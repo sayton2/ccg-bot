@@ -34,7 +34,7 @@ def run_vk_bot():
         vk = vk_session.get_api()
         
         bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-        print("Финальный бот успешно запущен в фоне и слушает ВК...")
+        print("Финальный бот успешно запущен в фоне...")
         
         for event in bot_longpoll.listen():
             if event.type == VkBotEventType.MESSAGE_NEW:
@@ -97,19 +97,32 @@ def run_vk_bot():
                 
                 if photo_content:
                     try:
-                        img = Image.open(io.BytesIO(photo_content)).convert("RGB")
+                        # Открываем оригинальный WebP (он в RGBA с прозрачностью)
+                        img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
+                        
+                        # Увеличиваем разрешение мелких картинок для четкости шрифтов
+                        target_height = 1200
+                        if img.height < target_height:
+                            scale = target_height / img.height
+                            new_width = int(img.width * scale)
+                            img = img.resize((new_width, target_height), Image.Resampling.LANCZOS)
+
+                        # ИСПРАВЛЕНИЕ: Создаем чистый БЕЛЫЙ фон под размер картинки
+                        white_bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                        # Накладываем карту на белый фон, сохраняя прозрачность углов
+                        final_img = Image.alpha_composite(white_bg, img).convert("RGB")
+
                         output = io.BytesIO()
-                        img.save(output, format="JPEG", quality=95)
+                        # Сохраняем в максимальном качестве без сжатия цветов
+                        final_img.save(output, format="JPEG", quality=98, subsampling=0)
                         jpeg_bytes = output.getvalue()
 
-                        # Вызываем метод получения сервера через универсальный vk_session.method
                         server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                         upload_url = server_resp['upload_url']
                         
                         files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
                         upload_resp = requests.post(upload_url, files=files).json()
                         
-                        # Сохраняем фото через чистый метод API photos.saveMessagesPhoto
                         if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
                             save_resp = vk_session.method('photos.saveMessagesPhoto', {
                                 'photo': upload_resp['photo'],
@@ -118,8 +131,7 @@ def run_vk_bot():
                             })
                             
                             if save_resp and len(save_resp) > 0:
-                                # Извлекаем параметры картинки из первого элемента ответа
-                                photo_data = save_resp[0]
+                                photo_data = save_resp
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
                         vk_error_msg = str(e)
@@ -155,6 +167,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
