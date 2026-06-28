@@ -33,7 +33,7 @@ def run_vk_bot():
         vk = vk_session.get_api()
         
         bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-        print("Финальный бот успешно запущен в фоне и слушает ВК через BotLongPoll...")
+        print("Финальный бот успешно запущен в фоне и слушает ВК...")
         
         for event in bot_longpoll.listen():
             if event.type == VkBotEventType.MESSAGE_NEW:
@@ -61,19 +61,30 @@ def run_vk_bot():
                 prefix = "bgo-" if chosen_command == "!бго" else "bk-"
                 full_filename = prefix + card_name_lat + ".webp"
 
-                possible_months = ["2026/06", "2026/05", "2026/04"]
+                # ПРИОРИТЕТ НА СВЕЖИЕ ПАПКИ
+                possible_paths = [
+                    "2026/06", 
+                    "2026/05", 
+                    "2026/04",
+                    "wp-content/uploads/2024/05",
+                    "wp-content/uploads/2024/06",
+                    "wp-content/uploads/2023/11",
+                    "wp-content/uploads/2023/12",
+                    "wp-content/uploads/2025/01"
+                ]
+                
                 photo_content = None
+                last_tried_url = ""
 
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
 
-                for month in possible_months:
-                    photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
+                for path in possible_paths:
+                    photo_url = f"https://ep-ccg.ru{path}/{full_filename}"
+                    last_tried_url = photo_url
                     try:
-                        res = requests.get(photo_url, headers=headers, timeout=5)
+                        res = requests.get(photo_url, headers=headers, timeout=2)
                         if res.status_code == 200:
                             photo_content = res.content
                             break
@@ -81,6 +92,8 @@ def run_vk_bot():
                         continue
 
                 attachment = None
+                vk_error_msg = ""
+                
                 if photo_content:
                     try:
                         img = Image.open(io.BytesIO(photo_content)).convert("RGB")
@@ -103,11 +116,10 @@ def run_vk_bot():
                             )
                             
                             if save_resp and len(save_resp) > 0:
-                                # Исправлено: строго берём первый элемент из ответа ВК
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
-                        print(f"Ошибка загрузки фото в ВК: {e}")
+                        vk_error_msg = str(e)
                         attachment = None
 
                 game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
@@ -121,9 +133,14 @@ def run_vk_bot():
                         v='5.199'
                     )
                 else:
+                    if not photo_content:
+                        err_text = f"❌ Карта не найдена на сайте!\nБот искал файл '{full_filename}', но на сервере ep-ccg.ru его нет.\n\nПоследний проверенный адрес:\n{last_tried_url}"
+                    else:
+                        err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
+                    
                     vk.messages.send(
                         peer_id=peer_id, 
-                        message=f"❌ Ошибка!\nНе удалось найти карту на сайте ep-ccg.ru или ВК отклонил сохранение картинки.\nПроверьте права вашего токена.", 
+                        message=err_text, 
                         random_id=0,
                         v='5.199'
                     )
@@ -137,6 +154,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
