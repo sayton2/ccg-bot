@@ -6,6 +6,7 @@ import threading
 from flask import Flask
 import os
 import io
+import time
 from PIL import Image
 from urllib.parse import urljoin
 
@@ -13,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home(): 
-    return "Бот работает", 200
+    return "Бот работает и активен", 200
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
 VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
@@ -29,148 +30,165 @@ RULES = {
 }
 
 def run_vk_bot():
-    try:
-        vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
-        vk = vk_session.get_api()
-        
-        bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-        print("Финальный бот успешно запущен в фоне...")
-        
-        for event in bot_longpoll.listen():
-            if event.type == VkBotEventType.MESSAGE_NEW:
-                message_obj = event.obj.message
-                text = message_obj.get('text', '').strip()
-                peer_id = message_obj.get('peer_id')
-                text_lower = text.lower()
+    while True: # Бесконечный цикл для автоперезапуска при сбоях ВК
+        try:
+            vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
+            vk = vk_session.get_api()
+            
+            bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
+            print("Финальный бот успешно запущен в фоне и слушает ВК...")
+            
+            for event in bot_longpoll.listen():
+                if event.type == VkBotEventType.MESSAGE_NEW:
+                    message_obj = event.obj.message
+                    text = message_obj.get('text', '').strip()
+                    peer_id = message_obj.get('peer_id')
+                    text_lower = text.lower()
 
-                chosen_command = None
-                for command in ["!бго", "!бк"]:
-                    if text_lower.startswith(command + " "):
-                        chosen_command = command
-                        break
-
-                if not chosen_command:
-                    continue
-
-                card_name_ru = text[len(chosen_command) + 1:].strip().lower()
-                if not card_name_ru:
-                    continue
-
-                cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
-                card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
-                
-                prefix = "bgo-" if chosen_command == "!бго" else "bk-"
-                full_filename = prefix + card_name_lat + ".webp"
-
-                possible_paths = [
-                    "wp-content/uploads/",
-                    "wp-content/uploads/2026/06/",
-                    "wp-content/uploads/2026/05/",
-                    "2026/06/",
-                    "2026/05/",
-                    "wp-content/uploads/2024/05/",
-                    "wp-content/uploads/2024/06/"
-                ]
-                
-                photo_content = None
-                last_tried_url = ""
-
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-
-                for path in possible_paths:
-                    relative_url = f"{path.strip('/')}/{full_filename}"
-                    photo_url = urljoin("https://ep-ccg.ru", relative_url)
-                    last_tried_url = photo_url
-                    
-                    try:
-                        res = requests.get(photo_url, headers=headers, timeout=2)
-                        if res.status_code == 200:
-                            photo_content = res.content
+                    chosen_command = None
+                    for command in ["!бго", "!бк"]:
+                        if text_lower.startswith(command + " "):
+                            chosen_command = command
                             break
-                    except Exception:
+
+                    if not chosen_command:
                         continue
 
-                attachment = None
-                vk_error_msg = ""
-                
-                if photo_content:
-                    try:
-                        img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
-                        
-                        # Создаем квадратный холст 1200х1200
-                        canvas_size = 1200
-                        white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
-                        
-                        # Пропорционально подгоняем карту под высоту холста
-                        card_height = canvas_size
-                        scale = card_height / img.height
-                        card_width = int(img.width * scale)
-                        img = img.resize((card_width, card_height), Image.Resampling.LANCZOS)
-                        
-                        # Вычисляем координаты, чтобы вставить карту ровно по центру
-                        x_offset = (canvas_size - card_width) // 2
-                        y_offset = (canvas_size - card_height) // 2
-                        
-                        # Накладываем карту по центру белого квадрата
-                        white_bg.paste(img, (x_offset, y_offset), img)
-                        final_img = white_bg.convert("RGB")
+                    card_name_ru = text[len(chosen_command) + 1:].strip().lower()
+                    if not card_name_ru:
+                        continue
 
-                        output = io.BytesIO()
-                        final_img.save(output, format="JPEG", quality=98, subsampling=0)
-                        jpeg_bytes = output.getvalue()
-
-                        server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-                        upload_url = server_resp['upload_url']
-                        
-                        files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
-                        upload_resp = requests.post(upload_url, files=files).json()
-                        
-                        if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
-                            save_resp = vk_session.method('photos.saveMessagesPhoto', {
-                                'photo': upload_resp['photo'],
-                                'server': int(upload_resp.get('server', 0)),
-                                'hash': str(upload_resp.get('hash', ''))
-                            })
-                            
-                            if save_resp and len(save_resp) > 0:
-                                photo_data = save_resp[0]
-                                attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-                    except Exception as e:
-                        vk_error_msg = str(e)
-                        attachment = None
-
-                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
-
-                if attachment:
-                    vk_session.method('messages.send', {
-                        'peer_id': peer_id,
-                        'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}",
-                        'attachment': attachment,
-                        'random_id': 0
-                    })
-                else:
-                    if not photo_content:
-                        err_text = f"❌ Карта не найдена на сайте!\nБот проверил все папки для файла '{full_filename}', включая свежие загрузки.\n\nПоследний проверенный адрес:\n{last_tried_url}"
-                    else:
-                        err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
+                    cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
+                    card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
                     
-                    vk_session.method('messages.send', {
-                        'peer_id': peer_id,
-                        'message': err_text,
-                        'random_id': 0
-                    })
-    except Exception as main_err:
-        print(f"Критическая ошибка в работе LongPoll: {main_err}")
+                    prefix = "bgo-" if chosen_command == "!бго" else "bk-"
+                    full_filename = prefix + card_name_lat + ".webp"
+
+                    possible_paths = [
+                        "wp-content/uploads/",
+                        "wp-content/uploads/2026/06/",
+                        "wp-content/uploads/2026/05/",
+                        "2026/06/",
+                        "2026/05/",
+                        "wp-content/uploads/2024/05/",
+                        "wp-content/uploads/2024/06/"
+                    ]
+                    
+                    photo_content = None
+                    last_tried_url = ""
+
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+
+                    for path in possible_paths:
+                        relative_url = f"{path.strip('/')}/{full_filename}"
+                        photo_url = urljoin("https://ep-ccg.ru", relative_url)
+                        last_tried_url = photo_url
+                        
+                        try:
+                            res = requests.get(photo_url, headers=headers, timeout=2)
+                            if res.status_code == 200:
+                                photo_content = res.content
+                                break
+                        except Exception:
+                            continue
+
+                    attachment = None
+                    vk_error_msg = ""
+                    
+                    if photo_content:
+                        try:
+                            img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
+                            
+                            canvas_size = 1200
+                            white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+                            
+                            card_height = canvas_size
+                            scale = card_height / img.height
+                            card_width = int(img.width * scale)
+                            img = img.resize((card_width, card_height), Image.Resampling.LANCZOS)
+                            
+                            x_offset = (canvas_size - card_width) // 2
+                            y_offset = (canvas_size - card_height) // 2
+                            
+                            white_bg.paste(img, (x_offset, y_offset), img)
+                            final_img = white_bg.convert("RGB")
+
+                            output = io.BytesIO()
+                            final_img.save(output, format="JPEG", quality=98, subsampling=0)
+                            jpeg_bytes = output.getvalue()
+
+                            server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+                            upload_url = server_resp['upload_url']
+                            
+                            files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
+                            upload_resp = requests.post(upload_url, files=files).json()
+                            
+                            if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
+                                save_resp = vk_session.method('photos.saveMessagesPhoto', {
+                                    'photo': upload_resp['photo'],
+                                    'server': int(upload_resp.get('server', 0)),
+                                    'hash': str(upload_resp.get('hash', ''))
+                                })
+                                
+                                if save_resp and len(save_resp) > 0:
+                                    photo_data = save_resp[0]
+                                    attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+                        except Exception as e:
+                            vk_error_msg = str(e)
+                            attachment = None
+
+                    game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+
+                    if attachment:
+                        vk_session.method('messages.send', {
+                            'peer_id': peer_id,
+                            'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}",
+                            'attachment': attachment,
+                            'random_id': 0
+                        })
+                    else:
+                        if not photo_content:
+                            err_text = f"❌ Карта не найдена на сайте!\nБот проверил все папки для файла '{full_filename}', включая свежие загрузки.\n\nПоследний проверенный адрес:\n{last_tried_url}"
+                        else:
+                            err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
+                        
+                        vk_session.method('messages.send', {
+                            'peer_id': peer_id,
+                            'message': err_text,
+                            'random_id': 0
+                        })
+        except Exception as main_err:
+            print(f"Сбой LongPoll, перезапуск через 5 секунд... Ошибка: {main_err}")
+            time.sleep(5)
+
+# Функция самопинга, чтобы сервер Render не уходил в спячку
+def keep_alive():
+    time.sleep(30) # Даем серверу сначала полностью запуститься
+    while True:
+        try:
+            # Скрипт стучится сам к себе каждые 10 минут
+            requests.get("http://127.0.0", timeout=5)
+        except Exception:
+            pass
+        time.sleep(600) # 10 минут
 
 if __name__ == '__main__':
+    # 1. Запуск бота ВК
     bot_thread = threading.Thread(target=run_vk_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
+    # 2. Запуск анти-сна
+    ping_thread = threading.Thread(target=keep_alive)
+    ping_thread.daemon = True
+    ping_thread.start()
+    
+    # 3. Запуск веб-сервера Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
