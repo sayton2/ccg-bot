@@ -7,6 +7,7 @@ from flask import Flask
 import os
 import io
 from PIL import Image
+from urllib.parse import urljoin  # Безопасная склейка ссылок
 
 app = Flask(__name__)
 
@@ -61,14 +62,15 @@ def run_vk_bot():
                 prefix = "bgo-" if chosen_command == "!бго" else "bk-"
                 full_filename = prefix + card_name_lat + ".webp"
 
-                # Исправленные пути WordPress с правильной структурой под 2026 год
+                # Добавлен путь wp-content/uploads/ без привязки к дате
                 possible_paths = [
-                    "wp-content/uploads/2026/06",
-                    "wp-content/uploads/2026/05",
-                    "2026/06",
-                    "2026/05",
-                    "wp-content/uploads/2024/05",
-                    "wp-content/uploads/2024/06"
+                    "wp-content/uploads/",
+                    "wp-content/uploads/2026/06/",
+                    "wp-content/uploads/2026/05/",
+                    "2026/06/",
+                    "2026/05/",
+                    "wp-content/uploads/2024/05/",
+                    "wp-content/uploads/2024/06/"
                 ]
                 
                 photo_content = None
@@ -79,9 +81,11 @@ def run_vk_bot():
                 }
 
                 for path in possible_paths:
-                    # Жестко контролируем наличие правильного слэша между доменом и путем
-                    photo_url = f"https://ep-ccg.ru{path}/{full_filename}"
+                    # Корректно объединяем базовый URL сайта и относительный путь к картинке
+                    relative_url = f"{path.strip('/')}/{full_filename}"
+                    photo_url = urljoin("https://ep-ccg.ru", relative_url)
                     last_tried_url = photo_url
+                    
                     try:
                         res = requests.get(photo_url, headers=headers, timeout=2)
                         if res.status_code == 200:
@@ -133,7 +137,7 @@ def run_vk_bot():
                     )
                 else:
                     if not photo_content:
-                        err_text = f"❌ Карта не найдена на сайте!\nБот искал файл '{full_filename}', но на сервере ep-ccg.ru его нет.\n\nПроверьте этот адрес в браузере:\n{last_tried_url}"
+                        err_text = f"❌ Карта не найдена на сайте!\nБот проверил все папки для файла '{full_filename}', включая свежие загрузки.\n\nПоследний проверенный адрес:\n{last_tried_url}"
                     else:
                         err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
                     
@@ -153,6 +157,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
