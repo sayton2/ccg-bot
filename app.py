@@ -16,7 +16,7 @@ def home():
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
 VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
-GROUP_ID = 202318207
+GROUP_ID = 202318207 
 # =============================================================
 
 RULES = {
@@ -103,6 +103,7 @@ def run_vk_bot():
                             )
                             
                             if save_resp and len(save_resp) > 0:
+                                # Исправлено: строго берём первый элемент из ответа ВК
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
@@ -136,6 +137,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
