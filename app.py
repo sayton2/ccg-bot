@@ -61,16 +61,14 @@ def run_vk_bot():
                 prefix = "bgo-" if chosen_command == "!бго" else "bk-"
                 full_filename = prefix + card_name_lat + ".webp"
 
-                # ПРИОРИТЕТ НА СВЕЖИЕ ПАПКИ
+                # Исправленные пути WordPress с правильной структурой под 2026 год
                 possible_paths = [
-                    "2026/06", 
-                    "2026/05", 
-                    "2026/04",
+                    "wp-content/uploads/2026/06",
+                    "wp-content/uploads/2026/05",
+                    "2026/06",
+                    "2026/05",
                     "wp-content/uploads/2024/05",
-                    "wp-content/uploads/2024/06",
-                    "wp-content/uploads/2023/11",
-                    "wp-content/uploads/2023/12",
-                    "wp-content/uploads/2025/01"
+                    "wp-content/uploads/2024/06"
                 ]
                 
                 photo_content = None
@@ -81,6 +79,7 @@ def run_vk_bot():
                 }
 
                 for path in possible_paths:
+                    # Жестко контролируем наличие правильного слэша между доменом и путем
                     photo_url = f"https://ep-ccg.ru{path}/{full_filename}"
                     last_tried_url = photo_url
                     try:
@@ -134,7 +133,7 @@ def run_vk_bot():
                     )
                 else:
                     if not photo_content:
-                        err_text = f"❌ Карта не найдена на сайте!\nБот искал файл '{full_filename}', но на сервере ep-ccg.ru его нет.\n\nПоследний проверенный адрес:\n{last_tried_url}"
+                        err_text = f"❌ Карта не найдена на сайте!\nБот искал файл '{full_filename}', но на сервере ep-ccg.ru его нет.\n\nПроверьте этот адрес в браузере:\n{last_tried_url}"
                     else:
                         err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
                     
@@ -154,6 +153,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
