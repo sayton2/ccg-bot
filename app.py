@@ -10,15 +10,12 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Хелсчек для Render, чтобы сервис всегда был в статусе "Live"
 @app.route('/')
 def home(): 
     return "Бот работает", 200
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
 VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
-# ВНИМАНИЕ: ID группы должен быть строго ЧИСЛОМ (без букв club, public и минусов)
-# Замените число ниже на реальный цифровой ID вашей группы ВК!
 GROUP_ID = 202318207
 # =============================================================
 
@@ -32,16 +29,13 @@ RULES = {
 
 def run_vk_bot():
     try:
-        # Авторизация сессии группы с явным указанием версии API
         vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
         vk = vk_session.get_api()
         
-        # Используем ПРАВИЛЬНЫЙ класс LongPoll для сообществ
         bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
         print("Финальный бот успешно запущен в фоне и слушает ВК через BotLongPoll...")
         
         for event in bot_longpoll.listen():
-            # Проверяем тип события: новое входящее сообщение
             if event.type == VkBotEventType.MESSAGE_NEW:
                 message_obj = event.obj.message
                 text = message_obj.get('text', '').strip()
@@ -89,22 +83,17 @@ def run_vk_bot():
                 attachment = None
                 if photo_content:
                     try:
-                        # Конвертируем WebP с сайта в JPEG в памяти
                         img = Image.open(io.BytesIO(photo_content)).convert("RGB")
                         output = io.BytesIO()
                         img.save(output, format="JPEG", quality=95)
                         jpeg_bytes = output.getvalue()
 
-                        # 1. Запрашиваем сервер загрузки у ВК
                         server_resp = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.199')
                         upload_url = server_resp['upload_url']
                         
-                        # 2. Отправляем файл POST-запросом
                         files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
                         upload_resp = requests.post(upload_url, files=files).json()
                         
-                        # 3. Сохраняем фото в ВК
-                                                # 3. Сохраняем фото в ВК
                         if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
                             save_resp = vk.messages.saveMessagesPhoto(
                                 photo=upload_resp['photo'],
@@ -114,10 +103,8 @@ def run_vk_bot():
                             )
                             
                             if save_resp and len(save_resp) > 0:
-                                # В API 5.199 saveMessagesPhoto возвращает массив, берем нулевой элемент [0]
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-
                     except Exception as e:
                         print(f"Ошибка загрузки фото в ВК: {e}")
                         attachment = None
@@ -143,16 +130,13 @@ def run_vk_bot():
         print(f"Критическая ошибка в работе LongPoll: {main_err}")
 
 if __name__ == '__main__':
-    # Обязательно впишите ID вашей группы в переменную GROUP_ID выше!
-    
-    # 1. Запускаем LongPoll бота ВК в фоновом потоке
     bot_thread = threading.Thread(target=run_vk_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # 2. Запускаем Flask в основном потоке на порту Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
