@@ -58,13 +58,13 @@ for event in longpoll.listen():
             prefix = "bgo-" if chosen_command == "!бго" else "bk-"
             full_filename = prefix + card_name_lat + ".webp"
 
-            # Перебираем возможные папки месяцев на вашем сайте (Июнь, Май, Апрель)
+            # Автоматический перебор папок месяцев в хранилище сайта (Июнь, Май, Апрель)
             possible_months = ["2026/06", "2026/05", "2026/04"]
             photo_content = None
             final_url = ""
 
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
             }
 
@@ -75,7 +75,7 @@ for event in longpoll.listen():
                     if res.status_code == 200:
                         photo_content = res.content
                         final_url = photo_url
-                        break  # Нашли картинку — останавливаем поиск!
+                        break  # Картинка успешно скачана из хранилища — останавливаем поиск!
                 except Exception:
                     continue
 
@@ -108,12 +108,12 @@ for event in longpoll.listen():
                     random_id=0
                 )
             else:
-                # Если перебор не помог, выведем последнюю проверенную ссылку
                 last_url = f"https://ep-ccg.ru2026/06/{full_filename}"
                 vk.messages.send(
                     peer_id=peer_id, 
-                    message=f"❌ Ошибка!\nБот проверил папки месяцев на сайте ep-ccg.ru.\nФайл {full_filename} не найден в медиатеке или ВК отклонил загрузку.\nПример ссылки: {last_url}", 
+                    message=f"❌ Ошибка!\nБот проверил папки хранилища на сайте ep-ccg.ru.\nФайл {full_filename} не найден в медиатеке или ВК отклонил загрузку.\nПример ссылки: {last_url}", 
                     random_id=0
                 )
+
 
 
