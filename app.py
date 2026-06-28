@@ -26,13 +26,13 @@ RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
     'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-    'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
 def fetch_photo(path, full_filename, headers):
     relative_url = f"{path.strip('/')}/{full_filename}"
-    photo_url = urljoin("https://ep-ccg.ru", relative_url)
+    photo_url = urljoin("https://ep-ccg.ru/", relative_url)
     try:
         res = requests.get(photo_url, headers=headers, timeout=2)
         if res.status_code == 200:
@@ -140,7 +140,6 @@ def run_vk_bot():
                                             'hash': str(upload_resp.get('hash', ''))
                                         })
                                         
-                                        # Чётко вытаскиваем данные из ответа через 'response' или напрямую
                                         actual_data = save_resp['response'] if 'response' in save_resp else save_resp
                                         if actual_data and len(actual_data) > 0:
                                             photo_data = actual_data[0]
@@ -177,6 +176,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
