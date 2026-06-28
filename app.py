@@ -6,6 +6,7 @@ import threading
 from flask import Flask
 import os
 import io
+import sys
 from PIL import Image
 
 app = Flask(__name__)
@@ -35,7 +36,7 @@ vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Бот на чистых requests запущен на Render...")
+print("Бот с логированием запущен на Render...", flush=True)
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -51,6 +52,7 @@ for event in longpoll.listen():
 
         if chosen_command:
             card_name_ru = text[len(chosen_command) + 1:].strip().lower()
+            print(f"Получена команда: {chosen_command} для карты: {card_name_ru}", flush=True)
             if not card_name_ru:
                 continue
 
@@ -63,20 +65,16 @@ for event in longpoll.listen():
             possible_months = ["2026/06", "2026/05", "2026/04"]
             photo_content = None
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-            }
-
             for month in possible_months:
                 photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
                 try:
-                    res = requests.get(photo_url, headers=headers, timeout=5)
+                    res = requests.get(photo_url, timeout=5)
                     if res.status_code == 200:
                         photo_content = res.content
+                        print(f"Успешно скачан файл с сайта: {photo_url}", flush=True)
                         break
-                except Exception:
+                except Exception as e:
+                    print(f"Ошибка скачивания с сайта: {str(e)}", flush=True)
                     continue
 
             attachment = None
@@ -91,41 +89,53 @@ for event in longpoll.listen():
                     # 1. Получаем сервер загрузки через чистый API
                     server_resp = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
                     upload_url = server_resp['upload_url']
+                    print(f"Получен сервер загрузки ВК: {upload_url}", flush=True)
                     
-                    # 2. Отправляем файл обычным POST-запросом через requests (без vk_api)
+                    # 2. Отправляем файл обычным POST-запросом через requests
                     files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
                     upload_resp = requests.post(upload_url, files=files).json()
+                    print(f"Ответ сервера загрузки ВК: {upload_resp}", flush=True)
                     
-                    # 3. Сохраняем фото в ВК
+                    # 3. Сохраняем фото в ВК, жестко вытаскивая сырые строковые параметры
                     if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
                         save_resp = vk.messages.saveMessagesPhoto(
                             photo=upload_resp['photo'],
-                            server=upload_resp.get('server', 0),
-                            hash=upload_resp.get('hash', ''),
+                            server=int(upload_resp.get('server', 0)),
+                            hash=str(upload_resp.get('hash', '')),
                             v='5.131'
                         )
+                        print(f"Ответ метода сохранения фото ВК: {save_resp}", flush=True)
                         
                         if save_resp and len(save_resp) > 0:
-                            photo_data = save_resp[0]
+                            photo_data = save_resp
                             attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-                except Exception:
+                    else:
+                        print("ВК вернул пустой блок 'photo' при загрузке бинарных данных.", flush=True)
+                except Exception as e:
+                    print(f"Критический сбой на этапе отправки в ВК: {str(e)}", flush=True)
                     attachment = None
 
             game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
-            if attachment:
-                vk.messages.send(
-                    peer_id=peer_id, 
-                    message=f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}", 
-                    attachment=attachment, 
-                    random_id=0
-                )
-            else:
-                vk.messages.send(
-                    peer_id=peer_id, 
-                    message=f"❌ Ошибка!\nБот успешно скачал карту с сайта ep-ccg.ru, но ВК отклонил сохранение файла.\nПроверьте, что в настройках группы ВК -> Работа с API -> Ключи доступа у вашего токена включена галочка 'Доступ к фотографиям сообщества'.", 
-                    random_id=0
-                )
+            try:
+                if attachment:
+                    vk.messages.send(
+                        peer_id=peer_id, 
+                        message=f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}", 
+                        attachment=attachment, 
+                        random_id=0
+                    )
+                    print("Сообщение с картой успешно отправлено пользователю!", flush=True)
+                else:
+                    vk.messages.send(
+                        peer_id=peer_id, 
+                        message=f"❌ Ошибка!\nБот успешно скачал карту с сайта ep-ccg.ru, но ВК отклонил сохранение файла.", 
+                        random_id=0
+                    )
+                    print("Отправлено текстовое сообщение об ошибке.", flush=True)
+            except Exception as e:
+                print(f"Не удалось отправить даже текстовое сообщение в ВК: {str(e)}", flush=True)
+
 
 
 
