@@ -6,7 +6,6 @@ import threading
 from flask import Flask
 import os
 
-# Крошечный веб-сервер, чтобы бесплатный Render не закрывал бота по ошибке порта
 app = Flask(__name__)
 @app.route('/')
 def home(): return "Бот активен"
@@ -15,7 +14,6 @@ def start_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# Запускаем веб-сервер в отдельном потоке, освобождая память для ВК
 threading.Thread(target=start_flask, daemon=True).start()
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
@@ -35,7 +33,7 @@ vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Бот успешно запущен на платформе Render и слушает чаты ВК...")
+print("Бот успешно запущен на платформе Render и ищет карты на сайте...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -58,26 +56,28 @@ for event in longpoll.listen():
             card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
             
             prefix = "bgo-" if chosen_command == "!бго" else "bk-"
-            full_filename = prefix + card_name_lat
+            full_filename = prefix + card_name_lat + ".webp"
 
-            # Картинки тянутся СТРОГО С ВАШЕГО САЙТА ep-ccg.ru по прямой ссылке со слэшем!
-            s = chr(47)
-            domain = "https:__ep-ccg.ru".replace("__", s + s)
-            path_folder = "img"
-
-            photo_url = domain + s + path_folder + s + full_filename + ".webp"
-
+            # Перебираем возможные папки месяцев на вашем сайте (Июнь, Май, Апрель)
+            possible_months = ["2026/06", "2026/05", "2026/04"]
             photo_content = None
-            try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
-                }
-                res = requests.get(photo_url, headers=headers, timeout=5)
-                if res.status_code == 200:
-                    photo_content = res.content
-            except Exception:
-                pass
+            final_url = ""
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
+            }
+
+            for month in possible_months:
+                photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
+                try:
+                    res = requests.get(photo_url, headers=headers, timeout=3)
+                    if res.status_code == 200:
+                        photo_content = res.content
+                        final_url = photo_url
+                        break  # Нашли картинку — останавливаем поиск!
+                except Exception:
+                    continue
 
             attachment = None
             if photo_content:
@@ -108,9 +108,12 @@ for event in longpoll.listen():
                     random_id=0
                 )
             else:
+                # Если перебор не помог, выведем последнюю проверенную ссылку
+                last_url = f"https://ep-ccg.ru2026/06/{full_filename}"
                 vk.messages.send(
                     peer_id=peer_id, 
-                    message=f"❌ Ошибка!\nБот собрал ссылку: {photo_url}\nКартинка не найдена на сайте или ВК отклонил её загрузку.", 
+                    message=f"❌ Ошибка!\nБот проверил папки месяцев на сайте ep-ccg.ru.\nФайл {full_filename} не найден в медиатеке или ВК отклонил загрузку.\nПример ссылки: {last_url}", 
                     random_id=0
                 )
+
 
