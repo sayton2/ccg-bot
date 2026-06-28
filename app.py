@@ -142,7 +142,8 @@ def run_vk_bot():
                                         
                                         actual_data = save_resp['response'] if 'response' in save_resp else save_resp
                                         if actual_data and len(actual_data) > 0:
-                                            photo_data = actual_data
+                                            # Извлекаем первый строгий элемент массива [0]
+                                            photo_data = actual_data[0]
                                             attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                                 except Exception as e:
                                     vk_error_msg = str(e)
@@ -176,6 +177,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
