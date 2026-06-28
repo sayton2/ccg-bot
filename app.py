@@ -84,7 +84,8 @@ for event in longpoll.listen():
                     upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
                     upload_url = upload_server['upload_url']
                     
-                    files = {'photo': ('card.webp', photo_content, 'image/webp')}
+                    files = {'photo': ('card.png', photo_content, 'image/png')}
+
                     upload_resp = requests.post(upload_url, files=files).json()
                     
                     if 'photo' in upload_resp and upload_resp['photo']:
