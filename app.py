@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 import requests
 import threading
 from flask import Flask
@@ -9,18 +9,17 @@ import io
 from PIL import Image
 
 app = Flask(__name__)
+
+# Хелсчек для Render, чтобы сервис всегда был в статусе "Live"
 @app.route('/')
-def home(): return "Бот работает"
-
-def start_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-threading.Thread(target=start_flask, daemon=True).start()
+def home(): 
+    return "Бот работает", 200
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
-# Вставьте сюда ваш действующий длинный токен группы ВК (с правами на фото)
 VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
+# ВНИМАНИЕ: ID группы должен быть строго ЧИСЛОМ (без букв club, public и минусов)
+# Замените число ниже на реальный цифровой ID вашей группы ВК!
+GROUP_ID = 202318207
 # =============================================================
 
 RULES = {
@@ -31,101 +30,127 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
-vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+def run_vk_bot():
+    try:
+        # Авторизация сессии группы с явным указанием версии API
+        vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
+        vk = vk_session.get_api()
+        
+        # Используем ПРАВИЛЬНЫЙ класс LongPoll для сообществ
+        bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
+        print("Финальный бот успешно запущен в фоне и слушает ВК через BotLongPoll...")
+        
+        for event in bot_longpoll.listen():
+            # Проверяем тип события: новое входящее сообщение
+            if event.type == VkBotEventType.MESSAGE_NEW:
+                message_obj = event.obj.message
+                text = message_obj.get('text', '').strip()
+                peer_id = message_obj.get('peer_id')
+                text_lower = text.lower()
 
-print("Финальный бот успешно запущен и слушает ВК...")
-
-for event in longpoll.listen():
-    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-        text = event.text.strip()
-        peer_id = event.peer_id
-        text_lower = text.lower()
-
-        chosen_command = None
-        for command in ["!бго", "!бк"]:
-            if text_lower.startswith(command + " "):
-                chosen_command = command
-                break
-
-        if chosen_command:
-            card_name_ru = text[len(chosen_command) + 1:].strip().lower()
-            if not card_name_ru:
-                continue
-
-            cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
-            card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
-            
-            prefix = "bgo-" if chosen_command == "!бго" else "bk-"
-            full_filename = prefix + card_name_lat + ".webp"
-
-            possible_months = ["2026/06", "2026/05", "2026/04"]
-            photo_content = None
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-            }
-
-            for month in possible_months:
-                photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
-                try:
-                    res = requests.get(photo_url, headers=headers, timeout=5)
-                    if res.status_code == 200:
-                        photo_content = res.content
+                chosen_command = None
+                for command in ["!бго", "!бк"]:
+                    if text_lower.startswith(command + " "):
+                        chosen_command = command
                         break
-                except Exception:
+
+                if not chosen_command:
                     continue
 
-            attachment = None
-            if photo_content:
-                try:
-                    # На лету пережимаем WebP с сайта в чистый JPEG в памяти для ВК
-                    img = Image.open(io.BytesIO(photo_content)).convert("RGB")
-                    output = io.BytesIO()
-                    img.save(output, format="JPEG", quality=95)
-                    jpeg_bytes = output.getvalue()
+                card_name_ru = text[len(chosen_command) + 1:].strip().lower()
+                if not card_name_ru:
+                    continue
 
-                    # 1. Запрашиваем официальный сервер загрузки ВК
-                    server_resp = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
-                    upload_url = server_resp['upload_url']
-                    
-                    # 2. Отправляем файл обычным POST-запросом через requests
-                    files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
-                    upload_resp = requests.post(upload_url, files=files).json()
-                    
-                    # 3. Сохраняем фото в ВК, жестко вытаскивая ПЕРВЫЙ [0] элемент массива
-                    if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
-                        save_resp = vk.messages.saveMessagesPhoto(
-                            photo=upload_resp['photo'],
-                            server=int(upload_resp.get('server', 0)),
-                            hash=str(upload_resp.get('hash', '')),
-                            v='5.131'
-                        )
+                cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
+                card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
+                
+                prefix = "bgo-" if chosen_command == "!бго" else "bk-"
+                full_filename = prefix + card_name_lat + ".webp"
+
+                possible_months = ["2026/06", "2026/05", "2026/04"]
+                photo_content = None
+
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+                }
+
+                for month in possible_months:
+                    photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
+                    try:
+                        res = requests.get(photo_url, headers=headers, timeout=5)
+                        if res.status_code == 200:
+                            photo_content = res.content
+                            break
+                    except Exception:
+                        continue
+
+                attachment = None
+                if photo_content:
+                    try:
+                        # Конвертируем WebP с сайта в JPEG в памяти
+                        img = Image.open(io.BytesIO(photo_content)).convert("RGB")
+                        output = io.BytesIO()
+                        img.save(output, format="JPEG", quality=95)
+                        jpeg_bytes = output.getvalue()
+
+                        # 1. Запрашиваем сервер загрузки у ВК
+                        server_resp = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.199')
+                        upload_url = server_resp['upload_url']
                         
-                        if save_resp and len(save_resp) > 0:
-                            photo_data = save_resp[0] # ИЗВЛЕКАЕМ ИМЕННО НУЛЕВОЙ СТРОГИЙ ЭЛЕМЕНТ
-                            attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-                except Exception:
-                    attachment = None
+                        # 2. Отправляем файл POST-запросом
+                        files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
+                        upload_resp = requests.post(upload_url, files=files).json()
+                        
+                        # 3. Сохраняем фото в ВК
+                        if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
+                            save_resp = vk.messages.saveMessagesPhoto(
+                                photo=upload_resp['photo'],
+                                server=int(upload_resp.get('server', 0)),
+                                hash=str(upload_resp.get('hash', '')),
+                                v='5.199'
+                            )
+                            
+                            if save_resp and len(save_resp) > 0:
+                                photo_data = save_resp[0]
+                                attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+                    except Exception as e:
+                        print(f"Ошибка загрузки фото в ВК: {e}")
+                        attachment = None
 
-            game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
-            if attachment:
-                vk.messages.send(
-                    peer_id=peer_id, 
-                    message=f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}", 
-                    attachment=attachment, 
-                    random_id=0
-                )
-            else:
-                vk.messages.send(
-                    peer_id=peer_id, 
-                    message=f"❌ Ошибка!\nБот успешно скачал карту с сайта ep-ccg.ru, но ВК отклонил сохранение медиафайла.\nУбедитесь, что в настройках группы ВК -> Работа с API -> Ключи доступа у вашего токена включена галочка 'Доступ к фотографиям сообщества'.", 
-                    random_id=0
-                )
+                if attachment:
+                    vk.messages.send(
+                        peer_id=peer_id, 
+                        message=f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}", 
+                        attachment=attachment, 
+                        random_id=0,
+                        v='5.199'
+                    )
+                else:
+                    vk.messages.send(
+                        peer_id=peer_id, 
+                        message=f"❌ Ошибка!\nНе удалось найти карту на сайте ep-ccg.ru или ВК отклонил сохранение картинки.\nПроверьте права вашего токена.", 
+                        random_id=0,
+                        v='5.199'
+                    )
+    except Exception as main_err:
+        print(f"Критическая ошибка в работе LongPoll: {main_err}")
+
+if __name__ == '__main__':
+    # Обязательно впишите ID вашей группы в переменную GROUP_ID выше!
+    
+    # 1. Запускаем LongPoll бота ВК в фоновом потоке
+    bot_thread = threading.Thread(target=run_vk_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # 2. Запускаем Flask в основном потоке на порту Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
 
 
 
