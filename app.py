@@ -17,7 +17,6 @@ def start_flask():
 threading.Thread(target=start_flask, daemon=True).start()
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
-# Вставьте сюда ваш действующий новый токен группы ВК
 VK_TOKEN = "vk1.a.elAkiiYHRRLNnHIWb6xlvPiOVE1MVj7g4w4bt5BJXevd6WVs14JjvBcKe_oz0HN029Yqytq5T_P9fTMtWg49VTR0jIUKiCn02bxWsslqLsKasFncsKegwOt5SdIW9fR1YycrZi5-yqER1OeRWBnT50wNUWOojSRczFk37QVXtiVwLQ61o4P0lHmx9XIBQz3RcpehFipGGJREGcRVrp0gzw"
 # =============================================================
 
@@ -33,7 +32,7 @@ vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Бот отладки запущен на Render...")
+print("Бот в полной маскировке запущен на Render...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -62,15 +61,18 @@ for event in longpoll.listen():
             photo_content = None
             final_url = ""
 
+            # МАСКИРОВКА ОБЯЗАТЕЛЬНО ОБЪЯВЛЯЕТСЯ ТУТ
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
             }
 
             for month in possible_months:
-                photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
+                photo_url = f"https://ep-ccg.ru/wp-content/uploads/{month}/{full_filename}"
                 try:
-                    res = requests.get(photo_url, headers=headers, timeout=3)
+                    # Передаем маскировку в каждый запрос к Fornex
+                    res = requests.get(photo_url, headers=headers, timeout=5)
                     if res.status_code == 200:
                         photo_content = res.content
                         final_url = photo_url
@@ -78,14 +80,12 @@ for event in longpoll.listen():
                 except Exception:
                     continue
 
-            # --- БЛОК ОПРЕДЕЛЕНИЯ ПРИЧИНЫ ОШИБКИ ---
             debug_status = "Начало проверки"
             attachment = None
 
             if not photo_content:
-                debug_status = f"ОШИБКА: Сайт ep-ccg.ru выдал ошибку 404. Файла {full_filename} физически НЕТ в папках uploads за 04, 05 и 06 месяцы."
+                debug_status = f"ОШИБКА: Сайт ep-ccg.ru всё ещё сбрасывает запрос. Последний проверенный путь: https://ep-ccg.ru/wp-content/uploads/2026/06/{full_filename}"
             else:
-                debug_status = f"УСПЕХ: Файл успешно скачан с сайта по ссылке: {final_url}! Отправляем на сервера ВК..."
                 try:
                     upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id)
                     upload_url = upload_server['upload_url']
@@ -101,12 +101,7 @@ for event in longpoll.listen():
                         )
                         
                         if save_resp and len(save_resp) > 0:
-                            attachment = f"photo{save_resp[0]['owner_id']}_{save_resp[0]['id']}"
-                            debug_status = "УСПЕХ: ВК успешно сохранил фото и выдал attachment!"
-                        else:
-                            debug_status = f"ОШИБКА ВК: Метод saveMessagesPhoto вернул пустой ответ. Возможно, ВК не переварил бинарный WEBP-контент. Ответ сервера: {save_resp}"
-                    else:
-                        debug_status = f"ОШИБКА ВК: Сервер загрузки отклонил файл. Ответ: {upload_resp}"
+                            attachment = f"photo{save_resp['owner_id']}_{save_resp['id']}"
                 except Exception as e:
                     debug_status = f"КРИТИЧЕСКАЯ ОШИБКА В КОДЕ Python: {str(e)}"
 
@@ -125,6 +120,7 @@ for event in longpoll.listen():
                     message=f"🔍 ОТЛАДКА БОТА:\n{debug_status}", 
                     random_id=0
                 )
+
 
 
 
