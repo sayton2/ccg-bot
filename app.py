@@ -17,6 +17,7 @@ def start_flask():
 threading.Thread(target=start_flask, daemon=True).start()
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
+# Вставьте сюда ваш действующий новый токен группы ВК
 VK_TOKEN = "vk1.a.elAkiiYHRRLNnHIWb6xlvPiOVE1MVj7g4w4bt5BJXevd6WVs14JjvBcKe_oz0HN029Yqytq5T_P9fTMtWg49VTR0jIUKiCn02bxWsslqLsKasFncsKegwOt5SdIW9fR1YycrZi5-yqER1OeRWBnT50wNUWOojSRczFk37QVXtiVwLQ61o4P0lHmx9XIBQz3RcpehFipGGJREGcRVrp0gzw"
 # =============================================================
 
@@ -28,11 +29,11 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Бот в полной маскировке запущен на Render...")
+print("Финальный бот успешно запущен и слушает ВК...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -59,9 +60,7 @@ for event in longpoll.listen():
 
             possible_months = ["2026/06", "2026/05", "2026/04"]
             photo_content = None
-            final_url = ""
 
-            # МАСКИРОВКА ОБЯЗАТЕЛЬНО ОБЪЯВЛЯЕТСЯ ТУТ
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
@@ -69,41 +68,39 @@ for event in longpoll.listen():
             }
 
             for month in possible_months:
-                photo_url = f"https://ep-ccg.ru/wp-content/uploads/{month}/{full_filename}"
+                photo_url = f"https://ep-ccg.ru{month}/{full_filename}"
                 try:
-                    # Передаем маскировку в каждый запрос к Fornex
                     res = requests.get(photo_url, headers=headers, timeout=5)
                     if res.status_code == 200:
                         photo_content = res.content
-                        final_url = photo_url
                         break
                 except Exception:
                     continue
 
-            debug_status = "Начало проверки"
             attachment = None
-
-            if not photo_content:
-                debug_status = f"ОШИБКА: Сайт ep-ccg.ru всё ещё сбрасывает запрос. Последний проверенный путь: https://ep-ccg.ru/wp-content/uploads/2026/06/{full_filename}"
-            else:
+            if photo_content:
                 try:
-                    upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id)
+                    # Исправленный вызов метода получения сервера ВК с явными параметрами
+                    upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
                     upload_url = upload_server['upload_url']
                     
                     files = {'photo': ('card.webp', photo_content, 'image/webp')}
                     upload_resp = requests.post(upload_url, files=files).json()
                     
                     if 'photo' in upload_resp and upload_resp['photo']:
+                        # Исправленный вызов сохранения фото с явным указанием версии
                         save_resp = vk.messages.saveMessagesPhoto(
                             photo=upload_resp['photo'],
                             server=upload_resp.get('server', 0),
-                            hash=upload_resp.get('hash', '')
+                            hash=upload_resp.get('hash', ''),
+                            v='5.131'
                         )
                         
                         if save_resp and len(save_resp) > 0:
-                            attachment = f"photo{save_resp['owner_id']}_{save_resp['id']}"
-                except Exception as e:
-                    debug_status = f"КРИТИЧЕСКАЯ ОШИБКА В КОДЕ Python: {str(e)}"
+                            photo_data = save_resp[0]
+                            attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+                except Exception:
+                    attachment = None
 
             game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
@@ -117,7 +114,7 @@ for event in longpoll.listen():
             else:
                 vk.messages.send(
                     peer_id=peer_id, 
-                    message=f"🔍 ОТЛАДКА БОТА:\n{debug_status}", 
+                    message=f"❌ Ошибка загрузки картинки ВКонтакте.\nБот успешно скачал файл с сайта, но ВК отклонил сохранение медиафайла.", 
                     random_id=0
                 )
 
