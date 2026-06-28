@@ -15,12 +15,12 @@ app = Flask(__name__)
 
 @app.route('/')
 def home(): 
-    return "Бот для карт активен", 200
+    return "Многопользовательский бот активен", 200
 
-# ==================== НАСТРОЙКИ ВКонтакте ====================
-VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
-GROUP_ID = 202318207 
-# =============================================================
+# ==================== БЕЗОПАСНЫЕ НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
+VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A")
+GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
+# =====================================================================================
 
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
@@ -45,14 +45,12 @@ def run_vk_bot():
     while True:
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
-            vk = vk_session.get_api()
             
             bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-            print("Бот запущен...")
+            print("Бот успешно запущен и слушает ВК...")
             
             while True:
                 try:
-                    # Ускоряем опрос: ставим время ожидания сервера ВК всего 1 секунду вместо 25
                     events = bot_longpoll.check()
                     for event in events:
                         if event.type == VkBotEventType.MESSAGE_NEW:
@@ -104,17 +102,20 @@ def run_vk_bot():
                                         break
 
                             attachment = None
+                            vk_error_msg = ""
                             
                             if photo_content:
                                 try:
                                     img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
-                                    canvas_size = 1200
+                                    
+                                    canvas_size = 800
                                     white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
                                     
                                     card_height = canvas_size
                                     scale = card_height / img.height
                                     card_width = int(img.width * scale)
-                                    img = img.resize((card_width, card_height), Image.Resampling.LANCZOS)
+                                    
+                                    img = img.resize((card_width, card_height), Image.Resampling.BILINEAR)
                                     
                                     x_offset = (canvas_size - card_width) // 2
                                     y_offset = (canvas_size - card_height) // 2
@@ -123,11 +124,11 @@ def run_vk_bot():
                                     final_img = white_bg.convert("RGB")
 
                                     output = io.BytesIO()
-                                    final_img.save(output, format="JPEG", quality=95, subsampling=0)
+                                    final_img.save(output, format="JPEG", quality=90)
                                     jpeg_bytes = output.getvalue()
 
                                     server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-                                    upload_url = server_resp['upload_url']
+                                    upload_url = server_resp['response']['upload_url'] if 'response' in server_resp else server_resp['upload_url']
                                     
                                     files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
                                     upload_resp = requests.post(upload_url, files=files).json()
@@ -139,10 +140,13 @@ def run_vk_bot():
                                             'hash': str(upload_resp.get('hash', ''))
                                         })
                                         
-                                        if save_resp and len(save_resp) > 0:
-                                            photo_data = save_resp[0]
+                                        # Чётко вытаскиваем данные из ответа через 'response' или напрямую
+                                        actual_data = save_resp['response'] if 'response' in save_resp else save_resp
+                                        if actual_data and len(actual_data) > 0:
+                                            photo_data = actual_data[0]
                                             attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-                                except Exception:
+                                except Exception as e:
+                                    vk_error_msg = str(e)
                                     attachment = None
 
                             game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
@@ -150,19 +154,19 @@ def run_vk_bot():
                             if attachment:
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
-                                    'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}",
+                                    'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru",
                                     'attachment': attachment,
                                     'random_id': 0
                                 })
                             else:
                                 if not photo_content:
-                                    err_text = f"❌ Карта не найдена!\nФайл '{full_filename}' отсутствует.\n\nПроверен адрес:\n{last_tried_url}"
+                                    err_text = f"❌ Карта не найдена на сайте!\nФайл '{full_filename}' отсутствует.\n\nПроверен адрес:\n{last_tried_url}"
                                 else:
-                                    err_text = "❌ Ошибка ВК при сохранении картинки."
+                                    err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}"
                                 vk_session.method('messages.send', {'peer_id': peer_id, 'message': err_text, 'random_id': 0})
                 except Exception:
                     time.sleep(1)
-                time.sleep(0.2) # Микропауза для разгрузки процессора Render
+                time.sleep(0.1)
         except Exception:
             time.sleep(5)
 
