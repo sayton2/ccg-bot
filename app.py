@@ -102,22 +102,23 @@ def run_vk_bot():
                         img.save(output, format="JPEG", quality=95)
                         jpeg_bytes = output.getvalue()
 
-                        server_resp = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.199')
+                        # Вызываем метод получения сервера через универсальный vk_session.method
+                        server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                         upload_url = server_resp['upload_url']
                         
                         files = {'photo': ('card.jpg', jpeg_bytes, 'image/jpeg')}
                         upload_resp = requests.post(upload_url, files=files).json()
                         
+                        # Сохраняем фото через чистый метод API photos.saveMessagesPhoto
                         if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
-                            save_resp = vk.messages.saveMessagesPhoto(
-                                photo=upload_resp['photo'],
-                                server=int(upload_resp.get('server', 0)),
-                                hash=str(upload_resp.get('hash', '')),
-                                v='5.199'
-                            )
+                            save_resp = vk_session.method('photos.saveMessagesPhoto', {
+                                'photo': upload_resp['photo'],
+                                'server': int(upload_resp.get('server', 0)),
+                                'hash': str(upload_resp.get('hash', ''))
+                            })
                             
                             if save_resp and len(save_resp) > 0:
-                                # ИСПРАВЛЕНО: Добавлен строгий индекс [0] для API 5.199
+                                # Извлекаем параметры картинки из первого элемента ответа
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
@@ -127,25 +128,23 @@ def run_vk_bot():
                 game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
                 if attachment:
-                    vk.messages.send(
-                        peer_id=peer_id, 
-                        message=f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}", 
-                        attachment=attachment, 
-                        random_id=0,
-                        v='5.199'
-                    )
+                    vk_session.method('messages.send', {
+                        'peer_id': peer_id,
+                        'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}",
+                        'attachment': attachment,
+                        'random_id': 0
+                    })
                 else:
                     if not photo_content:
                         err_text = f"❌ Карта не найдена на сайте!\nБот проверил все папки для файла '{full_filename}', включая свежие загрузки.\n\nПоследний проверенный адрес:\n{last_tried_url}"
                     else:
                         err_text = f"❌ Ошибка ВК при сохранении картинки!\nТекст ошибки: {vk_error_msg}\nУбедитесь, что у токена активны права на фото."
                     
-                    vk.messages.send(
-                        peer_id=peer_id, 
-                        message=err_text, 
-                        random_id=0,
-                        v='5.199'
-                    )
+                    vk_session.method('messages.send', {
+                        'peer_id': peer_id,
+                        'message': err_text,
+                        'random_id': 0
+                    })
     except Exception as main_err:
         print(f"Критическая ошибка в работе LongPoll: {main_err}")
 
@@ -156,6 +155,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
