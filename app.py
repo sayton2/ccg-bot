@@ -104,6 +104,7 @@ def run_vk_bot():
                         upload_resp = requests.post(upload_url, files=files).json()
                         
                         # 3. Сохраняем фото в ВК
+                                                # 3. Сохраняем фото в ВК
                         if 'photo' in upload_resp and upload_resp['photo'] and upload_resp['photo'] != '[]':
                             save_resp = vk.messages.saveMessagesPhoto(
                                 photo=upload_resp['photo'],
@@ -113,8 +114,10 @@ def run_vk_bot():
                             )
                             
                             if save_resp and len(save_resp) > 0:
+                                # В API 5.199 saveMessagesPhoto возвращает массив, берем нулевой элемент [0]
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+
                     except Exception as e:
                         print(f"Ошибка загрузки фото в ВК: {e}")
                         attachment = None
