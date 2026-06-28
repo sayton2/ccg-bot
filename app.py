@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.upload import VkUpload
 import requests
 import threading
 from flask import Flask
@@ -10,7 +11,7 @@ from PIL import Image
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Бот active"
+def home(): return "Бот работает"
 
 def start_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -34,8 +35,10 @@ RULES = {
 vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
+# Включаем официальный встроенный инструмент загрузки файлов ВК
+upload = VkUpload(vk_session)
 
-print("Бот-конвертер запущен на Render...")
+print("Бот на базе VkUpload успешно запущен на Render...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -82,31 +85,17 @@ for event in longpoll.listen():
             attachment = None
             if photo_content:
                 try:
-                    # НА ЛЕТУ ПЕРЕКОДИРУЕМ ИЗ WEBP В ЧИСТЫЙ JPEG ДЛЯ ВК
+                    # Конвертируем WebP с сайта в чистый JPEG в памяти
                     img = Image.open(io.BytesIO(photo_content)).convert("RGB")
                     output = io.BytesIO()
                     img.save(output, format="JPEG", quality=95)
-                    jpeg_content = output.getvalue()
+                    output.seek(0)
+                    # Присваиваем имя объекту в памяти, чтобы VkUpload понял тип файла
+                    output.name = 'card.jpg'
 
-                    upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
-                    upload_url = upload_server['upload_url']
-                    
-                    # Отправляем ВК настоящий JPEG файл
-                    files = {'photo': ('card.jpg', jpeg_content, 'image/jpeg')}
-                    upload_resp = requests.post(upload_url, files=files).json()
-                    
-                    if 'photo' in upload_resp and upload_resp['photo']:
-                        save_resp = vk.messages.saveMessagesPhoto(
-                            photo=upload_resp['photo'],
-                            server=upload_resp.get('server', 0),
-                            hash=upload_resp.get('hash', ''),
-                            v='5.131'
-                        )
-                        
-                        if save_resp and len(save_resp) > 0:
-    photo_data = save_resp[0]
-    attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
-
+                    # Самый надежный метод загрузки фото в сообщения ВК одной строкой
+                    photo = upload.photo_messages(photos=output, peer_id=peer_id)[0]
+                    attachment = f"photo{photo['owner_id']}_{photo['id']}"
                 except Exception:
                     attachment = None
 
@@ -122,9 +111,10 @@ for event in longpoll.listen():
             else:
                 vk.messages.send(
                     peer_id=peer_id, 
-                    message=f"❌ Ошибка загрузки картинки ВКонтакте.\nБот успешно скачал файл с сайта, но ВК отклонил сохранение медиафайла.", 
+                    message=f"❌ Ошибка!\nБот успешно скачал карту с сайта ep-ccg.ru, но встроенный метод VkUpload не смог загрузить её на сервера ВКонтакте.\nПроверьте права отправки медиафайлов в настройках сообщений группы.", 
                     random_id=0
                 )
+
 
 
 
