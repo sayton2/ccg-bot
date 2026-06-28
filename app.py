@@ -7,7 +7,7 @@ from flask import Flask
 import os
 import io
 from PIL import Image
-from urllib.parse import urljoin  # Безопасная склейка ссылок
+from urllib.parse import urljoin
 
 app = Flask(__name__)
 
@@ -62,7 +62,6 @@ def run_vk_bot():
                 prefix = "bgo-" if chosen_command == "!бго" else "bk-"
                 full_filename = prefix + card_name_lat + ".webp"
 
-                # Добавлен путь wp-content/uploads/ без привязки к дате
                 possible_paths = [
                     "wp-content/uploads/",
                     "wp-content/uploads/2026/06/",
@@ -81,7 +80,6 @@ def run_vk_bot():
                 }
 
                 for path in possible_paths:
-                    # Корректно объединяем базовый URL сайта и относительный путь к картинке
                     relative_url = f"{path.strip('/')}/{full_filename}"
                     photo_url = urljoin("https://ep-ccg.ru", relative_url)
                     last_tried_url = photo_url
@@ -119,6 +117,7 @@ def run_vk_bot():
                             )
                             
                             if save_resp and len(save_resp) > 0:
+                                # ИСПРАВЛЕНО: Добавлен строгий индекс [0] для API 5.199
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
@@ -157,6 +156,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
