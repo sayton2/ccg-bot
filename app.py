@@ -106,9 +106,10 @@ for event in longpoll.listen():
                         )
                         print(f"Ответ метода сохранения фото ВК: {save_resp}", flush=True)
                         
-                        if save_resp and len(save_resp) > 0:
-                            photo_data = save_resp
-                            attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+                        if save_resp:
+    photo_data = save_resp if isinstance(save_resp, list) else save_resp
+    attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+
                     else:
                         print("ВК вернул пустой блок 'photo' при загрузке бинарных данных.", flush=True)
                 except Exception as e:
