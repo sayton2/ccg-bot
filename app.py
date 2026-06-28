@@ -30,13 +30,13 @@ RULES = {
 }
 
 def run_vk_bot():
-    while True: # Бесконечный цикл для автоперезапуска при сбоях ВК
+    while True: # Автоперезапуск LongPoll при сбросе сессии со стороны ВК
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
             vk = vk_session.get_api()
             
             bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-            print("Финальный бот успешно запущен в фоне и слушает ВК...")
+            print("Финальный бот успешно запущен в фоне...")
             
             for event in bot_longpoll.listen():
                 if event.type == VkBotEventType.MESSAGE_NEW:
@@ -163,31 +163,16 @@ def run_vk_bot():
             print(f"Сбой LongPoll, перезапуск через 5 секунд... Ошибка: {main_err}")
             time.sleep(5)
 
-# Функция самопинга, чтобы сервер Render не уходил в спячку
-def keep_alive():
-    time.sleep(30) # Даем серверу сначала полностью запуститься
-    while True:
-        try:
-            # Скрипт стучится сам к себе каждые 10 минут
-            requests.get("http://127.0.0", timeout=5)
-        except Exception:
-            pass
-        time.sleep(600) # 10 минут
-
 if __name__ == '__main__':
-    # 1. Запуск бота ВК
+    # Запуск бота ВК
     bot_thread = threading.Thread(target=run_vk_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # 2. Запуск анти-сна
-    ping_thread = threading.Thread(target=keep_alive)
-    ping_thread.daemon = True
-    ping_thread.start()
-    
-    # 3. Запуск веб-сервера Flask
+    # Запуск веб-сервера Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
