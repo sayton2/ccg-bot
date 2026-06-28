@@ -5,10 +5,12 @@ import requests
 import threading
 from flask import Flask
 import os
+import io
+from PIL import Image
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Бот активен"
+def home(): return "Бот active"
 
 def start_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -33,7 +35,7 @@ vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.131')
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Финальный бот успешно запущен и слушает ВК...")
+print("Бот-конвертер запущен на Render...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -80,16 +82,20 @@ for event in longpoll.listen():
             attachment = None
             if photo_content:
                 try:
-                    # Исправленный вызов метода получения сервера ВК с явными параметрами
+                    # НА ЛЕТУ ПЕРЕКОДИРУЕМ ИЗ WEBP В ЧИСТЫЙ JPEG ДЛЯ ВК
+                    img = Image.open(io.BytesIO(photo_content)).convert("RGB")
+                    output = io.BytesIO()
+                    img.save(output, format="JPEG", quality=95)
+                    jpeg_content = output.getvalue()
+
                     upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id, v='5.131')
                     upload_url = upload_server['upload_url']
                     
-                    files = {'photo': ('card.png', photo_content, 'image/png')}
-
+                    # Отправляем ВК настоящий JPEG файл
+                    files = {'photo': ('card.jpg', jpeg_content, 'image/jpeg')}
                     upload_resp = requests.post(upload_url, files=files).json()
                     
                     if 'photo' in upload_resp and upload_resp['photo']:
-                        # Исправленный вызов сохранения фото с явным указанием версии
                         save_resp = vk.messages.saveMessagesPhoto(
                             photo=upload_resp['photo'],
                             server=upload_resp.get('server', 0),
@@ -98,7 +104,7 @@ for event in longpoll.listen():
                         )
                         
                         if save_resp and len(save_resp) > 0:
-                            photo_data = save_resp[0]
+                            photo_data = save_resp[0] if isinstance(save_resp, list) else save_resp
                             attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                 except Exception:
                     attachment = None
@@ -118,6 +124,7 @@ for event in longpoll.listen():
                     message=f"❌ Ошибка загрузки картинки ВКонтакте.\nБот успешно скачал файл с сайта, но ВК отклонил сохранение медиафайла.", 
                     random_id=0
                 )
+
 
 
 
