@@ -99,14 +99,23 @@ def run_vk_bot():
                     try:
                         img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
                         
-                        target_height = 1200
-                        if img.height < target_height:
-                            scale = target_height / img.height
-                            new_width = int(img.width * scale)
-                            img = img.resize((new_width, target_height), Image.Resampling.LANCZOS)
-
-                        white_bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                        final_img = Image.alpha_composite(white_bg, img).convert("RGB")
+                        # Создаем квадратный холст 1200х1200
+                        canvas_size = 1200
+                        white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+                        
+                        # Пропорционально подгоняем карту под высоту холста
+                        card_height = canvas_size
+                        scale = card_height / img.height
+                        card_width = int(img.width * scale)
+                        img = img.resize((card_width, card_height), Image.Resampling.LANCZOS)
+                        
+                        # Вычисляем координаты, чтобы вставить карту ровно по центру
+                        x_offset = (canvas_size - card_width) // 2
+                        y_offset = (canvas_size - card_height) // 2
+                        
+                        # Накладываем карту по центру белого квадрата
+                        white_bg.paste(img, (x_offset, y_offset), img)
+                        final_img = white_bg.convert("RGB")
 
                         output = io.BytesIO()
                         final_img.save(output, format="JPEG", quality=98, subsampling=0)
@@ -126,14 +135,13 @@ def run_vk_bot():
                             })
                             
                             if save_resp and len(save_resp) > 0:
-                                # Индекс [0] прописан жестко и защищен от съедания разметкой
                                 photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
                         vk_error_msg = str(e)
                         attachment = None
 
-                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Бер实к Классика"
+                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
                 if attachment:
                     vk_session.method('messages.send', {
@@ -163,6 +171,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
