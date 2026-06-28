@@ -21,7 +21,7 @@ threading.Thread(target=start_flask, daemon=True).start()
 
 # ==================== НАСТРОЙКИ ВКонтакте ====================
 # Вставьте сюда ваш действующий токен группы ВК
-VK_TOKEN = "vk1.a.X3AziWC5kugRJmL88Qdtx_SCoCdzl-UEC_0BqUrbBsh4cu0dHO5CZ4tv5ES3t_kYQKkixZjKh_6KFZZXeYcDNj24VfZpYzhunro5GZVVobpHweSsOU0pT0A96m1vKkiU67KaXhk-T3JEKmJSYD1qulypusVl9rmBzw0WTUw6ULuy6Vf0IlK4r6iLkbUB_66__x5OV1aTXOwydFqKQgJw_w"
+VK_TOKEN = "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A"
 # =============================================================
 
 RULES = {
