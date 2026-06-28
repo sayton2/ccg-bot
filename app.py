@@ -63,7 +63,8 @@ for event in longpoll.listen():
             # Картинки тянутся СТРОГО С ВАШЕГО САЙТА ep-ccg.ru по прямой ссылке со слэшем!
             s = chr(47)
             domain = "https:__ep-ccg.ru".replace("__", s + s)
-            path_folder = "wp-content" + s + "uploads" + s + "2026" + s + "06"
+            path_folder = "img"
+
             photo_url = domain + s + path_folder + s + full_filename + ".webp"
 
             photo_content = None
