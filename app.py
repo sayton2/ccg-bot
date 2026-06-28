@@ -33,7 +33,7 @@ vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-print("Бот успешно запущен на платформе Render и ищет карты на сайте...")
+print("Бот отладки запущен на Render...")
 
 for event in longpoll.listen():
     if event.type == VkEventType.MESSAGE_NEW and event.to_me:
@@ -58,7 +58,6 @@ for event in longpoll.listen():
             prefix = "bgo-" if chosen_command == "!бго" else "bk-"
             full_filename = prefix + card_name_lat + ".webp"
 
-            # Автоматический перебор папок месяцев в хранилище сайта (Июнь, Май, Апрель)
             possible_months = ["2026/06", "2026/05", "2026/04"]
             photo_content = None
             final_url = ""
@@ -75,12 +74,18 @@ for event in longpoll.listen():
                     if res.status_code == 200:
                         photo_content = res.content
                         final_url = photo_url
-                        break  # Картинка успешно скачана из хранилища — останавливаем поиск!
+                        break
                 except Exception:
                     continue
 
+            # --- БЛОК ОПРЕДЕЛЕНИЯ ПРИЧИНЫ ОШИБКИ ---
+            debug_status = "Начало проверки"
             attachment = None
-            if photo_content:
+
+            if not photo_content:
+                debug_status = f"ОШИБКА: Сайт ep-ccg.ru выдал ошибку 404. Файла {full_filename} физически НЕТ в папках uploads за 04, 05 и 06 месяцы."
+            else:
+                debug_status = f"УСПЕХ: Файл успешно скачан с сайта по ссылке: {final_url}! Отправляем на сервера ВК..."
                 try:
                     upload_server = vk.messages.getMessagesUploadServer(peer_id=peer_id)
                     upload_url = upload_server['upload_url']
@@ -94,9 +99,16 @@ for event in longpoll.listen():
                             server=upload_resp.get('server', 0),
                             hash=upload_resp.get('hash', '')
                         )
-                        attachment = f"photo{save_resp['owner_id']}_{save_resp['id']}"
-                except Exception:
-                    attachment = None
+                        
+                        if save_resp and len(save_resp) > 0:
+                            attachment = f"photo{save_resp[0]['owner_id']}_{save_resp[0]['id']}"
+                            debug_status = "УСПЕХ: ВК успешно сохранил фото и выдал attachment!"
+                        else:
+                            debug_status = f"ОШИБКА ВК: Метод saveMessagesPhoto вернул пустой ответ. Возможно, ВК не переварил бинарный WEBP-контент. Ответ сервера: {save_resp}"
+                    else:
+                        debug_status = f"ОШИБКА ВК: Сервер загрузки отклонил файл. Ответ: {upload_resp}"
+                except Exception as e:
+                    debug_status = f"КРИТИЧЕСКАЯ ОШИБКА В КОДЕ Python: {str(e)}"
 
             game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
 
@@ -108,12 +120,12 @@ for event in longpoll.listen():
                     random_id=0
                 )
             else:
-                last_url = f"https://ep-ccg.ru2026/06/{full_filename}"
                 vk.messages.send(
                     peer_id=peer_id, 
-                    message=f"❌ Ошибка!\nБот проверил папки хранилища на сайте ep-ccg.ru.\nФайл {full_filename} не найден в медиатеке или ВК отклонил загрузку.\nПример ссылки: {last_url}", 
+                    message=f"🔍 ОТЛАДКА БОТА:\n{debug_status}", 
                     random_id=0
                 )
+
 
 
 
