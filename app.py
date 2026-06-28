@@ -9,6 +9,7 @@ import io
 import time
 from PIL import Image
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed  # Для параллельного поиска
 
 app = Flask(__name__)
 
@@ -29,14 +30,26 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
+# Функция для одиночной проверки пути (выполняется параллельно)
+def fetch_photo(path, full_filename, headers):
+    relative_url = f"{path.strip('/')}/{full_filename}"
+    photo_url = urljoin("https://ep-ccg.ru", relative_url)
+    try:
+        res = requests.get(photo_url, headers=headers, timeout=2)
+        if res.status_code == 200:
+            return res.content, photo_url
+    except Exception:
+        pass
+    return None, photo_url
+
 def run_vk_bot():
-    while True: # Автоперезапуск LongPoll при сбросе сессии со стороны ВК
+    while True:
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
             vk = vk_session.get_api()
             
             bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-            print("Финальный бот успешно запущен в фоне...")
+            print("Скоростной бот успешно запущен в фоне...")
             
             for event in bot_longpoll.listen():
                 if event.type == VkBotEventType.MESSAGE_NEW:
@@ -81,18 +94,15 @@ def run_vk_bot():
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     }
 
-                    for path in possible_paths:
-                        relative_url = f"{path.strip('/')}/{full_filename}"
-                        photo_url = urljoin("https://ep-ccg.ru", relative_url)
-                        last_tried_url = photo_url
-                        
-                        try:
-                            res = requests.get(photo_url, headers=headers, timeout=2)
-                            if res.status_code == 200:
-                                photo_content = res.content
-                                break
-                        except Exception:
-                            continue
+                    # УСКОРЕНИЕ: Параллельный опрос всех папок одновременно через пул потоков
+                    with ThreadPoolExecutor(max_workers=len(possible_paths)) as executor:
+                        futures = [executor.submit(fetch_photo, path, full_filename, headers) for path in possible_paths]
+                        for future in as_completed(futures):
+                            content, tried_url = future.result()
+                            last_tried_url = tried_url
+                            if content:
+                                photo_content = content
+                                break # Как только нашли первую рабочую картинку, выходим
 
                     attachment = None
                     vk_error_msg = ""
@@ -116,7 +126,8 @@ def run_vk_bot():
                             final_img = white_bg.convert("RGB")
 
                             output = io.BytesIO()
-                            final_img.save(output, format="JPEG", quality=98, subsampling=0)
+                            # Оптимизация качества до 95% для моментальной передачи файла в ВК
+                            final_img.save(output, format="JPEG", quality=95, subsampling=0)
                             jpeg_bytes = output.getvalue()
 
                             server_resp = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
@@ -164,14 +175,13 @@ def run_vk_bot():
             time.sleep(5)
 
 if __name__ == '__main__':
-    # Запуск бота ВК
     bot_thread = threading.Thread(target=run_vk_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # Запуск веб-сервера Flask
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
