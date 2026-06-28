@@ -97,23 +97,18 @@ def run_vk_bot():
                 
                 if photo_content:
                     try:
-                        # Открываем оригинальный WebP (он в RGBA с прозрачностью)
                         img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
                         
-                        # Увеличиваем разрешение мелких картинок для четкости шрифтов
                         target_height = 1200
                         if img.height < target_height:
                             scale = target_height / img.height
                             new_width = int(img.width * scale)
                             img = img.resize((new_width, target_height), Image.Resampling.LANCZOS)
 
-                        # ИСПРАВЛЕНИЕ: Создаем чистый БЕЛЫЙ фон под размер картинки
                         white_bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                        # Накладываем карту на белый фон, сохраняя прозрачность углов
                         final_img = Image.alpha_composite(white_bg, img).convert("RGB")
 
                         output = io.BytesIO()
-                        # Сохраняем в максимальном качестве без сжатия цветов
                         final_img.save(output, format="JPEG", quality=98, subsampling=0)
                         jpeg_bytes = output.getvalue()
 
@@ -131,13 +126,14 @@ def run_vk_bot():
                             })
                             
                             if save_resp and len(save_resp) > 0:
-                                photo_data = save_resp
+                                # Индекс [0] прописан жестко и защищен от съедания разметкой
+                                photo_data = save_resp[0]
                                 attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
                     except Exception as e:
                         vk_error_msg = str(e)
                         attachment = None
 
-                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Бер实к Классика"
 
                 if attachment:
                     vk_session.method('messages.send', {
@@ -167,6 +163,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
