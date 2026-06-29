@@ -7,9 +7,11 @@ from flask import Flask
 import os
 import io
 import time
+import re
 from PIL import Image
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import difflib  # Алгоритм для исправления опечаток на лету
 
 app = Flask(__name__)
 
@@ -17,7 +19,7 @@ app = Flask(__name__)
 def home():
     return "Многопользовательский бот активен", 200
 
-# ==================== БЕЗОПАСНЫЕ НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
+# ==================== НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
 VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 # =====================================================================================
@@ -30,11 +32,59 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
+# Мгновенный кэш вложений ВК: { "raw_user_input": "photoXXXX_XXXX" }
+ATTACHMENT_CACHE = {}
+
+# Глобальный кэш списка файлов с сайта (автообновление раз в час)
+SITE_FILES_INDEX = []
+LAST_INDEX_UPDATE = 0
+INDEX_LOCK = threading.Lock()
+
+def update_site_files_index():
+    """Скачивает структуру папки uploads и собирает имена всех картинок на сайте"""
+    global SITE_FILES_INDEX, LAST_INDEX_UPDATE
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    target_urls = ["https://ep-ccg.ru"]
+    
+    found_files = []
+    for url in target_urls:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                # Ищем все ссылки на файлы .webp в HTML-коде страницы
+                links = re.findall(r'href="([^"]+\.webp)"', res.text, re.IGNORECASE)
+                for link in links:
+                    filename = link.split('/')[-1]
+                    if filename not in found_files:
+                        found_files.append(filename)
+        except Exception:
+            pass
+            
+    if found_files:
+        with INDEX_LOCK:
+            SITE_FILES_INDEX = found_files
+            LAST_INDEX_UPDATE = time.time()
+        print(f"Индекс файлов сайта обновлен! Доступно карт: {len(SITE_FILES_INDEX)}", flush=True)
+
+def get_smart_filename(target_filename):
+    """Ищет максимально похожий файл в индексе сайта с допуском опечаток"""
+    global SITE_FILES_INDEX, LAST_INDEX_UPDATE
+    
+    # Обновляем индекс файлов раз в час в фоновом режиме
+    if not SITE_FILES_INDEX or (time.time() - LAST_INDEX_UPDATE > 3600):
+        threading.Thread(target=update_site_files_index).start()
+        
+    if not SITE_FILES_INDEX:
+        return target_filename
+        
+    # Ищем файлы со схожестью не менее 75%
+    matches = difflib.get_close_matches(target_filename, SITE_FILES_INDEX, n=1, cutoff=0.75)
+    return matches[0] if matches else target_filename
+
 def fetch_photo(path, full_filename, headers):
     relative_url = f"{path.strip('/')}/{full_filename}"
     photo_url = urljoin("https://ep-ccg.ru", relative_url)
     try:
-        # ДОБАВЛЕНО: Увеличили таймаут до 4 секунд, чтобы Render успевал скачать файл
         res = requests.get(photo_url, headers=headers, timeout=4)
         if res.status_code == 200:
             return res.content, photo_url
@@ -43,6 +93,9 @@ def fetch_photo(path, full_filename, headers):
     return None, photo_url
 
 def run_vk_bot():
+    # Первичный сбор имён файлов при старте
+    update_site_files_index()
+    
     while True:
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
@@ -72,11 +125,28 @@ def run_vk_bot():
                             if not card_name_ru:
                                 continue
 
+                            # Ключ кэша строится на основе того, что именно ввёл пользователь
+                            cache_key = f"{chosen_command}_{card_name_ru}"
+
+                            # --- УМНЫЙ КЭШ ВК ---
+                            if cache_key in ATTACHMENT_CACHE:
+                                game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+                                vk_session.method('messages.send', {
+                                    'peer_id': peer_id,
+                                    'message': f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()} (из кэша ⚡)\n\nБаза карт: ep-ccg.ru",
+                                    'attachment': ATTACHMENT_CACHE[cache_key],
+                                    'random_id': 0
+                                })
+                                continue
+
                             cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
                             card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
                             
                             prefix = "bgo-" if chosen_command == "!бго" else "bk-"
-                            full_filename = prefix + card_name_lat + ".webp"
+                            ideal_filename = prefix + card_name_lat + ".webp"
+                            
+                            # --- АВТО-ИСПРАВЛЕНИЕ ОПЕЧАТОК ---
+                            full_filename = get_smart_filename(ideal_filename)
 
                             possible_paths = [
                                 "wp-content/uploads/",
@@ -90,7 +160,6 @@ def run_vk_bot():
                             
                             photo_content = None
                             last_tried_url = ""
-                            # ДОБАВЛЕНО: Более реалистичный User-Agent, чтобы сайт не думал, что это DDoS-скрипт
                             headers = {
                                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                             }
@@ -103,7 +172,6 @@ def run_vk_bot():
                                     if content:
                                         photo_content = content
                                         break
-
                             attachment = None
                             vk_error_msg = ""
                             
@@ -145,9 +213,12 @@ def run_vk_bot():
                                         
                                         actual_data = save_resp['response'] if 'response' in save_resp else save_resp
                                         if actual_data and len(actual_data) > 0:
-                                            # ВАШ ОРИГИНАЛЬНЫЙ СТРОГИЙ ВАРИАНТ
+                                            # Извлекаем первый элемент списка объектов фото ВК
                                             photo_data = actual_data[0]
                                             attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
+                                            
+                                            # Сохраняем вложение в кэш
+                                            ATTACHMENT_CACHE[cache_key] = attachment
                                 except Exception as e:
                                     vk_error_msg = str(e)
                                     attachment = None
@@ -180,6 +251,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
