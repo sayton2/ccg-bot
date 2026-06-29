@@ -8,31 +8,35 @@ import os
 import io
 import time
 import re
-import json
 from PIL import Image
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 
 app = Flask(__name__)
 
+# Метрика для проверки жизни потока
+last_bot_activity = time.time()
+
 @app.route('/')
 def home():
-    return "Public Card Bot is running", 200
+    global last_bot_activity
+    status = "OK" if time.time() - last_bot_activity < 300 else "STUCK?"
+    print(f"[PING] Received. Bot status: {status}", flush=True)
+    return f"Bot status: {status}", 200
 
-# ==================== НАСТРОЙКИ ТРАНСЛИТЕРАЦИИ ====================
+# ==================== НАСТРОЙКИ ====================
+VK_TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН")
+
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
-    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
     'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
     'ф': 'f', 'х': 'h', 'ц': 'cz', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-# Кэш вложений: { group_id: { "key": "photo_id" } }
-MULTI_GROUP_CACHE = {}
-
-# Глобальный индекс файлов сайта
+ATTACHMENT_CACHE = {} 
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
@@ -49,7 +53,7 @@ def update_site_files_index():
                 with INDEX_LOCK:
                     SITE_FILES_INDEX = found
                     LAST_INDEX_UPDATE = time.time()
-                print(f"[INDEX] Карт на сайте: {len(SITE_FILES_INDEX)}", flush=True)
+                print(f"[INDEX] Обновлен! Карт: {len(SITE_FILES_INDEX)}", flush=True)
     except: pass
 
 def get_smart_filename(target_filename):
@@ -57,39 +61,43 @@ def get_smart_filename(target_filename):
     matches = difflib.get_close_matches(target_filename, SITE_FILES_INDEX, n=1, cutoff=0.75)
     return matches[0] if matches else target_filename
 
-def fetch_photo(path, full_filename, headers):
-    photo_url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{full_filename}")
-    try:
-        res = requests.get(photo_url, headers=headers, timeout=4)
-        if res.status_code == 200: return res.content, photo_url
-    except: pass
-    return None, photo_url
-
-def clean_message_text(text):
-    """Удаляет упоминание бота из начала сообщения (для чатов)"""
+def clean_text(text):
+    """Очищает текст от упоминаний бота [club...|@bot]"""
     return re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', text).strip()
 
-def start_bot_instance(token, group_id):
-    """Запуск отдельного потока для каждой группы ВК"""
-    global MULTI_GROUP_CACHE
-    if group_id not in MULTI_GROUP_CACHE:
-        MULTI_GROUP_CACHE[group_id] = {}
-    cache = MULTI_GROUP_CACHE[group_id]
+def fetch_photo(path, filename, headers):
+    url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{quote(filename)}")
+    try:
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200: return res.content, url
+    except: pass
+    return None, url
 
+def run_vk_bot():
+    global last_bot_activity
+    update_site_files_index()
+    
     while True:
         try:
-            vk_session = vk_api.VkApi(token=token, api_version='5.199')
-            lp = VkBotLongPoll(vk_session, group_id=group_id)
-            print(f"[BOT {group_id}] Подключен!", flush=True)
+            vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
+            vk = vk_session.get_api()
             
-            for event in lp.listen():
+            # Автоматически узнаем ID группы, чтобы бот мог работать везде
+            group_info = vk.groups.getById()[0]
+            group_id = group_info['id']
+            print(f"[VK] Бот '{group_info['name']}' запущен!", flush=True)
+            
+            longpoll = VkBotLongPoll(vk_session, group_id)
+            
+            for event in longpoll.listen():
+                last_bot_activity = time.time() # Обновляем время активности
+                
                 if event.type == VkBotEventType.MESSAGE_NEW:
                     msg = event.obj.message
-                    raw_text = msg.get('text', '')
                     peer_id = msg.get('peer_id')
+                    raw_text = msg.get('text', '')
                     
-                    # Очищаем от упоминаний и переводим в нижний регистр
-                    text = clean_message_text(raw_text)
+                    text = clean_text(raw_text)
                     text_lower = text.lower()
 
                     cmd = None
@@ -99,27 +107,27 @@ def start_bot_instance(token, group_id):
                             break
                     if not cmd: continue
 
-                    card_name_ru = text[len(cmd) + 1:].strip().lower()
-                    if not card_name_ru: continue
-
-                    cache_key = f"{cmd}_{card_name_ru}"
-
-                    # --- ПРОВЕРКА КЭША (Текст теперь одинаковый для всех) ---
+                    card_name = text[len(cmd) + 1:].strip()
+                    if not card_name: continue
+                    
+                    print(f"[EVENT] Запрос от {peer_id}: {card_name}", flush=True)
+                    
+                    cache_key = f"{group_id}_{cmd}_{card_name.lower()}"
                     game_title = "Берсерк Герои" if cmd == "!бго" else "Берсерк Классика"
-                    response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
+                    # Чистое сообщение без пометки о кэше
+                    response_msg = f"🃏 [{game_title}] Карта: {card_name.capitalize()}\n\nБаза карт: ep-ccg.ru"
 
-                    if cache_key in cache:
-                        vk_session.method('messages.send', {
-                            'peer_id': peer_id, 'message': response_msg,
-                            'attachment': cache[cache_key], 'random_id': 0
-                        })
+                    if cache_key in ATTACHMENT_CACHE:
+                        vk.messages.send(peer_id=peer_id, message=response_msg, attachment=ATTACHMENT_CACHE[cache_key], random_id=0)
                         continue
 
-                    # --- ПОИСК КАРТЫ ---
-                    cleaned = card_name_ru.replace(" ", "-").replace("_", "-")
-                    lat_name = "".join(RULES.get(c, c) for c in cleaned)
+                    # --- ПОИСК ---
                     prefix = "bgo-" if cmd == "!бго" else "bk-"
-                    full_filename = get_smart_filename(prefix + lat_name + ".webp")
+                    clean_name = card_name.lower().replace(" ", "-").replace("_", "-")
+                    
+                    # Генерируем имя файла с новой транслитерацией (cz)
+                    ideal_name = f"{prefix}{''.join(RULES.get(c,c) for c in clean_name)}.webp"
+                    full_filename = get_smart_filename(ideal_name)
 
                     paths = ["wp-content/uploads/2026/06/", "wp-content/uploads/2026/05/", "wp-content/uploads/", "wp-content/uploads/2024/05/", "wp-content/uploads/2024/06/"]
                     photo_content, headers = None, {'User-Agent': 'Mozilla/5.0'}
@@ -128,9 +136,7 @@ def start_bot_instance(token, group_id):
                         futures = [ex.submit(fetch_photo, p, full_filename, headers) for p in paths]
                         for f in as_completed(futures):
                             cnt, url = f.result()
-                            if cnt:
-                                photo_content = cnt
-                                break
+                            if cnt: photo_content = cnt; break
                     
                     if photo_content:
                         try:
@@ -139,53 +145,32 @@ def start_bot_instance(token, group_id):
                             canvas = Image.new("RGBA", (800, 800), (255, 255, 255, 255))
                             scale = 800 / img.height
                             img = img.resize((int(img.width * scale), 800), Image.Resampling.BILINEAR)
-                            canvas.paste(img, ((800 - img.width) // 2, 0), img)
+                            canvas.paste(img, ((800 - img.width)//2, 0), img)
                             out = io.BytesIO()
                             canvas.convert("RGB").save(out, format="JPEG", quality=90)
-
-                            # Загрузка в ВК
-                            up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-                            up_res = requests.post(up_srv['upload_url'], files={'photo': ('c.jpg', out.getvalue(), 'image/jpeg')}).json()
-                            sv_res = vk_session.method('photos.saveMessagesPhoto', {'photo': up_res['photo'], 'server': up_res['server'], 'hash': up_res['hash']})
+                            
+                            # Загрузка
+                            up_url = vk.photos.getMessagesUploadServer(peer_id=peer_id)['upload_url']
+                            up_res = requests.post(up_url, files={'photo': ('c.jpg', out.getvalue(), 'image/jpeg')}).json()
+                            sv_res = vk.photos.saveMessagesPhoto(photo=up_res['photo'], server=up_res['server'], hash=up_res['hash'])
                             
                             att = f"photo{sv_res[0]['owner_id']}_{sv_res[0]['id']}"
-                            cache[cache_key] = att # Сохраняем в кэш группы
-                            
-                            vk_session.method('messages.send', {
-                                'peer_id': peer_id, 'message': response_msg,
-                                'attachment': att, 'random_id': 0
-                            })
+                            ATTACHMENT_CACHE[cache_key] = att
+                            vk.messages.send(peer_id=peer_id, message=response_msg, attachment=att, random_id=0)
+                            print(f"[SUCCESS] Отправлено: {card_name}", flush=True)
                         except Exception as e:
-                            print(f"[ERR] {e}")
+                            print(f"[ERR] {e}", flush=True)
                     else:
-                        vk_session.method('messages.send', {'peer_id': peer_id, 'message': f"❌ Карта не найдена!\nФайл: {full_filename}", 'random_id': 0})
+                        vk.messages.send(peer_id=peer_id, message=f"❌ Карта '{card_name}' не найдена.", random_id=0)
 
         except Exception as e:
-            print(f"[RESTART {group_id}] {e}")
+            print(f"[CRITICAL] {e}. Рестарт через 10с...", flush=True)
             time.sleep(10)
 
 if __name__ == '__main__':
-    update_site_files_index()
-    
-    # 1. Загружаем основную группу из Env
-    main_token = os.environ.get("VK_TOKEN")
-    main_id = os.environ.get("GROUP_ID")
-    
-    configs = []
-    if main_token and main_id:
-        configs.append({"token": main_token, "group_id": int(main_id)})
-    
-    # 2. Поддержка дополнительных групп (через JSON в Env переменной EXTRA_BOTS)
-    extra_bots_raw = os.environ.get("EXTRA_BOTS")
-    if extra_bots_raw:
-        try:
-            configs.extend(json.loads(extra_bots_raw))
-        except: print("Ошибка парсинга EXTRA_BOTS")
-
-    for cfg in configs:
-        threading.Thread(target=start_bot_instance, args=(cfg["token"], cfg["group_id"]), daemon=True).start()
-    
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    threading.Thread(target=run_vk_bot, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 
 
