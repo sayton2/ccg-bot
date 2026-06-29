@@ -9,41 +9,37 @@ import io
 import time
 import re
 from PIL import Image
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 
 app = Flask(__name__)
 
-# Метрика для проверки жизни потока
-last_bot_activity = time.time()
-
 @app.route('/')
 def home():
-    global last_bot_activity
-    status = "OK" if time.time() - last_bot_activity < 300 else "STUCK?"
-    print(f"[PING] Received. Bot status: {status}", flush=True)
-    return f"Bot status: {status}", 200
+    return "Многопользовательский бот активен", 200
 
-# ==================== НАСТРОЙКИ ====================
-VK_TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН")
+# ==================== НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
+VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A")
+GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
+# =====================================================================================
 
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
-    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
     'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
     'ф': 'f', 'х': 'h', 'ц': 'cz', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-ATTACHMENT_CACHE = {} 
+ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
 
 def update_site_files_index():
     global SITE_FILES_INDEX, LAST_INDEX_UPDATE
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         res = requests.get("https://ep-ccg.ru", headers=headers, timeout=10)
         if res.status_code == 200:
@@ -53,7 +49,7 @@ def update_site_files_index():
                 with INDEX_LOCK:
                     SITE_FILES_INDEX = found
                     LAST_INDEX_UPDATE = time.time()
-                print(f"[INDEX] Обновлен! Карт: {len(SITE_FILES_INDEX)}", flush=True)
+                print(f"Индекс обновлен! Карт: {len(SITE_FILES_INDEX)}", flush=True)
     except: pass
 
 def get_smart_filename(target_filename):
@@ -61,114 +57,109 @@ def get_smart_filename(target_filename):
     matches = difflib.get_close_matches(target_filename, SITE_FILES_INDEX, n=1, cutoff=0.75)
     return matches[0] if matches else target_filename
 
-def clean_text(text):
-    """Очищает текст от упоминаний бота [club...|@bot]"""
-    return re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', text).strip()
-
-def fetch_photo(path, filename, headers):
-    url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{quote(filename)}")
+def fetch_photo(path, full_filename, headers):
+    photo_url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{full_filename}")
     try:
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200: return res.content, url
+        res = requests.get(photo_url, headers=headers, timeout=4)
+        if res.status_code == 200: return res.content, photo_url
     except: pass
-    return None, url
+    return None, photo_url
 
 def run_vk_bot():
-    global last_bot_activity
     update_site_files_index()
-    
     while True:
         try:
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
-            vk = vk_session.get_api()
+            bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
+            print("Бот успешно запущен и слушает ВК...", flush=True)
             
-            # Автоматически узнаем ID группы, чтобы бот мог работать везде
-            group_info = vk.groups.getById()[0]
-            group_id = group_info['id']
-            print(f"[VK] Бот '{group_info['name']}' запущен!", flush=True)
-            
-            longpoll = VkBotLongPoll(vk_session, group_id)
-            
-            for event in longpoll.listen():
-                last_bot_activity = time.time() # Обновляем время активности
-                
-                if event.type == VkBotEventType.MESSAGE_NEW:
-                    msg = event.obj.message
-                    peer_id = msg.get('peer_id')
-                    raw_text = msg.get('text', '')
-                    
-                    text = clean_text(raw_text)
-                    text_lower = text.lower()
-
-                    cmd = None
-                    for c in ["!бго", "!бк"]:
-                        if text_lower.startswith(c + " "):
-                            cmd = c
-                            break
-                    if not cmd: continue
-
-                    card_name = text[len(cmd) + 1:].strip()
-                    if not card_name: continue
-                    
-                    print(f"[EVENT] Запрос от {peer_id}: {card_name}", flush=True)
-                    
-                    cache_key = f"{group_id}_{cmd}_{card_name.lower()}"
-                    game_title = "Берсерк Герои" if cmd == "!бго" else "Берсерк Классика"
-                    # Чистое сообщение без пометки о кэше
-                    response_msg = f"🃏 [{game_title}] Карта: {card_name.capitalize()}\n\nБаза карт: ep-ccg.ru"
-
-                    if cache_key in ATTACHMENT_CACHE:
-                        vk.messages.send(peer_id=peer_id, message=response_msg, attachment=ATTACHMENT_CACHE[cache_key], random_id=0)
-                        continue
-
-                    # --- ПОИСК ---
-                    prefix = "bgo-" if cmd == "!бго" else "bk-"
-                    clean_name = card_name.lower().replace(" ", "-").replace("_", "-")
-                    
-                    # Генерируем имя файла с новой транслитерацией (cz)
-                    ideal_name = f"{prefix}{''.join(RULES.get(c,c) for c in clean_name)}.webp"
-                    full_filename = get_smart_filename(ideal_name)
-
-                    paths = ["wp-content/uploads/2026/06/", "wp-content/uploads/2026/05/", "wp-content/uploads/", "wp-content/uploads/2024/05/", "wp-content/uploads/2024/06/"]
-                    photo_content, headers = None, {'User-Agent': 'Mozilla/5.0'}
-
-                    with ThreadPoolExecutor(max_workers=5) as ex:
-                        futures = [ex.submit(fetch_photo, p, full_filename, headers) for p in paths]
-                        for f in as_completed(futures):
-                            cnt, url = f.result()
-                            if cnt: photo_content = cnt; break
-                    
-                    if photo_content:
-                        try:
-                            # Обработка картинки
-                            img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
-                            canvas = Image.new("RGBA", (800, 800), (255, 255, 255, 255))
-                            scale = 800 / img.height
-                            img = img.resize((int(img.width * scale), 800), Image.Resampling.BILINEAR)
-                            canvas.paste(img, ((800 - img.width)//2, 0), img)
-                            out = io.BytesIO()
-                            canvas.convert("RGB").save(out, format="JPEG", quality=90)
+            while True:
+                try:
+                    events = bot_longpoll.check()
+                    for event in events:
+                        if event.type == VkBotEventType.MESSAGE_NEW:
+                            message_obj = event.obj.message
+                            raw_text = message_obj.get('text', '').strip()
+                            peer_id = message_obj.get('peer_id')
                             
-                            # Загрузка
-                            up_url = vk.photos.getMessagesUploadServer(peer_id=peer_id)['upload_url']
-                            up_res = requests.post(up_url, files={'photo': ('c.jpg', out.getvalue(), 'image/jpeg')}).json()
-                            sv_res = vk.photos.saveMessagesPhoto(photo=up_res['photo'], server=up_res['server'], hash=up_res['hash'])
-                            
-                            att = f"photo{sv_res[0]['owner_id']}_{sv_res[0]['id']}"
-                            ATTACHMENT_CACHE[cache_key] = att
-                            vk.messages.send(peer_id=peer_id, message=response_msg, attachment=att, random_id=0)
-                            print(f"[SUCCESS] Отправлено: {card_name}", flush=True)
-                        except Exception as e:
-                            print(f"[ERR] {e}", flush=True)
-                    else:
-                        vk.messages.send(peer_id=peer_id, message=f"❌ Карта '{card_name}' не найдена.", random_id=0)
+                            # ЧИСТКА ОТ УПОМИНАНИЙ (Для работы в беседах других сообществ)
+                            text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
+                            text_lower = text.lower()
 
-        except Exception as e:
-            print(f"[CRITICAL] {e}. Рестарт через 10с...", flush=True)
-            time.sleep(10)
+                            chosen_command = None
+                            for command in ["!бго", "!бк"]:
+                                if text_lower.startswith(command + " "):
+                                    chosen_command = command
+                                    break
+                            if not chosen_command: continue
+
+                            card_name_ru = text[len(chosen_command) + 1:].strip().lower()
+                            if not card_name_ru: continue
+
+                            cache_key = f"{chosen_command}_{card_name_ru}"
+                            game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+                            # ЧИСТЫЙ ТЕКСТ (без надписи про кэш)
+                            response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
+
+                            if cache_key in ATTACHMENT_CACHE:
+                                vk_session.method('messages.send', {'peer_id': peer_id, 'message': response_msg, 'attachment': ATTACHMENT_CACHE[cache_key], 'random_id': 0})
+                                continue
+
+                            cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
+                            card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
+                            prefix = "bgo-" if chosen_command == "!бго" else "bk-"
+                            ideal_filename = prefix + card_name_lat + ".webp"
+                            full_filename = get_smart_filename(ideal_filename)
+
+                            possible_paths = [
+                                "wp-content/uploads/2026/06/", "wp-content/uploads/2026/05/",
+                                "wp-content/uploads/", "2026/06/", "2026/05/", 
+                                "wp-content/uploads/2024/05/", "wp-content/uploads/2024/06/"
+                            ]
+                            
+                            photo_content, last_tried_url, headers = None, "", {'User-Agent': 'Mozilla/5.0'}
+
+                            with ThreadPoolExecutor(max_workers=len(possible_paths)) as executor:
+                                futures = [executor.submit(fetch_photo, path, full_filename, headers) for path in possible_paths]
+                                for future in as_completed(futures):
+                                    content, tried_url = future.result()
+                                    if content: photo_content, last_tried_url = content, tried_url; break
+                            
+                            if photo_content:
+                                try:
+                                    img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
+                                    canvas_size = 800
+                                    white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+                                    scale = canvas_size / img.height
+                                    card_width = int(img.width * scale)
+                                    img = img.resize((card_width, canvas_size), Image.Resampling.BILINEAR)
+                                    white_bg.paste(img, ((canvas_size - card_width) // 2, 0), img)
+                                    output = io.BytesIO()
+                                    white_bg.convert("RGB").save(output, format="JPEG", quality=90)
+
+                                    up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+                                    upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
+                                    upload_resp = requests.post(upload_url, files={'photo': ('card.jpg', output.getvalue(), 'image/jpeg')}).json()
+                                    save_resp = vk_session.method('photos.saveMessagesPhoto', {'photo': upload_resp['photo'], 'server': upload_resp['server'], 'hash': upload_resp['hash']})
+                                    
+                                    actual_data = save_resp['response'] if 'response' in save_resp else save_resp
+                                    attachment = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+                                    ATTACHMENT_CACHE[cache_key] = attachment
+                                    
+                                    vk_session.method('messages.send', {'peer_id': peer_id, 'message': response_msg, 'attachment': attachment, 'random_id': 0})
+                                except Exception as e:
+                                    vk_session.method('messages.send', {'peer_id': peer_id, 'message': f"❌ Ошибка ВК: {e}", 'random_id': 0})
+                            else:
+                                vk_session.method('messages.send', {'peer_id': peer_id, 'message': f"❌ Карта не найдена!\nФайл: {full_filename}", 'random_id': 0})
+                except Exception: time.sleep(1)
+                time.sleep(0.1)
+        except Exception: time.sleep(5)
 
 if __name__ == '__main__':
-    threading.Thread(target=run_vk_bot, daemon=True).start()
+    bot_thread = threading.Thread(target=run_vk_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
