@@ -9,7 +9,7 @@ import io
 import time
 from PIL import Image
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
@@ -18,8 +18,7 @@ def home():
     return "Многопользовательский бот активен", 200
 
 # ==================== НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
-# Вставьте ваш токен в переменные окружения на хостинге!
-VK_TOKEN = os.environ.get("VK_TOKEN", "УКАЖИТЕ_ТОКЕН_В_ПЕРЕМЕННЫХ_ОКРУЖЕНИЯ")
+VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.BALD32iIlxqRFAkhbeNf_ov9m4nXt-Kw9VY3A_JHaIDm5AbgfCumitU_Wkwr3j2FJCEcAKS7DZTuPm_5cmbuHEtNdFIGCwf5ObrPf1agvu6nYefQ7kdKwEIaZT63A5cmC9lf8kiASrIqcC8GjCfclXX517KPSL8wEbXDGvnw-BEFIIU09vJx1v_XQn8T4rlVnmtfuQaa75uSq_J6IVbM3A")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 # =====================================================================================
 
@@ -35,7 +34,7 @@ def fetch_photo(path, full_filename, headers):
     relative_url = f"{path.strip('/')}/{full_filename}"
     photo_url = urljoin("https://ep-ccg.ru", relative_url)
     try:
-        res = requests.get(photo_url, headers=headers, timeout=3)
+        res = requests.get(photo_url, headers=headers, timeout=4)
         if res.status_code == 200:
             return res.content, photo_url
     except Exception:
@@ -43,7 +42,6 @@ def fetch_photo(path, full_filename, headers):
     return None, photo_url
 
 def process_message(event, vk_session):
-    """Функция для параллельной обработки каждого отдельного сообщения"""
     try:
         message_obj = event.obj.message
         text = message_obj.get('text', '').strip()
@@ -80,22 +78,19 @@ def process_message(event, vk_session):
         ]
 
         photo_content = None
-        # По умолчанию берем URL из первого пути на случай, если вообще ничего не найдет
         last_tried_url = urljoin("https://ep-ccg.ru", f"{possible_paths[0]}{full_filename}")
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
 
-        # Поиск картинки на сайте в несколько потоков
-        with ThreadPoolExecutor(max_workers=len(possible_paths)) as executor:
-            futures = {executor.submit(fetch_photo, path, full_filename, headers): path for path in possible_paths}
-            for future in as_completed(futures):
-                content, tried_url = future.result()
-                if content:
-                    photo_content = content
-                    last_tried_url = tried_url
-                    break
-                else:
-                    # Запоминаем последний проверенный URL, где искали
-                    last_tried_url = tried_url
+        # Последовательный обход путей с паузой для обхода блокировок сайта
+        for path in possible_paths:
+            content, tried_url = fetch_photo(path, full_filename, headers)
+            last_tried_url = tried_url
+            if content:
+                photo_content = content
+                break
+            time.sleep(0.1)
 
         attachment = None
         vk_error_msg = ""
@@ -138,6 +133,7 @@ def process_message(event, vk_session):
                     
                     actual_data = save_resp.get('response', save_resp)
                     if actual_data and len(actual_data) > 0:
+                        # ИСПРАВЛЕНО: Безопасное извлечение первого элемента из списка объектов фото ВК
                         photo_data = actual_data[0]
                         attachment = f"photo{photo_data['owner_id']}_{photo_data['id']}"
             except Exception as e:
@@ -161,30 +157,31 @@ def process_message(event, vk_session):
             vk_session.method('messages.send', {'peer_id': peer_id, 'message': err_text, 'random_id': 0})
             
     except Exception as main_e:
-        print(f"Ошибка при обработке сообщения: {main_e}")
+        print(f"Ошибка при обработке сообщения: {main_e}", flush=True)
 
 def run_vk_bot():
     while True:
         try:
+            print("Логирование: Инициализация сессии ВК...", flush=True)
             vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
             bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-            print("Бот успешно запущен и слушает ВК...")
+            print("Логирование: Бот успешно запущен и слушает ВК!", flush=True)
             
-            # Пул потоков для одновременной обработки входящих сообщений от разных пользователей
-            with ThreadPoolExecutor(max_workers=20) as message_executor:
+            with ThreadPoolExecutor(max_workers=10) as message_executor:
                 while True:
                     try:
-                        # check() ждет событий от ВК. Блокирующий метод.
                         events = bot_longpoll.check()
                         for event in events:
                             if event.type == VkBotEventType.MESSAGE_NEW:
-                                # Передаем обработку каждого сообщения в отдельный поток
                                 message_executor.submit(process_message, event, vk_session)
+                    except requests.exceptions.RequestException:
+                        print("Логирование: Сетевой сбой. Переподключение LongPoll...", flush=True)
+                        break
                     except Exception as e:
-                        print(f"Ошибка внутри LongPoll цикла: {e}")
-                        time.sleep(1)
+                        print(f"Логирование: Ошибка LongPoll цикла: {e}", flush=True)
+                        time.sleep(2)
         except Exception as e:
-            print(f"Критическая ошибка сессии ВК: {e}. Перезапуск через 5 секунд...")
+            print(f"Логирование: Критическая ошибка создания сессии: {e}. Повтор через 5 секунд...", flush=True)
             time.sleep(5)
 
 if __name__ == '__main__':
@@ -194,6 +191,7 @@ if __name__ == '__main__':
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
 
 
