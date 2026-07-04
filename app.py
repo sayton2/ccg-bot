@@ -277,24 +277,29 @@ def run_vk_bot():
                             text_lower = text.lower()
 
                             # ==================== !deck ====================
-                            if text_lower.startswith("!deck"):
-                                deck_text = text[5:].strip()
-                                if not deck_text:
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': "Использование: !deck [текст колоды из декбилдера]",
-                                        'random_id': 0
-                                    })
-                                    continue
+                         if text_lower.startswith("!deck"):
+    deck_text = text[5:].strip()
+    if not deck_text:
+        vk_session.method('messages.send', {
+            'peer_id': peer_id,
+            'message': "Использование: !deck [текст колоды из декбилдера]",
+            'random_id': 0
+        })
+        continue
 
-                                hero_name, cards = parse_deck_text(deck_text)
-                                if not cards:
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': "❌ Не удалось распознать колоду. Вставьте текст из декбилдера полностью.",
-                                        'random_id': 0
-                                    })
-                                    continue
+    print(f"[DECK] Получен текст длиной {len(deck_text)} символов", flush=True)
+    print(f"[DECK] Первые 300 символов: {repr(deck_text[:300])}", flush=True)
+
+    hero_name, cards = parse_deck_text(deck_text)
+    print(f"[DECK] Герой: '{hero_name}', карт: {len(cards)}", flush=True)
+
+    if not cards:
+        vk_session.method('messages.send', {
+            'peer_id': peer_id,
+            'message': "❌ Не удалось распознать колоду. Вставьте текст из декбилдера полностью.",
+            'random_id': 0
+        })
+        continue
 
                                 total_cards = sum(c[0] for c in cards)
 
