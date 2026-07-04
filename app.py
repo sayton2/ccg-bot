@@ -85,6 +85,7 @@ def get_card_element(card_name_ru):
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
         res = requests.get(url, timeout=5)
+        print(f"[ELEMENT] slug={slug} status={res.status_code} data={res.text[:200]}", flush=True)
         if res.status_code == 200:
             data = res.json()
             if data and isinstance(data, list):
@@ -94,8 +95,8 @@ def get_card_element(card_name_ru):
                         element = m.group(1)
                         ELEMENT_CACHE[slug] = element
                         return element
-    except:
-        pass
+    except Exception as e:
+        print(f"[ELEMENT ERROR] {e}", flush=True)
     ELEMENT_CACHE[slug] = 'neutral'
     return 'neutral'
 
@@ -234,15 +235,18 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
 def parse_deck_text(text):
     hero_name = ""
     cards = []
-    lines = text.splitlines()
-    # Имя героя из второй строки вида "Герой: Имя"
-    if len(lines) >= 2:
-        m_hero = re.match(r"[Гг]ерой[:\s]+(.+)", lines[1].strip())
+    for line in text.splitlines():
+        # Убираем ведущий "# " или "#"
+        clean = re.sub(r'^#+\s*', '', line).strip()
+        if not clean:
+            continue
+        # Имя героя
+        m_hero = re.match(r'[Гг]ерой[:\s]+(.+)', clean)
         if m_hero:
             hero_name = m_hero.group(1).strip()
-    for line in lines:
-        line = line.strip()
-        m = re.match(r"#\s*(\d+)x\s*\((\d+)\)\s*(.+)", line)
+            continue
+        # Карта: 2x (0) Цветение
+        m = re.match(r'(\d+)x\s*\((\d+)\)\s*(.+)', clean)
         if m:
             count = int(m.group(1))
             cost  = int(m.group(2))
