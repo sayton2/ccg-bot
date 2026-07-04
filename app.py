@@ -34,21 +34,20 @@ RULES = {
 
 # Цвета стихий
 ELEMENT_COLORS = {
-    'steppe':  (210, 170,  30),   # жёлтый
-    'mountain':(70,  130, 200),   # синий
-    'swamp':   (140, 180, 130),   # бледно-зелёный
-    'forest':  (60,  150,  60),   # зелёный
-    'dark':    (120,  60, 180),   # фиолетовый
-    'neutral': (160, 120,  60),   # бронзовый
+    'steppe':   (210, 170,  30),   # жёлтый
+    'mountain': (70,  130, 200),   # синий
+    'swamp':    (140, 180, 130),   # бледно-зелёный
+    'forest':   (60,  150,  60),   # зелёный
+    'dark':     (120,  60, 180),   # фиолетовый
+    'neutral':  (160, 120,  60),   # бронзовый
 }
-DEFAULT_ELEMENT_COLOR = (160, 120, 60)  # бронзовый по умолчанию
+DEFAULT_ELEMENT_COLOR = (160, 120, 60)
 
 ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
 
-# Кэш стихий карт: slug -> element_key
 ELEMENT_CACHE = {}
 
 # ==================== ИНДЕКС САЙТА ====================
@@ -82,7 +81,6 @@ def to_lat(text):
 # ==================== СТИХИЯ КАРТЫ ====================
 
 def get_card_element(card_name_ru):
-    """Получает стихию карты через WordPress API по slug."""
     slug = to_lat(card_name_ru.strip().lower())
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
@@ -174,9 +172,6 @@ HEADER_COLOR = (200, 150, 30)
 SUBHEADER_COLOR = (100, 200, 80)
 
 def build_deck_image(hero_name, total_cards, max_cards, cards):
-    """
-    cards: list of (cost, name, count, img_bytes, element_key)
-    """
     font_header = get_font(26)
     font_sub = get_font(16)
     font_card = get_font(17)
@@ -190,7 +185,6 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     canvas = Image.new("RGB", (img_w, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
-    # Заголовок
     draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
     draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
 
@@ -200,15 +194,12 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
         art_w = CARD_W - COST_W - COUNT_W
 
-        # Арт карты — верхняя центральная часть
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Масштабируем по высоте полосы
                 scale = CARD_H / card_img.height
                 new_w = int(card_img.width * scale)
                 card_img = card_img.resize((new_w, CARD_H), Image.Resampling.BILINEAR)
-                # Берём верхнюю центральную часть
                 start_x = max(0, (new_w - art_w) // 2)
                 card_img = card_img.crop((start_x, 0, start_x + art_w, CARD_H))
                 canvas.paste(card_img, (COST_W, row_y))
@@ -217,21 +208,17 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         else:
             draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
 
-        # Затемнение для читаемости текста
         overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 110))
         canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (COST_W, row_y), overlay)
 
-        # Стоимость — цвет стихии
         draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=(0, 0, 0))
 
-        # Название карты
         draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2), name, font=font_card, fill=(255, 255, 255))
 
-        # Количество — цвет стихии
         draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
@@ -239,7 +226,6 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
                   count_str, font=font_count, fill=(0, 0, 0))
 
-        # Разделитель
         draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
         y += CARD_H + PADDING
 
@@ -309,7 +295,6 @@ def run_vk_bot():
 
                                 total_cards = sum(c[0] for c in cards)
 
-                                # Параллельно загружаем арт и стихию для каждой карты
                                 def load_card(item):
                                     count, cost, name = item
                                     img = download_card_image(name, prefix="bgo-")
@@ -445,8 +430,3 @@ if __name__ == '__main__':
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-    
-
-
-
-
