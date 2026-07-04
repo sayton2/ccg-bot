@@ -32,14 +32,13 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-# Цвета стихий
 ELEMENT_COLORS = {
-    'steppe':   (210, 170,  30),   # жёлтый
-    'mountain': (70,  130, 200),   # синий
-    'swamp':    (140, 180, 130),   # бледно-зелёный
-    'forest':   (60,  150,  60),   # зелёный
-    'dark':     (120,  60, 180),   # фиолетовый
-    'neutral':  (160, 120,  60),   # бронзовый
+    'steppe':   (210, 170,  30),
+    'mountain': ( 70, 130, 200),
+    'swamp':    (140, 180, 130),
+    'forest':   ( 60, 150,  60),
+    'dark':     (120,  60, 180),
+    'neutral':  (160, 120,  60),
 }
 DEFAULT_ELEMENT_COLOR = (160, 120, 60)
 
@@ -47,7 +46,6 @@ ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
-
 ELEMENT_CACHE = {}
 
 # ==================== ИНДЕКС САЙТА ====================
@@ -90,8 +88,7 @@ def get_card_element(card_name_ru):
         if res.status_code == 200:
             data = res.json()
             if data and isinstance(data, list):
-                classes = data[0].get('class_list', [])
-                for cls in classes:
+                for cls in data[0].get('class_list', []):
                     m = re.match(r'mmf_element-(\w+)', cls)
                     if m:
                         element = m.group(1)
@@ -109,11 +106,8 @@ POSSIBLE_PATHS = [
     "wp-content/uploads/2026/06/",
     "wp-content/uploads/2026/05/",
     "wp-content/uploads/",
-    "2026/07/",
-    "2026/06/",
-    "2026/05/",
-    "wp-content/uploads/2024/05/",
     "wp-content/uploads/2024/06/",
+    "wp-content/uploads/2024/05/",
 ]
 
 def fetch_photo(path, full_filename, headers):
@@ -173,16 +167,13 @@ SUBHEADER_COLOR = (100, 200, 80)
 
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     font_header = get_font(26)
-    font_sub = get_font(16)
-    font_card = get_font(17)
-    font_cost = get_font(20)
-    font_count = get_font(17)
+    font_sub    = get_font(16)
+    font_card   = get_font(17)
+    font_cost   = get_font(20)
+    font_count  = get_font(17)
 
-    num_cards = len(cards)
-    img_h = HEADER_H + num_cards * (CARD_H + PADDING) + PADDING
-    img_w = CARD_W
-
-    canvas = Image.new("RGB", (img_w, img_h), BG_COLOR)
+    img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
+    canvas = Image.new("RGB", (CARD_W, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
     draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
@@ -194,6 +185,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
         art_w = CARD_W - COST_W - COUNT_W
 
+        # Арт — верхняя центральная полоска карты
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -208,17 +200,21 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         else:
             draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
 
+        # Затемнение для читаемости текста
         overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 110))
         canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (COST_W, row_y), overlay)
 
+        # Стоимость (цвет стихии)
         draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=(0, 0, 0))
 
+        # Название карты
         draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2), name, font=font_card, fill=(255, 255, 255))
 
+        # Количество (цвет стихии)
         draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
@@ -238,16 +234,19 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
 def parse_deck_text(text):
     hero_name = ""
     cards = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    # Имя героя из второй строки вида "Герой: Имя"
+    if len(lines) >= 2:
+        m_hero = re.match(r"[Гг]ерой[:\s]+(.+)", lines[1].strip())
+        if m_hero:
+            hero_name = m_hero.group(1).strip()
+    for line in lines:
         line = line.strip()
-        if line.startswith("###"):
-            hero_name = line.lstrip("#").strip()
-            continue
         m = re.match(r"#\s*(\d+)x\s*\((\d+)\)\s*(.+)", line)
         if m:
             count = int(m.group(1))
-            cost = int(m.group(2))
-            name = m.group(3).strip()
+            cost  = int(m.group(2))
+            name  = m.group(3).strip()
             cards.append((count, cost, name))
     return hero_name, cards
 
@@ -268,7 +267,7 @@ def run_vk_bot():
                         if event.type == VkBotEventType.MESSAGE_NEW:
                             message_obj = event.obj.message
                             raw_text = message_obj.get('text', '').strip()
-                            peer_id = message_obj.get('peer_id')
+                            peer_id  = message_obj.get('peer_id')
 
                             text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
                             text_lower = text.lower()
@@ -297,7 +296,7 @@ def run_vk_bot():
 
                                 def load_card(item):
                                     count, cost, name = item
-                                    img = download_card_image(name, prefix="bgo-")
+                                    img     = download_card_image(name, prefix="bgo-")
                                     element = get_card_element(name)
                                     return cost, name, count, img, element
 
@@ -322,7 +321,7 @@ def run_vk_bot():
                                     'hash': upload_resp['hash']
                                 })
                                 actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-                                attachment = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+                                attachment  = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
 
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
@@ -345,7 +344,7 @@ def run_vk_bot():
                             if not card_name_ru:
                                 continue
 
-                            cache_key = f"{chosen_command}_{card_name_ru}"
+                            cache_key  = f"{chosen_command}_{card_name_ru}"
                             game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
                             response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
 
@@ -358,11 +357,11 @@ def run_vk_bot():
                                 })
                                 continue
 
-                            cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
-                            card_name_lat = to_lat(cleaned_text)
-                            prefix = "bgo-" if chosen_command == "!бго" else "bk-"
-                            ideal_filename = prefix + card_name_lat + ".webp"
-                            full_filename = get_smart_filename(ideal_filename)
+                            cleaned_text    = card_name_ru.replace(" ", "-").replace("_", "-")
+                            card_name_lat   = to_lat(cleaned_text)
+                            prefix          = "bgo-" if chosen_command == "!бго" else "bk-"
+                            ideal_filename  = prefix + card_name_lat + ".webp"
+                            full_filename   = get_smart_filename(ideal_filename)
 
                             photo_content = None
                             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -395,7 +394,7 @@ def run_vk_bot():
                                         'hash': upload_resp['hash']
                                     })
                                     actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-                                    attachment = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+                                    attachment  = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
                                     ATTACHMENT_CACHE[cache_key] = attachment
 
                                     vk_session.method('messages.send', {
