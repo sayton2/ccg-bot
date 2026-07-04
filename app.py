@@ -32,10 +32,24 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
+# Цвета стихий
+ELEMENT_COLORS = {
+    'steppe':  (210, 170,  30),   # жёлтый
+    'mountain':(70,  130, 200),   # синий
+    'swamp':   (140, 180, 130),   # бледно-зелёный
+    'forest':  (60,  150,  60),   # зелёный
+    'dark':    (120,  60, 180),   # фиолетовый
+    'neutral': (160, 120,  60),   # бронзовый
+}
+DEFAULT_ELEMENT_COLOR = (160, 120, 60)  # бронзовый по умолчанию
+
 ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
+
+# Кэш стихий карт: slug -> element_key
+ELEMENT_CACHE = {}
 
 # ==================== ИНДЕКС САЙТА ====================
 
@@ -64,6 +78,31 @@ def get_smart_filename(target_filename):
 def to_lat(text):
     cleaned = text.replace(" ", "-").replace("_", "-")
     return "".join(RULES.get(c, c) for c in cleaned)
+
+# ==================== СТИХИЯ КАРТЫ ====================
+
+def get_card_element(card_name_ru):
+    """Получает стихию карты через WordPress API по slug."""
+    slug = to_lat(card_name_ru.strip().lower())
+    if slug in ELEMENT_CACHE:
+        return ELEMENT_CACHE[slug]
+    try:
+        url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data and isinstance(data, list):
+                classes = data[0].get('class_list', [])
+                for cls in classes:
+                    m = re.match(r'mmf_element-(\w+)', cls)
+                    if m:
+                        element = m.group(1)
+                        ELEMENT_CACHE[slug] = element
+                        return element
+    except:
+        pass
+    ELEMENT_CACHE[slug] = 'neutral'
+    return 'neutral'
 
 # ==================== ЗАГРУЗКА КАРТ ====================
 
@@ -103,25 +142,9 @@ def download_card_image(card_name_ru, prefix="bgo-"):
                 return content
     return None
 
-# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
-
-CARD_W = 280
-CARD_H = 48
-COST_W = 36
-COUNT_W = 40
-PADDING = 6
-HEADER_H = 80
-BG_COLOR = (18, 22, 30)
-COST_COLOR = (200, 150, 30)
-COST_TEXT_COLOR = (0, 0, 0)
-NAME_BG = (30, 35, 45, 180)
-COUNT_BG = (200, 150, 30)
-COUNT_TEXT_COLOR = (0, 0, 0)
-HEADER_COLOR = (200, 150, 30)
-SUBHEADER_COLOR = (100, 200, 80)
+# ==================== ШРИФТ ====================
 
 def get_font(size):
-    # Пробуем найти системный шрифт с кириллицей
     font_paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -138,9 +161,21 @@ def get_font(size):
                 pass
     return ImageFont.load_default()
 
+# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
+
+CARD_W = 280
+CARD_H = 48
+COST_W = 36
+COUNT_W = 40
+PADDING = 3
+HEADER_H = 80
+BG_COLOR = (18, 22, 30)
+HEADER_COLOR = (200, 150, 30)
+SUBHEADER_COLOR = (100, 200, 80)
+
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     """
-    cards: list of (cost, name, count, image_bytes_or_None)
+    cards: list of (cost, name, count, img_bytes, element_key)
     """
     font_header = get_font(26)
     font_sub = get_font(16)
@@ -155,56 +190,54 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     canvas = Image.new("RGB", (img_w, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
-    # Заголовок — имя героя
+    # Заголовок
     draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
-    # Подзаголовок — количество карт
     draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
 
     y = HEADER_H
-    for cost, name, count, img_bytes in cards:
+    for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        # Арт карты (весь ряд как фон)
+        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        art_w = CARD_W - COST_W - COUNT_W
+
+        # Арт карты — верхняя центральная часть
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Обрезаем/масштабируем под полосу
-                art_w = CARD_W - COST_W - COUNT_W
+                # Масштабируем по высоте полосы
                 scale = CARD_H / card_img.height
                 new_w = int(card_img.width * scale)
                 card_img = card_img.resize((new_w, CARD_H), Image.Resampling.BILINEAR)
-                # Берём правую часть арта
-                crop_x = max(0, new_w - art_w)
-                card_img = card_img.crop((crop_x, 0, crop_x + art_w, CARD_H))
+                # Берём верхнюю центральную часть
+                start_x = max(0, (new_w - art_w) // 2)
+                card_img = card_img.crop((start_x, 0, start_x + art_w, CARD_H))
                 canvas.paste(card_img, (COST_W, row_y))
             except:
-                # Заглушка если арт не загрузился
                 draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
         else:
             draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
 
-        # Затемнение на арте для читаемости текста
-        overlay = Image.new("RGBA", (CARD_W - COST_W - COUNT_W, CARD_H), (0, 0, 0, 120))
-        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)),
-                     (COST_W, row_y),
-                     overlay)
+        # Затемнение для читаемости текста
+        overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 110))
+        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (COST_W, row_y), overlay)
 
-        # Стоимость — левый блок
-        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=COST_COLOR)
+        # Стоимость — цвет стихии
+        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=COST_TEXT_COLOR)
+        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=(0, 0, 0))
 
         # Название карты
         draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2), name, font=font_card, fill=(255, 255, 255))
 
-        # Количество — правый блок
-        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=COUNT_BG)
+        # Количество — цвет стихии
+        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
         tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
         draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
-                  count_str, font=font_count, fill=COUNT_TEXT_COLOR)
+                  count_str, font=font_count, fill=(0, 0, 0))
 
         # Разделитель
         draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
@@ -217,23 +250,13 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
 # ==================== ПАРСИНГ КОЛОДЫ ====================
 
 def parse_deck_text(text):
-    """
-    Парсит текст вида:
-    ### Имя героя
-    # Герой: Имя героя
-    # 2x (0) Название карты
-    ...
-    Возвращает (hero_name, [(count, cost, card_name), ...])
-    """
     hero_name = ""
     cards = []
     for line in text.splitlines():
         line = line.strip()
-        # Имя героя из ### строки
         if line.startswith("###"):
             hero_name = line.lstrip("#").strip()
             continue
-        # Строки карт: # Nx (стоимость) Название
         m = re.match(r"#\s*(\d+)x\s*\((\d+)\)\s*(.+)", line)
         if m:
             count = int(m.group(1))
@@ -261,7 +284,6 @@ def run_vk_bot():
                             raw_text = message_obj.get('text', '').strip()
                             peer_id = message_obj.get('peer_id')
 
-                            # Чистка от упоминаний
                             text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
                             text_lower = text.lower()
 
@@ -287,18 +309,16 @@ def run_vk_bot():
 
                                 total_cards = sum(c[0] for c in cards)
 
-                                # Загружаем арты параллельно
+                                # Параллельно загружаем арт и стихию для каждой карты
                                 def load_card(item):
                                     count, cost, name = item
                                     img = download_card_image(name, prefix="bgo-")
-                                    return cost, name, count, img
+                                    element = get_card_element(name)
+                                    return cost, name, count, img, element
 
-                                card_data = []
                                 with ThreadPoolExecutor(max_workers=10) as executor:
-                                    results = list(executor.map(load_card, cards))
-                                card_data = results  # (cost, name, count, img_bytes)
+                                    card_data = list(executor.map(load_card, cards))
 
-                                # Сортируем по стоимости
                                 card_data.sort(key=lambda x: x[0])
 
                                 img_bytes = build_deck_image(
@@ -308,7 +328,6 @@ def run_vk_bot():
                                     card_data
                                 )
 
-                                # Загружаем в ВК
                                 up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                                 upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
                                 upload_resp = requests.post(upload_url, files={'photo': ('deck.jpg', img_bytes, 'image/jpeg')}).json()
