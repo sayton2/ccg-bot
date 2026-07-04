@@ -8,7 +8,7 @@ import os
 import io
 import time
 import re
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
@@ -19,10 +19,10 @@ app = Flask(__name__)
 def home():
     return "Многопользовательский бот активен", 200
 
-# ==================== НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ) ====================
+# ==================== НАСТРОЙКИ ====================
 VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.T5Pbv3wIbB4GMeo7K35-pOAe4VRe084e6Yk8F4d6VgpA37bFPnGMUkAiPx2pql3QHudrZD8H9yHMPkWQqIm9DPqh6Ogccw5DUV-eQDxZD0--ASEzF1lP9yPcBZuVJPewneTsmYCM_dOp5aBVycYSl2hxkOrnRWa6Ew7VijQTXr2vJG0pLJ77yuz_DwPn1hSnpilKv2PixLWo0e-WfTmCoA")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
-# =====================================================================================
+# ====================================================
 
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
@@ -36,6 +36,8 @@ ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
+
+# ==================== ИНДЕКС САЙТА ====================
 
 def update_site_files_index():
     global SITE_FILES_INDEX, LAST_INDEX_UPDATE
@@ -59,6 +61,24 @@ def get_smart_filename(target_filename):
     matches = difflib.get_close_matches(target_filename, SITE_FILES_INDEX, n=1, cutoff=0.75)
     return matches[0] if matches else target_filename
 
+def to_lat(text):
+    cleaned = text.replace(" ", "-").replace("_", "-")
+    return "".join(RULES.get(c, c) for c in cleaned)
+
+# ==================== ЗАГРУЗКА КАРТ ====================
+
+POSSIBLE_PATHS = [
+    "wp-content/uploads/2026/07/",
+    "wp-content/uploads/2026/06/",
+    "wp-content/uploads/2026/05/",
+    "wp-content/uploads/",
+    "2026/07/",
+    "2026/06/",
+    "2026/05/",
+    "wp-content/uploads/2024/05/",
+    "wp-content/uploads/2024/06/",
+]
+
 def fetch_photo(path, full_filename, headers):
     photo_url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{full_filename}")
     try:
@@ -68,6 +88,161 @@ def fetch_photo(path, full_filename, headers):
     except:
         pass
     return None, photo_url
+
+def download_card_image(card_name_ru, prefix="bgo-"):
+    cleaned = card_name_ru.strip().lower()
+    lat = to_lat(cleaned)
+    ideal = prefix + lat + ".webp"
+    filename = get_smart_filename(ideal)
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
+        futures = [executor.submit(fetch_photo, path, filename, headers) for path in POSSIBLE_PATHS]
+        for future in as_completed(futures):
+            content, _ = future.result()
+            if content:
+                return content
+    return None
+
+# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
+
+CARD_W = 280
+CARD_H = 48
+COST_W = 36
+COUNT_W = 40
+PADDING = 6
+HEADER_H = 80
+BG_COLOR = (18, 22, 30)
+COST_COLOR = (200, 150, 30)
+COST_TEXT_COLOR = (0, 0, 0)
+NAME_BG = (30, 35, 45, 180)
+COUNT_BG = (200, 150, 30)
+COUNT_TEXT_COLOR = (0, 0, 0)
+HEADER_COLOR = (200, 150, 30)
+SUBHEADER_COLOR = (100, 200, 80)
+
+def get_font(size):
+    # Пробуем найти системный шрифт с кириллицей
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except:
+                pass
+    return ImageFont.load_default()
+
+def build_deck_image(hero_name, total_cards, max_cards, cards):
+    """
+    cards: list of (cost, name, count, image_bytes_or_None)
+    """
+    font_header = get_font(26)
+    font_sub = get_font(16)
+    font_card = get_font(17)
+    font_cost = get_font(20)
+    font_count = get_font(17)
+
+    num_cards = len(cards)
+    img_h = HEADER_H + num_cards * (CARD_H + PADDING) + PADDING
+    img_w = CARD_W
+
+    canvas = Image.new("RGB", (img_w, img_h), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # Заголовок — имя героя
+    draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
+    # Подзаголовок — количество карт
+    draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
+
+    y = HEADER_H
+    for cost, name, count, img_bytes in cards:
+        row_y = y
+        # Арт карты (весь ряд как фон)
+        if img_bytes:
+            try:
+                card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                # Обрезаем/масштабируем под полосу
+                art_w = CARD_W - COST_W - COUNT_W
+                scale = CARD_H / card_img.height
+                new_w = int(card_img.width * scale)
+                card_img = card_img.resize((new_w, CARD_H), Image.Resampling.BILINEAR)
+                # Берём правую часть арта
+                crop_x = max(0, new_w - art_w)
+                card_img = card_img.crop((crop_x, 0, crop_x + art_w, CARD_H))
+                canvas.paste(card_img, (COST_W, row_y))
+            except:
+                # Заглушка если арт не загрузился
+                draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
+        else:
+            draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
+
+        # Затемнение на арте для читаемости текста
+        overlay = Image.new("RGBA", (CARD_W - COST_W - COUNT_W, CARD_H), (0, 0, 0, 120))
+        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)),
+                     (COST_W, row_y),
+                     overlay)
+
+        # Стоимость — левый блок
+        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=COST_COLOR)
+        cost_str = str(cost)
+        bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=COST_TEXT_COLOR)
+
+        # Название карты
+        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2), name, font=font_card, fill=(255, 255, 255))
+
+        # Количество — правый блок
+        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=COUNT_BG)
+        count_str = f"{count}x"
+        bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
+        tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
+        draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
+                  count_str, font=font_count, fill=COUNT_TEXT_COLOR)
+
+        # Разделитель
+        draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
+        y += CARD_H + PADDING
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=92)
+    return output.getvalue()
+
+# ==================== ПАРСИНГ КОЛОДЫ ====================
+
+def parse_deck_text(text):
+    """
+    Парсит текст вида:
+    ### Имя героя
+    # Герой: Имя героя
+    # 2x (0) Название карты
+    ...
+    Возвращает (hero_name, [(count, cost, card_name), ...])
+    """
+    hero_name = ""
+    cards = []
+    for line in text.splitlines():
+        line = line.strip()
+        # Имя героя из ### строки
+        if line.startswith("###"):
+            hero_name = line.lstrip("#").strip()
+            continue
+        # Строки карт: # Nx (стоимость) Название
+        m = re.match(r"#\s*(\d+)x\s*\((\d+)\)\s*(.+)", line)
+        if m:
+            count = int(m.group(1))
+            cost = int(m.group(2))
+            name = m.group(3).strip()
+            cards.append((count, cost, name))
+    return hero_name, cards
+
+# ==================== ОСНОВНОЙ БОТ ====================
 
 def run_vk_bot():
     update_site_files_index()
@@ -86,10 +261,74 @@ def run_vk_bot():
                             raw_text = message_obj.get('text', '').strip()
                             peer_id = message_obj.get('peer_id')
 
-                            # ЧИСТКА ОТ УПОМИНАНИЙ (для работы в беседах других сообществ)
+                            # Чистка от упоминаний
                             text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
                             text_lower = text.lower()
 
+                            # ==================== !deck ====================
+                            if text_lower.startswith("!deck"):
+                                deck_text = text[5:].strip()
+                                if not deck_text:
+                                    vk_session.method('messages.send', {
+                                        'peer_id': peer_id,
+                                        'message': "Использование: !deck [текст колоды из декбилдера]",
+                                        'random_id': 0
+                                    })
+                                    continue
+
+                                hero_name, cards = parse_deck_text(deck_text)
+                                if not cards:
+                                    vk_session.method('messages.send', {
+                                        'peer_id': peer_id,
+                                        'message': "❌ Не удалось распознать колоду. Вставьте текст из декбилдера полностью.",
+                                        'random_id': 0
+                                    })
+                                    continue
+
+                                total_cards = sum(c[0] for c in cards)
+
+                                # Загружаем арты параллельно
+                                def load_card(item):
+                                    count, cost, name = item
+                                    img = download_card_image(name, prefix="bgo-")
+                                    return cost, name, count, img
+
+                                card_data = []
+                                with ThreadPoolExecutor(max_workers=10) as executor:
+                                    results = list(executor.map(load_card, cards))
+                                card_data = results  # (cost, name, count, img_bytes)
+
+                                # Сортируем по стоимости
+                                card_data.sort(key=lambda x: x[0])
+
+                                img_bytes = build_deck_image(
+                                    hero_name or "Колода",
+                                    total_cards,
+                                    60,
+                                    card_data
+                                )
+
+                                # Загружаем в ВК
+                                up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+                                upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
+                                upload_resp = requests.post(upload_url, files={'photo': ('deck.jpg', img_bytes, 'image/jpeg')}).json()
+                                save_resp = vk_session.method('photos.saveMessagesPhoto', {
+                                    'photo': upload_resp['photo'],
+                                    'server': upload_resp['server'],
+                                    'hash': upload_resp['hash']
+                                })
+                                actual_data = save_resp['response'] if 'response' in save_resp else save_resp
+                                attachment = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+
+                                vk_session.method('messages.send', {
+                                    'peer_id': peer_id,
+                                    'message': "",
+                                    'attachment': attachment,
+                                    'random_id': 0
+                                })
+                                continue
+
+                            # ==================== !бго / !бк ====================
                             chosen_command = None
                             for command in ["!бго", "!бк"]:
                                 if text_lower.startswith(command + " "):
@@ -116,34 +355,19 @@ def run_vk_bot():
                                 continue
 
                             cleaned_text = card_name_ru.replace(" ", "-").replace("_", "-")
-                            card_name_lat = "".join(RULES.get(char, char) for char in cleaned_text)
+                            card_name_lat = to_lat(cleaned_text)
                             prefix = "bgo-" if chosen_command == "!бго" else "bk-"
                             ideal_filename = prefix + card_name_lat + ".webp"
                             full_filename = get_smart_filename(ideal_filename)
 
-                            possible_paths = [
-                                "wp-content/uploads/2026/07/",
-                                "wp-content/uploads/2026/06/",
-                                "wp-content/uploads/2026/05/",
-                                "wp-content/uploads/",
-                                "2026/07/",
-                                "2026/06/",
-                                "2026/05/",
-                                "wp-content/uploads/2024/05/",
-                                "wp-content/uploads/2024/06/",
-                            ]
-
                             photo_content = None
-                            last_tried_url = ""
                             headers = {'User-Agent': 'Mozilla/5.0'}
-
-                            with ThreadPoolExecutor(max_workers=len(possible_paths)) as executor:
-                                futures = [executor.submit(fetch_photo, path, full_filename, headers) for path in possible_paths]
+                            with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
+                                futures = [executor.submit(fetch_photo, path, full_filename, headers) for path in POSSIBLE_PATHS]
                                 for future in as_completed(futures):
-                                    content, tried_url = future.result()
+                                    content, _ = future.result()
                                     if content:
                                         photo_content = content
-                                        last_tried_url = tried_url
                                         break
 
                             if photo_content:
@@ -166,7 +390,6 @@ def run_vk_bot():
                                         'server': upload_resp['server'],
                                         'hash': upload_resp['hash']
                                     })
-
                                     actual_data = save_resp['response'] if 'response' in save_resp else save_resp
                                     attachment = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
                                     ATTACHMENT_CACHE[cache_key] = attachment
@@ -189,6 +412,7 @@ def run_vk_bot():
                                     'message': f"❌ Карта не найдена!\nФайл: {full_filename}",
                                     'random_id': 0
                                 })
+
                 except Exception:
                     time.sleep(1)
                 time.sleep(0.1)
