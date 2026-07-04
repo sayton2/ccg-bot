@@ -87,19 +87,23 @@ def get_card_element(card_name_ru):
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
         res = requests.get(url, timeout=7)
-        print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
+        print(f"[ELEMENT] '{card_name_ru}' -> slug='{slug}' status={res.status_code}", flush=True)
         if res.status_code == 200:
             data = res.json()
-            if data and isinstance(data, list):
+            print(f"[ELEMENT] data={data}", flush=True)
+            if data and isinstance(data, list) and len(data) > 0:
                 for cls in data[0].get('class_list', []):
                     m = re.match(r'mmf_element-(\w+)', cls)
                     if m:
                         element = m.group(1)
                         ELEMENT_CACHE[slug] = element
-                        print(f"[ELEMENT] Найден: {slug} -> {element}", flush=True)
+                        print(f"[ELEMENT] OK: '{card_name_ru}' -> '{element}'", flush=True)
                         return element
+                print(f"[ELEMENT] mmf_element не найден в class_list: {data[0].get('class_list', [])}", flush=True)
+            else:
+                print(f"[ELEMENT] Пустой ответ для slug='{slug}' — карта не найдена на сайте", flush=True)
     except Exception as e:
-        print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
+        print(f"[ELEMENT ERROR] '{card_name_ru}': {e}", flush=True)
 
     ELEMENT_CACHE[slug] = 'neutral'
     return 'neutral'
@@ -188,32 +192,34 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-        art_x = COST_W - 2
-        art_w = CARD_W - COST_W - COUNT_W + 4
 
-        # Арт карты — центральная часть (лицо персонажа)
+        # Арт занимает всю ширину карточки с перекрытием под цветные блоки
+        # Рисуем арт от -10 до CARD_W+10 чтобы гарантированно скрыть рамки
+        art_x     = -10
+        art_w     = CARD_W + 20
+
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Масштабируем по ширине арта
+                # Масштабируем так чтобы ширина арта совпала с art_w
                 scale = art_w / card_img.width
                 new_h = int(card_img.height * scale)
                 card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
-                # Берём центральную часть по вертикали (лицо ~25% от верха)
+                # Центральная часть по вертикали (~25% сверху — зона лица)
                 offset_y = int(new_h * 0.25)
                 offset_y = min(offset_y, max(0, new_h - CARD_H))
                 card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
                 canvas.paste(card_img, (art_x, row_y))
             except:
-                draw.rectangle([art_x, row_y, art_x + art_w, row_y + CARD_H], fill=(40, 45, 55))
+                draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
         else:
-            draw.rectangle([art_x, row_y, art_x + art_w, row_y + CARD_H], fill=(40, 45, 55))
+            draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
 
-        # Затемнение для читаемости текста
-        overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 120))
-        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (art_x, row_y), overlay)
+        # Затемнение поверх арта для читаемости текста
+        overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 110))
+        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), (20, 25, 35)), (0, row_y), overlay)
 
-        # Стоимость (цвет стихии)
+        # Стоимость (цветной блок стихии слева)
         draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
@@ -225,7 +231,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
                   name, font=font_card, fill=(255, 255, 255))
 
-        # Количество (цвет стихии)
+        # Количество (цветной блок стихии справа)
         draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
