@@ -20,7 +20,7 @@ def home():
     return "Многопользовательский бот активен", 200
 
 # ==================== НАСТРОЙКИ ====================
-VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a.T5Pbv3wIbB4GMeo7K35-pOAe4VRe084e6Yk8F4d6VgpA37bFPnGMUkAiPx2pql3QHudrZD8H9yHMPkWQqIm9DPqh6Ogccw5DUV-eQDxZD0--ASEzF1lP9yPcBZuVJPewneTsmYCM_dOp5aBVycYSl2hxkOrnRWa6Ew7VijQTXr2vJG0pLJ77yuz_DwPn1hSnpilKv2PixLWo0e-WfTmCoA")
+VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 # ====================================================
 
@@ -33,10 +33,10 @@ RULES = {
 }
 
 ELEMENT_COLORS = {
+    'forest':   ( 60, 150,  60),
     'steppe':   (210, 170,  30),
     'mountain': ( 70, 130, 200),
-    'swamp':    (140, 180, 130),
-    'forest':   ( 60, 150,  60),
+    'swamp':    (100, 160, 110),
     'dark':     (120,  60, 180),
     'neutral':  (160, 120,  60),
 }
@@ -78,51 +78,31 @@ def to_lat(text):
 
 # ==================== СТИХИЯ КАРТЫ ====================
 
-HEADERS_SITE = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
-    'Referer': 'https://ep-ccg.ru/',
-    'Accept-Language': 'ru-RU,ru;q=0.9',
-}
-
 def get_card_element(card_name_ru):
     slug = to_lat(card_name_ru.strip().lower())
+
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
 
-    # Парсим HTML страницы карты
     try:
-        url = f"https://ep-ccg.ru/{slug}/"
-        res = requests.get(url, headers=HEADERS_SITE, timeout=7)
+        url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
+        res = requests.get(url, timeout=7)
         print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
         if res.status_code == 200:
-            # Ищем класс стихии в body или article
-            m = re.search(r'mmf_element-(\w+)', res.text)
-            if m:
-                element = m.group(1)
-                ELEMENT_CACHE[slug] = element
-                print(f"[ELEMENT] Найден: {slug} -> {element}", flush=True)
-                return element
+            data = res.json()
+            if data and isinstance(data, list):
+                for cls in data[0].get('class_list', []):
+                    m = re.match(r'mmf_element-(\w+)', cls)
+                    if m:
+                        element = m.group(1)
+                        ELEMENT_CACHE[slug] = element
+                        print(f"[ELEMENT] Найден: {slug} -> {element}", flush=True)
+                        return element
     except Exception as e:
         print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
 
-    # Запасной вариант — угадать по имени
-    name_lower = card_name_ru.lower()
-    if any(w in name_lower for w in ['лес', 'эльм', 'чащ', 'дриад', 'лик', 'зверин', 'маути', 'найтин', 'вилрайн']):
-        element = 'forest'
-    elif any(w in name_lower for w in ['болот', 'топ', 'трясин', 'пыл', 'туман']):
-        element = 'swamp'
-    elif any(w in name_lower for w in ['степ', 'песк', 'пуст', 'цвет']):
-        element = 'steppe'
-    elif any(w in name_lower for w in ['гор', 'камен', 'скал', 'антар', 'катак']):
-        element = 'mountain'
-    elif any(w in name_lower for w in ['тьм', 'тём', 'мрак', 'тен', 'тем']):
-        element = 'dark'
-    else:
-        element = 'neutral'
-
-    print(f"[ELEMENT] Угадан: {slug} -> {element}", flush=True)
-    ELEMENT_CACHE[slug] = element
-    return element
+    ELEMENT_CACHE[slug] = 'neutral'
+    return 'neutral'
 
 # ==================== ЗАГРУЗКА КАРТ ====================
 
@@ -180,14 +160,14 @@ def get_font(size):
 
 # ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
 
-CARD_W = 280
-CARD_H = 48
-COST_W = 36
-COUNT_W = 40
-PADDING = 3
+CARD_W   = 300
+CARD_H   = 52
+COST_W   = 36
+COUNT_W  = 42
+PADDING  = 3
 HEADER_H = 80
-BG_COLOR = (18, 22, 30)
-HEADER_COLOR = (200, 150, 30)
+BG_COLOR        = (18, 22, 30)
+HEADER_COLOR    = (200, 150, 30)
 SUBHEADER_COLOR = (100, 200, 80)
 
 def build_deck_image(hero_name, total_cards, max_cards, cards):
@@ -208,35 +188,42 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-        art_w = CARD_W - COST_W - COUNT_W
+        art_x = COST_W - 2
+        art_w = CARD_W - COST_W - COUNT_W + 4
 
-        # Арт — верхняя центральная полоска карты
+        # Арт карты — центральная часть (лицо персонажа)
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Масштабируем по ширине арта, берём верхние CARD_H пикселей
+                # Масштабируем по ширине арта
                 scale = art_w / card_img.width
                 new_h = int(card_img.height * scale)
                 card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
-                # Берём верхнюю часть (центр-верх как в декбилдере)
-                card_img = card_img.crop((0, 0, art_w, CARD_H))
-                canvas.paste(card_img, (COST_W, row_y))
+                # Берём центральную часть по вертикали (лицо ~25% от верха)
+                offset_y = int(new_h * 0.25)
+                offset_y = min(offset_y, max(0, new_h - CARD_H))
+                card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
+                canvas.paste(card_img, (art_x, row_y))
             except:
-                draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
+                draw.rectangle([art_x, row_y, art_x + art_w, row_y + CARD_H], fill=(40, 45, 55))
+        else:
+            draw.rectangle([art_x, row_y, art_x + art_w, row_y + CARD_H], fill=(40, 45, 55))
 
         # Затемнение для читаемости текста
-        overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 110))
-        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (COST_W, row_y), overlay)
+        overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 120))
+        canvas.paste(Image.new("RGB", overlay.size, (20, 25, 35)), (art_x, row_y), overlay)
 
         # Стоимость (цвет стихии)
         draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2), cost_str, font=font_cost, fill=(0, 0, 0))
+        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2),
+                  cost_str, font=font_cost, fill=(0, 0, 0))
 
         # Название карты
-        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2), name, font=font_card, fill=(255, 255, 255))
+        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
+                  name, font=font_card, fill=(255, 255, 255))
 
         # Количество (цвет стихии)
         draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
@@ -259,16 +246,13 @@ def parse_deck_text(text):
     hero_name = ""
     cards = []
     for line in text.splitlines():
-        # Убираем ведущие # и пробелы
         clean = re.sub(r'^#+\s*', '', line).strip()
         if not clean:
             continue
-        # Имя героя
         m_hero = re.match(r'[Гг]ерой[:\s]+(.+)', clean)
         if m_hero:
             hero_name = m_hero.group(1).strip()
             continue
-        # Карта: 2x (0) Цветение
         m = re.match(r'(\d+)x\s*\((\d+)\)\s*(.+)', clean)
         if m:
             count = int(m.group(1))
