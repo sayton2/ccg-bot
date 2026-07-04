@@ -63,8 +63,8 @@ def update_site_files_index():
                     SITE_FILES_INDEX = found
                     LAST_INDEX_UPDATE = time.time()
                 print(f"Индекс обновлен! Карт: {len(SITE_FILES_INDEX)}", flush=True)
-    except:
-        pass
+    except Exception as e:
+        print(f"Ошибка индекса: {e}", flush=True)
 
 def get_smart_filename(target_filename):
     if not SITE_FILES_INDEX:
@@ -78,61 +78,51 @@ def to_lat(text):
 
 # ==================== СТИХИЯ КАРТЫ ====================
 
+HEADERS_SITE = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+    'Referer': 'https://ep-ccg.ru/',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+}
+
 def get_card_element(card_name_ru):
     slug = to_lat(card_name_ru.strip().lower())
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://ep-ccg.ru/',
-        'Accept': 'application/json',
-    }
-    
-    # Пробуем разные варианты slug
-    slugs_to_try = [slug]
-    # Бьерсард -> bjersard (й=j, но ь убирается)
-    # Попробуем также с 'bj' для 'б' перед 'ь'
-    
-    for try_slug in slugs_to_try:
-        try:
-            url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={try_slug}&_fields=id,slug,class_list"
-            res = requests.get(url, headers=headers, timeout=7)
-            print(f"[ELEMENT] slug={try_slug} status={res.status_code}", flush=True)
-            if res.status_code == 200:
-                data = res.json()
-                if data and isinstance(data, list):
-                    for cls in data[0].get('class_list', []):
-                        m = re.match(r'mmf_element-(\w+)', cls)
-                        if m:
-                            element = m.group(1)
-                            ELEMENT_CACHE[slug] = element
-                            print(f"[ELEMENT] Найден: {try_slug} -> {element}", flush=True)
-                            return element
-        except Exception as e:
-            print(f"[ELEMENT ERROR] {e}", flush=True)
-    
-    # Если API не работает - пробуем угадать по имени карты
+
+    # Парсим HTML страницы карты
+    try:
+        url = f"https://ep-ccg.ru/{slug}/"
+        res = requests.get(url, headers=HEADERS_SITE, timeout=7)
+        print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
+        if res.status_code == 200:
+            # Ищем класс стихии в body или article
+            m = re.search(r'mmf_element-(\w+)', res.text)
+            if m:
+                element = m.group(1)
+                ELEMENT_CACHE[slug] = element
+                print(f"[ELEMENT] Найден: {slug} -> {element}", flush=True)
+                return element
+    except Exception as e:
+        print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
+
+    # Запасной вариант — угадать по имени
     name_lower = card_name_ru.lower()
-    if any(w in name_lower for w in ['лес', 'дриада', 'эльм', 'чащ', 'дерев', 'лик']):
+    if any(w in name_lower for w in ['лес', 'эльм', 'чащ', 'дриад', 'лик', 'зверин', 'маути', 'найтин', 'вилрайн']):
         element = 'forest'
-    elif any(w in name_lower for w in ['болот', 'топ', 'трясин']):
+    elif any(w in name_lower for w in ['болот', 'топ', 'трясин', 'пыл', 'туман']):
         element = 'swamp'
-    elif any(w in name_lower for w in ['степ', 'песк', 'пуст']):
+    elif any(w in name_lower for w in ['степ', 'песк', 'пуст', 'цвет']):
         element = 'steppe'
-    elif any(w in name_lower for w in ['гор', 'камен', 'скал']):
+    elif any(w in name_lower for w in ['гор', 'камен', 'скал', 'антар', 'катак']):
         element = 'mountain'
-    elif any(w in name_lower for w in ['тьм', 'тём', 'мрак', 'тен']):
+    elif any(w in name_lower for w in ['тьм', 'тём', 'мрак', 'тен', 'тем']):
         element = 'dark'
     else:
         element = 'neutral'
-    
+
+    print(f"[ELEMENT] Угадан: {slug} -> {element}", flush=True)
     ELEMENT_CACHE[slug] = element
     return element
-    except Exception as e:
-        print(f"[ELEMENT ERROR] {e}", flush=True)
-    ELEMENT_CACHE[slug] = 'neutral'
-    return 'neutral'
 
 # ==================== ЗАГРУЗКА КАРТ ====================
 
@@ -224,9 +214,11 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                # Масштабируем по высоте полоски
                 scale = CARD_H / card_img.height
                 new_w = int(card_img.width * scale)
                 card_img = card_img.resize((new_w, CARD_H), Image.Resampling.BILINEAR)
+                # Берём центр по горизонтали, верх по вертикали
                 start_x = max(0, (new_w - art_w) // 2)
                 card_img = card_img.crop((start_x, 0, start_x + art_w, CARD_H))
                 canvas.paste(card_img, (COST_W, row_y))
@@ -270,7 +262,7 @@ def parse_deck_text(text):
     hero_name = ""
     cards = []
     for line in text.splitlines():
-        # Убираем ведущий "# " или "#"
+        # Убираем ведущие # и пробелы
         clean = re.sub(r'^#+\s*', '', line).strip()
         if not clean:
             continue
@@ -311,29 +303,27 @@ def run_vk_bot():
                             text_lower = text.lower()
 
                             # ==================== !deck ====================
-                         if text_lower.startswith("!deck"):
-    deck_text = text[5:].strip()
-    if not deck_text:
-        vk_session.method('messages.send', {
-            'peer_id': peer_id,
-            'message': "Использование: !deck [текст колоды из декбилдера]",
-            'random_id': 0
-        })
-        continue
+                            if text_lower.startswith("!deck"):
+                                deck_text = text[5:].strip()
+                                if not deck_text:
+                                    vk_session.method('messages.send', {
+                                        'peer_id': peer_id,
+                                        'message': "Использование: !deck [текст колоды из игры]",
+                                        'random_id': 0
+                                    })
+                                    continue
 
-    print(f"[DECK] Получен текст длиной {len(deck_text)} символов", flush=True)
-    print(f"[DECK] Первые 300 символов: {repr(deck_text[:300])}", flush=True)
+                                print(f"[DECK] Получен текст длиной {len(deck_text)}", flush=True)
+                                hero_name, cards = parse_deck_text(deck_text)
+                                print(f"[DECK] Герой: '{hero_name}', карт: {len(cards)}", flush=True)
 
-    hero_name, cards = parse_deck_text(deck_text)
-    print(f"[DECK] Герой: '{hero_name}', карт: {len(cards)}", flush=True)
-
-    if not cards:
-        vk_session.method('messages.send', {
-            'peer_id': peer_id,
-            'message': "❌ Не удалось распознать колоду. Вставьте текст из декбилдера полностью.",
-            'random_id': 0
-        })
-        continue
+                                if not cards:
+                                    vk_session.method('messages.send', {
+                                        'peer_id': peer_id,
+                                        'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
+                                        'random_id': 0
+                                    })
+                                    continue
 
                                 total_cards = sum(c[0] for c in cards)
 
@@ -400,11 +390,11 @@ def run_vk_bot():
                                 })
                                 continue
 
-                            cleaned_text    = card_name_ru.replace(" ", "-").replace("_", "-")
-                            card_name_lat   = to_lat(cleaned_text)
-                            prefix          = "bgo-" if chosen_command == "!бго" else "bk-"
-                            ideal_filename  = prefix + card_name_lat + ".webp"
-                            full_filename   = get_smart_filename(ideal_filename)
+                            cleaned_text   = card_name_ru.replace(" ", "-").replace("_", "-")
+                            card_name_lat  = to_lat(cleaned_text)
+                            prefix         = "bgo-" if chosen_command == "!бго" else "bk-"
+                            ideal_filename = prefix + card_name_lat + ".webp"
+                            full_filename  = get_smart_filename(ideal_filename)
 
                             photo_content = None
                             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -449,13 +439,13 @@ def run_vk_bot():
                                 except Exception as e:
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
-                                        'message': f"❌ Ошибка ВК: {e}",
+                                        'message': f"Ошибка: {e}",
                                         'random_id': 0
                                     })
                             else:
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
-                                    'message': f"❌ Карта не найдена!\nФайл: {full_filename}",
+                                    'message': f"Карта не найдена: {full_filename}",
                                     'random_id': 0
                                 })
 
