@@ -214,18 +214,15 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Масштабируем по высоте полоски
-                scale = CARD_H / card_img.height
-                new_w = int(card_img.width * scale)
-                card_img = card_img.resize((new_w, CARD_H), Image.Resampling.BILINEAR)
-                # Берём центр по горизонтали, верх по вертикали
-                start_x = max(0, (new_w - art_w) // 2)
-                card_img = card_img.crop((start_x, 0, start_x + art_w, CARD_H))
+                # Масштабируем по ширине арта, берём верхние CARD_H пикселей
+                scale = art_w / card_img.width
+                new_h = int(card_img.height * scale)
+                card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
+                # Берём верхнюю часть (центр-верх как в декбилдере)
+                card_img = card_img.crop((0, 0, art_w, CARD_H))
                 canvas.paste(card_img, (COST_W, row_y))
             except:
                 draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
-        else:
-            draw.rectangle([COST_W, row_y, CARD_W - COUNT_W, row_y + CARD_H], fill=(40, 45, 55))
 
         # Затемнение для читаемости текста
         overlay = Image.new("RGBA", (art_w, CARD_H), (0, 0, 0, 110))
