@@ -82,19 +82,53 @@ def get_card_element(card_name_ru):
     slug = to_lat(card_name_ru.strip().lower())
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
-    try:
-        url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
-        res = requests.get(url, timeout=5)
-        print(f"[ELEMENT] slug={slug} status={res.status_code} data={res.text[:200]}", flush=True)
-        if res.status_code == 200:
-            data = res.json()
-            if data and isinstance(data, list):
-                for cls in data[0].get('class_list', []):
-                    m = re.match(r'mmf_element-(\w+)', cls)
-                    if m:
-                        element = m.group(1)
-                        ELEMENT_CACHE[slug] = element
-                        return element
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://ep-ccg.ru/',
+        'Accept': 'application/json',
+    }
+    
+    # Пробуем разные варианты slug
+    slugs_to_try = [slug]
+    # Бьерсард -> bjersard (й=j, но ь убирается)
+    # Попробуем также с 'bj' для 'б' перед 'ь'
+    
+    for try_slug in slugs_to_try:
+        try:
+            url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={try_slug}&_fields=id,slug,class_list"
+            res = requests.get(url, headers=headers, timeout=7)
+            print(f"[ELEMENT] slug={try_slug} status={res.status_code}", flush=True)
+            if res.status_code == 200:
+                data = res.json()
+                if data and isinstance(data, list):
+                    for cls in data[0].get('class_list', []):
+                        m = re.match(r'mmf_element-(\w+)', cls)
+                        if m:
+                            element = m.group(1)
+                            ELEMENT_CACHE[slug] = element
+                            print(f"[ELEMENT] Найден: {try_slug} -> {element}", flush=True)
+                            return element
+        except Exception as e:
+            print(f"[ELEMENT ERROR] {e}", flush=True)
+    
+    # Если API не работает - пробуем угадать по имени карты
+    name_lower = card_name_ru.lower()
+    if any(w in name_lower for w in ['лес', 'дриада', 'эльм', 'чащ', 'дерев', 'лик']):
+        element = 'forest'
+    elif any(w in name_lower for w in ['болот', 'топ', 'трясин']):
+        element = 'swamp'
+    elif any(w in name_lower for w in ['степ', 'песк', 'пуст']):
+        element = 'steppe'
+    elif any(w in name_lower for w in ['гор', 'камен', 'скал']):
+        element = 'mountain'
+    elif any(w in name_lower for w in ['тьм', 'тём', 'мрак', 'тен']):
+        element = 'dark'
+    else:
+        element = 'neutral'
+    
+    ELEMENT_CACHE[slug] = element
+    return element
     except Exception as e:
         print(f"[ELEMENT ERROR] {e}", flush=True)
     ELEMENT_CACHE[slug] = 'neutral'
