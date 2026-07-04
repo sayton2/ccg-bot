@@ -8,6 +8,7 @@ import os
 import io
 import time
 import re
+import json
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,7 @@ def home():
 # ==================== НАСТРОЙКИ ====================
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
+ELEMENT_CACHE_FILE = "element_cache.json"
 # ====================================================
 
 RULES = {
@@ -32,26 +34,71 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
+# Цвета из декбилдера (точные)
 ELEMENT_COLORS = {
-    'forest':   ( 60, 150,  60),
-    'steppe':   (210, 170,  30),
-    'mountain': ( 70, 130, 200),
-    'swamp':    (100, 160, 110),
-    'dark':     (120,  60, 180),
-    'neutral':  (160, 120,  60),
+    'stepi':   (241, 196,  15),   # #f1c40f
+    'gory':    ( 41, 128, 185),   # #2980b9
+    'boloto':  (168, 213, 162),   # #a8d5a2
+    'les':     ( 39, 174,  96),   # #27ae60
+    'tma':     (142,  68, 173),   # #8e44ad
+    'nejtraly':(205, 127,  50),   # #cd7f32
 }
-DEFAULT_ELEMENT_COLOR = (160, 120, 60)
+# Цвет текста для каждой стихии
+ELEMENT_TEXT_COLORS = {
+    'stepi':   (0, 0, 0),
+    'gory':    (255, 255, 255),
+    'boloto':  (0, 0, 0),
+    'les':     (255, 255, 255),
+    'tma':     (255, 255, 255),
+    'nejtraly':(255, 255, 255),
+}
+DEFAULT_ELEMENT_COLOR      = (205, 127, 50)
+DEFAULT_ELEMENT_TEXT_COLOR = (255, 255, 255)
+
+# Маппинг: что возвращает API -> наш ключ стихии
+API_ELEMENT_MAP = {
+    'forest':   'les',
+    'steppe':   'stepi',
+    'mountain': 'gory',
+    'swamp':    'boloto',
+    'dark':     'tma',
+    'neutral':  'nejtraly',
+    # на случай если API вернёт русские
+    'les':      'les',
+    'stepi':    'stepi',
+    'gory':     'gory',
+    'boloto':   'boloto',
+    'tma':      'tma',
+    'nejtraly': 'nejtraly',
+}
 
 ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
-LAST_INDEX_UPDATE = 0
 INDEX_LOCK = threading.Lock()
-ELEMENT_CACHE = {}
+
+# ==================== КЕШ СТИХИЙ (файл) ====================
+
+def load_element_cache():
+    try:
+        with open(ELEMENT_CACHE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_element_cache(cache):
+    try:
+        with open(ELEMENT_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[CACHE SAVE ERROR] {e}", flush=True)
+
+ELEMENT_CACHE = load_element_cache()
+print(f"[CACHE] Загружено {len(ELEMENT_CACHE)} стихий из файла", flush=True)
 
 # ==================== ИНДЕКС САЙТА ====================
 
 def update_site_files_index():
-    global SITE_FILES_INDEX, LAST_INDEX_UPDATE
+    global SITE_FILES_INDEX
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         res = requests.get("https://ep-ccg.ru", headers=headers, timeout=10)
@@ -61,7 +108,6 @@ def update_site_files_index():
             if found:
                 with INDEX_LOCK:
                     SITE_FILES_INDEX = found
-                    LAST_INDEX_UPDATE = time.time()
                 print(f"Индекс обновлен! Карт: {len(SITE_FILES_INDEX)}", flush=True)
     except Exception as e:
         print(f"Ошибка индекса: {e}", flush=True)
@@ -84,29 +130,34 @@ def get_card_element(card_name_ru):
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
 
+    # Пауза чтобы не словить 447
+    time.sleep(0.3)
+
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
         res = requests.get(url, timeout=7)
-        print(f"[ELEMENT] '{card_name_ru}' -> slug='{slug}' status={res.status_code}", flush=True)
+        print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
         if res.status_code == 200:
             data = res.json()
-            print(f"[ELEMENT] data={data}", flush=True)
             if data and isinstance(data, list) and len(data) > 0:
                 for cls in data[0].get('class_list', []):
                     m = re.match(r'mmf_element-(\w+)', cls)
                     if m:
-                        element = m.group(1)
+                        raw = m.group(1)
+                        element = API_ELEMENT_MAP.get(raw, 'nejtraly')
                         ELEMENT_CACHE[slug] = element
-                        print(f"[ELEMENT] OK: '{card_name_ru}' -> '{element}'", flush=True)
+                        save_element_cache(ELEMENT_CACHE)
+                        print(f"[ELEMENT] OK: {slug} -> {raw} -> {element}", flush=True)
                         return element
-                print(f"[ELEMENT] mmf_element не найден в class_list: {data[0].get('class_list', [])}", flush=True)
-            else:
-                print(f"[ELEMENT] Пустой ответ для slug='{slug}' — карта не найдена на сайте", flush=True)
+        elif res.status_code == 447:
+            print(f"[ELEMENT] 447 для {slug} — возврат из кеша если есть", flush=True)
     except Exception as e:
-        print(f"[ELEMENT ERROR] '{card_name_ru}': {e}", flush=True)
+        print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
 
-    ELEMENT_CACHE[slug] = 'neutral'
-    return 'neutral'
+    # Не сохраняем neutral в файл при 447 — попробуем снова при следующем запросе
+    if slug not in ELEMENT_CACHE:
+        ELEMENT_CACHE[slug] = 'nejtraly'
+    return ELEMENT_CACHE[slug]
 
 # ==================== ЗАГРУЗКА КАРТ ====================
 
@@ -191,21 +242,19 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     y = HEADER_H
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        element_color      = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        element_text_color = ELEMENT_TEXT_COLORS.get(element_key, DEFAULT_ELEMENT_TEXT_COLOR)
 
-        # Арт занимает всю ширину карточки с перекрытием под цветные блоки
-        # Рисуем арт от -10 до CARD_W+10 чтобы гарантированно скрыть рамки
-        art_x     = -10
-        art_w     = CARD_W + 20
+        # Арт с запасом по краям чтобы скрыть рамки карты
+        art_x = -15
+        art_w = CARD_W + 30
 
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Масштабируем так чтобы ширина арта совпала с art_w
                 scale = art_w / card_img.width
                 new_h = int(card_img.height * scale)
                 card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
-                # Центральная часть по вертикали (~25% сверху — зона лица)
                 offset_y = int(new_h * 0.25)
                 offset_y = min(offset_y, max(0, new_h - CARD_H))
                 card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
@@ -215,29 +264,29 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         else:
             draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
 
-        # Затемнение поверх арта для читаемости текста
+        # Затемнение
         overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 110))
         canvas.paste(Image.new("RGB", (CARD_W, CARD_H), (20, 25, 35)), (0, row_y), overlay)
 
-        # Стоимость (цветной блок стихии слева)
+        # Стоимость (цвет стихии слева)
         draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2),
-                  cost_str, font=font_cost, fill=(0, 0, 0))
+                  cost_str, font=font_cost, fill=element_text_color)
 
         # Название карты
         draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
                   name, font=font_card, fill=(255, 255, 255))
 
-        # Количество (цветной блок стихии справа)
+        # Количество (цвет стихии справа)
         draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
         tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
         draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
-                  count_str, font=font_count, fill=(0, 0, 0))
+                  count_str, font=font_count, fill=element_text_color)
 
         draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
         y += CARD_H + PADDING
@@ -320,9 +369,8 @@ def run_vk_bot():
                                     element = get_card_element(name)
                                     return cost, name, count, img, element
 
-                                with ThreadPoolExecutor(max_workers=10) as executor:
-                                    card_data = list(executor.map(load_card, cards))
-
+                                # Последовательно чтобы не словить 447 от параллельных запросов к API
+                                card_data = [load_card(c) for c in cards]
                                 card_data.sort(key=lambda x: x[0])
 
                                 img_bytes = build_deck_image(
