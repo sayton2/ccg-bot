@@ -9,6 +9,7 @@ import io
 import time
 import re
 import json
+import traceback
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,28 +35,27 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-# Цвета из декбилдера (точные)
+# Цвета из декбилдера
 ELEMENT_COLORS = {
-    'stepi':   (241, 196,  15),   # #f1c40f
-    'gory':    ( 41, 128, 185),   # #2980b9
-    'boloto':  (168, 213, 162),   # #a8d5a2
-    'les':     ( 39, 174,  96),   # #27ae60
-    'tma':     (142,  68, 173),   # #8e44ad
-    'nejtraly':(205, 127,  50),   # #cd7f32
+    'stepi':    (241, 196,  15),   # #f1c40f Степи
+    'gory':     ( 41, 128, 185),   # #2980b9 Горы
+    'boloto':   (168, 213, 162),   # #a8d5a2 Болото
+    'les':      ( 39, 174,  96),   # #27ae60 Лес
+    'tma':      (142,  68, 173),   # #8e44ad Тьма
+    'nejtraly': (205, 127,  50),   # #cd7f32 Нейтралы
 }
-# Цвет текста для каждой стихии
 ELEMENT_TEXT_COLORS = {
-    'stepi':   (0, 0, 0),
-    'gory':    (255, 255, 255),
-    'boloto':  (0, 0, 0),
-    'les':     (255, 255, 255),
-    'tma':     (255, 255, 255),
-    'nejtraly':(255, 255, 255),
+    'stepi':    (0, 0, 0),
+    'gory':     (255, 255, 255),
+    'boloto':   (0, 0, 0),
+    'les':      (255, 255, 255),
+    'tma':      (255, 255, 255),
+    'nejtraly': (255, 255, 255),
 }
 DEFAULT_ELEMENT_COLOR      = (205, 127, 50)
 DEFAULT_ELEMENT_TEXT_COLOR = (255, 255, 255)
 
-# Маппинг: что возвращает API -> наш ключ стихии
+# Маппинг: класс с сайта -> наш ключ
 API_ELEMENT_MAP = {
     'forest':    'les',
     'steppe':    'stepi',
@@ -68,11 +68,17 @@ API_ELEMENT_MAP = {
     'neutral':   'nejtraly',
 }
 
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+}
+
 ATTACHMENT_CACHE = {}
 SITE_FILES_INDEX = []
 INDEX_LOCK = threading.Lock()
 
-# ==================== КЕШ СТИХИЙ (файл) ====================
+# ==================== КЕШ СТИХИЙ ====================
 
 def load_element_cache():
     try:
@@ -95,9 +101,8 @@ print(f"[CACHE] Загружено {len(ELEMENT_CACHE)} стихий из фай
 
 def update_site_files_index():
     global SITE_FILES_INDEX
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        res = requests.get("https://ep-ccg.ru", headers=headers, timeout=10)
+        res = requests.get("https://ep-ccg.ru", headers=BROWSER_HEADERS, timeout=10)
         if res.status_code == 200:
             links = re.findall(r'href__="([^"]+\.webp)"', res.text, re.IGNORECASE)
             found = list(set([l.split('/')[-1] for l in links]))
@@ -126,16 +131,9 @@ def get_card_element(card_name_ru):
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
 
-    time.sleep(0.3)
-
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'ru-RU,ru;q=0.9',
-        }
-        res = requests.get(url, headers=headers, timeout=7)
+        res = requests.get(url, headers=BROWSER_HEADERS, timeout=7)
         print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
         if res.status_code == 200:
             data = res.json()
@@ -150,7 +148,7 @@ def get_card_element(card_name_ru):
                         print(f"[ELEMENT] OK: {slug} -> {raw} -> {element}", flush=True)
                         return element
         elif res.status_code == 447:
-            print(f"[ELEMENT] 447 для {slug} — возврат из кеша", flush=True)
+            print(f"[ELEMENT] 447 для {slug}", flush=True)
     except Exception as e:
         print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
 
@@ -244,7 +242,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         element_color      = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
         element_text_color = ELEMENT_TEXT_COLORS.get(element_key, DEFAULT_ELEMENT_TEXT_COLOR)
 
-        # Арт с запасом по краям чтобы скрыть рамки карты
+        # Арт с запасом по краям чтобы скрыть рамки
         art_x = -15
         art_w = CARD_W + 30
 
@@ -368,16 +366,18 @@ def run_vk_bot():
                                     element = get_card_element(name)
                                     return cost, name, count, img, element
 
-                                # Последовательно чтобы не словить 447 от параллельных запросов к API
-                                card_data = [load_card(c) for c in cards]
+                                with ThreadPoolExecutor(max_workers=10) as executor:
+                                    card_data = list(executor.map(load_card, cards))
                                 card_data.sort(key=lambda x: x[0])
 
+                                print(f"[DECK] Карты загружены, собираю изображение...", flush=True)
                                 img_bytes = build_deck_image(
                                     hero_name or "Колода",
                                     total_cards,
                                     60,
                                     card_data
                                 )
+                                print(f"[DECK] Изображение собрано, отправляю...", flush=True)
 
                                 up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                                 upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
@@ -396,6 +396,7 @@ def run_vk_bot():
                                     'attachment': attachment,
                                     'random_id': 0
                                 })
+                                print(f"[DECK] Отправлено!", flush=True)
                                 continue
 
                             # ==================== !бго / !бк ====================
@@ -471,6 +472,8 @@ def run_vk_bot():
                                         'random_id': 0
                                     })
                                 except Exception as e:
+                                    print(f"[CARD ERROR] {e}", flush=True)
+                                    traceback.print_exc()
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': f"Ошибка: {e}",
@@ -483,10 +486,14 @@ def run_vk_bot():
                                     'random_id': 0
                                 })
 
-                except Exception:
+                except Exception as e:
+                    print(f"[LOOP ERROR] {e}", flush=True)
+                    traceback.print_exc()
                     time.sleep(1)
                 time.sleep(0.1)
-        except Exception:
+        except Exception as e:
+            print(f"[BOT ERROR] {e}", flush=True)
+            traceback.print_exc()
             time.sleep(5)
 
 if __name__ == '__main__':
