@@ -30,7 +30,7 @@ RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
     'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-    'ф': 'f', 'х': 'h', 'ц': 'cz', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+    'ф': 'f', 'х': 'h', 'ц': 'cz', 'ч': 'ch', 'ш': 'sh', 'щ': 'shh',
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
@@ -57,19 +57,15 @@ DEFAULT_ELEMENT_TEXT_COLOR = (255, 255, 255)
 
 # Маппинг: что возвращает API -> наш ключ стихии
 API_ELEMENT_MAP = {
-    'forest':   'les',
-    'steppe':   'stepi',
-    'mountain': 'gory',
-    'swamp':    'boloto',
-    'dark':     'tma',
-    'neutral':  'nejtraly',
-    # на случай если API вернёт русские
-    'les':      'les',
-    'stepi':    'stepi',
-    'gory':     'gory',
-    'boloto':   'boloto',
-    'tma':      'tma',
-    'nejtraly': 'nejtraly',
+    'forest':    'les',
+    'steppe':    'stepi',
+    'mountains': 'gory',
+    'mountain':  'gory',
+    'swamp':     'boloto',
+    'darkness':  'tma',
+    'dark':      'tma',
+    'nejtraly':  'nejtraly',
+    'neutral':   'nejtraly',
 }
 
 ATTACHMENT_CACHE = {}
@@ -130,12 +126,16 @@ def get_card_element(card_name_ru):
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
 
-    # Пауза чтобы не словить 447
     time.sleep(0.3)
 
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
-        res = requests.get(url, timeout=7)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'ru-RU,ru;q=0.9',
+        }
+        res = requests.get(url, headers=headers, timeout=7)
         print(f"[ELEMENT] slug={slug} status={res.status_code}", flush=True)
         if res.status_code == 200:
             data = res.json()
@@ -150,11 +150,10 @@ def get_card_element(card_name_ru):
                         print(f"[ELEMENT] OK: {slug} -> {raw} -> {element}", flush=True)
                         return element
         elif res.status_code == 447:
-            print(f"[ELEMENT] 447 для {slug} — возврат из кеша если есть", flush=True)
+            print(f"[ELEMENT] 447 для {slug} — возврат из кеша", flush=True)
     except Exception as e:
         print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
 
-    # Не сохраняем neutral в файл при 447 — попробуем снова при следующем запросе
     if slug not in ELEMENT_CACHE:
         ELEMENT_CACHE[slug] = 'nejtraly'
     return ELEMENT_CACHE[slug]
