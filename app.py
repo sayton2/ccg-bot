@@ -258,33 +258,35 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         row_y = y
         row_bottom = row_y + CARD_H
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-
-        # --- Тёмно-синяя полоса ---
+        # --- Изображение карты на всю полоску ---
         bar_x = COST_W
         bar_w = CARD_W - COST_W - COUNT_W
-        draw.rectangle([bar_x, row_y, bar_x + bar_w, row_bottom], fill=BAR_COLOR)
-        
-        # --- Изображение карты (на всю высоту полоски, верхние 30% карты) ---
-        THUMB_W = 90
-        thumb_x = bar_x + bar_w - THUMB_W
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 w, h = card_img.size
-                crop_top = int(h * 0.08)
-                crop_bot = int(h * 0.38)
-                crop = card_img.crop((0, crop_top, w, crop_bot))
-                crop = crop.resize((THUMB_W, CARD_H), Image.Resampling.BILINEAR)
-                canvas.paste(crop, (thumb_x, row_y))
+                # Обрезаем боковые рамки (8% с каждой стороны) и берём зону ниже стоимости
+                side = int(w * 0.08)
+                top = int(h * 0.12)
+                bot = int(h * 0.46)
+                crop = card_img.crop((side, top, w - side, bot))
+                crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
+                canvas.paste(crop, (bar_x, row_y))
             except:
-                pass
+                draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
+        else:
+            draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
+
+        # --- Затемнение под текст для читаемости ---
+        overlay = Image.new("RGBA", (bar_w - COUNT_W, CARD_H), (0, 0, 0, 90))
+        canvas.paste(overlay, (bar_x, row_y), overlay)
 
         # --- Название карты (с тенью) ---
         name_x = bar_x + 10
         name_y = row_y + (CARD_H - 18) // 2
+        max_name_w = bar_w - 20
         display_name = name
         bbox = draw.textbbox((0, 0), display_name, font=font_card)
-        max_name_w = thumb_x - name_x - 8
         while (bbox[2] - bbox[0]) > max_name_w and len(display_name) > 3:
             display_name = display_name[:-1]
             bbox = draw.textbbox((0, 0), display_name, font=font_card)
