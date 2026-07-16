@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
+import math
 
 app = Flask(__name__)
 
