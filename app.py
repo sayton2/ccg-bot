@@ -263,22 +263,19 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         bar_x = COST_W
         bar_w = CARD_W - COST_W - COUNT_W
         draw.rectangle([bar_x, row_y, bar_x + bar_w, row_bottom], fill=BAR_COLOR)
-
-        # --- Круглый миниатюр карты (справа в полосе) ---
-        thumb_x = bar_x + bar_w - THUMB_S - 6
-        thumb_y = row_y + (CARD_H - THUMB_S) // 2
+        
+        # --- Изображение карты (на всю высоту полоски, верхние 30% карты) ---
+        THUMB_W = 90
+        thumb_x = bar_x + bar_w - THUMB_W
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 w, h = card_img.size
-                cs = min(w, h)
-                left = (w - cs) // 2
-                top = max(0, int(h * 0.15))
-                card_img = card_img.crop((left, top, left + cs, top + cs))
-                card_img = card_img.resize((THUMB_S, THUMB_S), Image.Resampling.BILINEAR)
-                mask = Image.new("L", (THUMB_S, THUMB_S), 0)
-                ImageDraw.Draw(mask).ellipse([0, 0, THUMB_S - 1, THUMB_S - 1], fill=255)
-                canvas.paste(card_img, (thumb_x, thumb_y), mask)
+                crop_top = int(h * 0.08)
+                crop_bot = int(h * 0.38)
+                crop = card_img.crop((0, crop_top, w, crop_bot))
+                crop = crop.resize((THUMB_W, CARD_H), Image.Resampling.BILINEAR)
+                canvas.paste(crop, (thumb_x, row_y))
             except:
                 pass
 
