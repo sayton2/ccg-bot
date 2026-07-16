@@ -410,11 +410,19 @@ def run_vk_bot():
                                     60,
                                     card_data
                                 )
-                                print(f"[DECK] Изображение собрано, отправляю...", flush=True)
+                                                              print(f"[DECK] Изображение собрано (размер: {len(img_bytes)} байт), отправляю...", flush=True)
 
                                 up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                                 upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-                                upload_resp = requests.post(upload_url, files={'photo': ('deck.jpg', img_bytes, 'image/jpeg')}).json()
+                                upload_resp = requests.post(
+                                    upload_url,
+                                    files={'photo': ('deck.jpg', io.BytesIO(img_bytes), 'image/jpeg')}
+                                ).json()
+                                print(f"[DECK] Upload response: {upload_resp}", flush=True)
+
+                                if not upload_resp.get('photo'):
+                                    raise Exception(f"Upload failed (photo empty): {upload_resp}")
+
                                 save_resp = vk_session.method('photos.saveMessagesPhoto', {
                                     'photo': upload_resp['photo'],
                                     'server': upload_resp['server'],
