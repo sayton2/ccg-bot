@@ -9,13 +9,11 @@ import io
 import time
 import re
 import json
-import random
 import traceback
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
-import math
 
 app = Flask(__name__)
 
@@ -28,9 +26,6 @@ VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 ELEMENT_CACHE_FILE = "element_cache.json"
 # ====================================================
-
-def rnd_id():
-    return random.randint(0, 2**31)
 
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
@@ -217,122 +212,80 @@ def get_font(size):
 
 # ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
 
+CARD_W   = 300
+CARD_H   = 52
+COST_W   = 36
+COUNT_W  = 42
+PADDING  = 3
+HEADER_H = 80
+BG_COLOR        = (18, 22, 30)
+HEADER_COLOR    = (200, 150, 30)
+SUBHEADER_COLOR = (100, 200, 80)
+
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     font_header = get_font(26)
     font_sub    = get_font(16)
-    font_card   = get_font(18)
-    font_cost   = get_font(22)
-    font_count  = get_font(18)
-
-    CARD_W   = 340
-    CARD_H   = 58
-    HEX_R    = 24
-    COST_W   = 48
-    COUNT_W  = 54
-    PADDING  = 2
-    HEADER_H = 80
-
-    BG_COLOR     = (30, 40, 55)
-    BAR_COLOR    = (42, 55, 74)    # #2a374a
-    HEX_COLOR    = (197, 165, 87)  # #c5a557 золото
-    HEX_TEXT     = (46, 46, 46)    # #2e2e2e
-    TEXT_COLOR   = (255, 255, 255)
-    SHADOW_COLOR = (0, 0, 0)
+    font_card   = get_font(17)
+    font_cost   = get_font(20)
+    font_count  = get_font(17)
 
     img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
     canvas = Image.new("RGB", (CARD_W, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
-    draw.text((14, 12), hero_name, font=font_header, fill=HEX_COLOR)
-    draw.text((14, 48), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=(180, 200, 220))
+    draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
+    draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
 
     y = HEADER_H
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        row_bottom = row_y + CARD_H
-        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        element_color      = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        element_text_color = ELEMENT_TEXT_COLORS.get(element_key, DEFAULT_ELEMENT_TEXT_COLOR)
 
-        # --- Изображение карты на всю полоску (включая зону шестиугольника) ---
-        bar_x = 0
-        bar_w = CARD_W - COUNT_W
+        # Арт с запасом по краям чтобы скрыть рамки
+        art_x = -15
+        art_w = CARD_W + 30
+
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                w, h = card_img.size
-                # Обрезаем боковые рамки и зону ниже стоимости
-                side = int(w * 0.18)
-                top = int(h * 0.20)
-                bot = int(h * 0.54)
-                crop = card_img.crop((side, top, w - side, bot))
-                cw, ch = crop.size
-                # Центрированный кроп под нужное соотношение
-                target_ratio = bar_w / CARD_H
-                crop_ratio = cw / ch
-                if crop_ratio > target_ratio:
-                    new_w = int(ch * target_ratio)
-                    left = (cw - new_w) // 2
-                    crop = crop.crop((left, 0, left + new_w, ch))
-                else:
-                    new_h = int(cw / target_ratio)
-                    top2 = (ch - new_h) // 2
-                    crop = crop.crop((0, top2, cw, top2 + new_h))
-                crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
-                canvas.paste(crop, (bar_x, row_y))
+                scale = art_w / card_img.width
+                new_h = int(card_img.height * scale)
+                card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
+                offset_y = int(new_h * 0.25)
+                offset_y = min(offset_y, max(0, new_h - CARD_H))
+                card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
+                canvas.paste(card_img, (art_x, row_y))
             except:
-                draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
+                draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
         else:
-            draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
+            draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
 
-        # --- Плавный теневой переход для читаемости текста ---
-        shadow = Image.new("L", (bar_w, CARD_H), 0)
-        sd = ImageDraw.Draw(shadow)
-        sd.rectangle([0, 0, bar_w, CARD_H], fill=0)
-        steps = 40
-        for i in range(steps):
-            alpha = int(160 * (1 - i / steps))
-            sd.rectangle([i, 0, i + 1, CARD_H], fill=alpha)
-        shadow_rgba = Image.new("RGBA", (bar_w, CARD_H), (0, 0, 0, 0))
-        shadow_rgba.putalpha(shadow)
-        canvas.paste(shadow_rgba, (bar_x, row_y), shadow_rgba)
+        # Затемнение
+        overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 110))
+        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), (20, 25, 35)), (0, row_y), overlay)
 
-        # --- Название карты (с тенью) ---
-        name_x = COST_W + 10
-        name_y = row_y + (CARD_H - 18) // 2
-        max_name_w = bar_w - name_x - 10
-        display_name = name
-        bbox = draw.textbbox((0, 0), display_name, font=font_card)
-        while (bbox[2] - bbox[0]) > max_name_w and len(display_name) > 3:
-            display_name = display_name[:-1]
-            bbox = draw.textbbox((0, 0), display_name, font=font_card)
-        if display_name != name:
-            display_name = display_name.rstrip('.') + "…"
-        draw.text((name_x + 1, name_y + 1), display_name, font=font_card, fill=SHADOW_COLOR)
-        draw.text((name_x, name_y), display_name, font=font_card, fill=TEXT_COLOR)
-
-        # --- Шестиугольный бейдж стоимости ---
-        hex_cx = COST_W // 2
-        hex_cy = row_y + CARD_H // 2
-        hex_pts = [(hex_cx + HEX_R * math.cos(math.pi / 3 * i - math.pi / 2),
-                    hex_cy + HEX_R * math.sin(math.pi / 3 * i - math.pi / 2)) for i in range(6)]
-        draw.polygon(hex_pts, fill=HEX_COLOR)
+        # Стоимость (цвет стихии слева)
+        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((hex_cx - tw // 2 - bbox[0], hex_cy - th // 2 - bbox[1] - 2),
-                  cost_str, font=font_cost, fill=HEX_TEXT)
+        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2),
+                  cost_str, font=font_cost, fill=element_text_color)
 
-        # --- Бейдж количества с шевроном ---
-        qty_x = CARD_W - COUNT_W
-        draw.rectangle([qty_x, row_y, CARD_W, row_bottom], fill=element_color)
-        draw.polygon([(qty_x, row_y), (qty_x - 10, row_y + CARD_H // 2), (qty_x, row_bottom)],
-                     fill=element_color)
-        count_str = str(count)
+        # Название карты
+        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
+                  name, font=font_card, fill=(255, 255, 255))
+
+        # Количество (цвет стихии справа)
+        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
+        count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
         tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-        draw.text((qty_x + (COUNT_W - tw2) // 2 - bbox2[0],
-                   row_y + (CARD_H - th2) // 2 - bbox2[1] - 1),
-                  count_str, font=font_count, fill=TEXT_COLOR)
+        draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
+                  count_str, font=font_count, fill=element_text_color)
 
+        draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
         y += CARD_H + PADDING
 
     output = io.BytesIO()
@@ -389,7 +342,7 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': "Использование: !deck [текст колоды из игры]",
-                                        'random_id': rnd_id()
+                                        'random_id': 0
                                     })
                                     continue
 
@@ -401,7 +354,7 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
-                                        'random_id': rnd_id()
+                                        'random_id': 0
                                     })
                                     continue
 
@@ -424,19 +377,11 @@ def run_vk_bot():
                                     60,
                                     card_data
                                 )
-                                print(f"[DECK] Изображение собрано (размер: {len(img_bytes)} байт), отправляю...", flush=True)
+                                print(f"[DECK] Изображение собрано, отправляю...", flush=True)
 
                                 up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                                 upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-                                upload_resp = requests.post(
-                                    upload_url,
-                                    files={'photo': ('deck.jpg', io.BytesIO(img_bytes), 'image/jpeg')}
-                                ).json()
-                                print(f"[DECK] Upload response: {upload_resp}", flush=True)
-
-                                if not upload_resp.get('photo'):
-                                    raise Exception(f"Upload failed (photo empty): {upload_resp}")
-
+                                upload_resp = requests.post(upload_url, files={'photo': ('deck.jpg', img_bytes, 'image/jpeg')}).json()
                                 save_resp = vk_session.method('photos.saveMessagesPhoto', {
                                     'photo': upload_resp['photo'],
                                     'server': upload_resp['server'],
@@ -449,7 +394,7 @@ def run_vk_bot():
                                     'peer_id': peer_id,
                                     'message': "",
                                     'attachment': attachment,
-                                    'random_id': rnd_id()
+                                    'random_id': 0
                                 })
                                 print(f"[DECK] Отправлено!", flush=True)
                                 continue
@@ -476,7 +421,7 @@ def run_vk_bot():
                                     'peer_id': peer_id,
                                     'message': response_msg,
                                     'attachment': ATTACHMENT_CACHE[cache_key],
-                                    'random_id': rnd_id()
+                                    'random_id': 0
                                 })
                                 continue
 
@@ -524,7 +469,7 @@ def run_vk_bot():
                                         'peer_id': peer_id,
                                         'message': response_msg,
                                         'attachment': attachment,
-                                        'random_id': rnd_id()
+                                        'random_id': 0
                                     })
                                 except Exception as e:
                                     print(f"[CARD ERROR] {e}", flush=True)
@@ -532,13 +477,13 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': f"Ошибка: {e}",
-                                        'random_id': rnd_id()
+                                        'random_id': 0
                                     })
                             else:
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
                                     'message': f"Карта не найдена: {full_filename}",
-                                    'random_id': rnd_id()
+                                    'random_id': 0
                                 })
 
                 except Exception as e:
