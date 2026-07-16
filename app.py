@@ -258,17 +258,18 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         row_y = y
         row_bottom = row_y + CARD_H
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-        # --- Изображение карты на всю полоску ---
-        bar_x = COST_W
-        bar_w = CARD_W - COST_W - COUNT_W
+
+                # --- Изображение карты на всю полоску (включая зону шестиугольника) ---
+        bar_x = 0
+        bar_w = CARD_W - COUNT_W
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 w, h = card_img.size
-                # Обрезаем боковые рамки (8% с каждой стороны) и берём зону ниже стоимости
-                side = int(w * 0.08)
-                top = int(h * 0.12)
-                bot = int(h * 0.46)
+                # Глубже обрезаем боковые рамки (18%) и зону ниже стоимости (20%-54%)
+                side = int(w * 0.18)
+                top = int(h * 0.20)
+                bot = int(h * 0.54)
                 crop = card_img.crop((side, top, w - side, bot))
                 crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
                 canvas.paste(crop, (bar_x, row_y))
@@ -277,14 +278,22 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         else:
             draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
 
-        # --- Затемнение под текст для читаемости ---
-        overlay = Image.new("RGBA", (bar_w - COUNT_W, CARD_H), (0, 0, 0, 90))
-        canvas.paste(overlay, (bar_x, row_y), overlay)
+        # --- Плавный теневой переход для читаемости текста ---
+        shadow = Image.new("L", (bar_w, CARD_H), 0)
+        sd = ImageDraw.Draw(shadow)
+        sd.rectangle([0, 0, bar_w, CARD_H], fill=0)
+        steps = 40
+        for i in range(steps):
+            alpha = int(160 * (1 - i / steps))
+            sd.rectangle([i, 0, i + 1, CARD_H], fill=alpha)
+        shadow_rgba = Image.new("RGBA", (bar_w, CARD_H), (0, 0, 0, 0))
+        shadow_rgba.putalpha(shadow)
+        canvas.paste(shadow_rgba, (bar_x, row_y), shadow_rgba)
 
         # --- Название карты (с тенью) ---
-        name_x = bar_x + 10
+        name_x = COST_W + 10
         name_y = row_y + (CARD_H - 18) // 2
-        max_name_w = bar_w - 20
+        max_name_w = bar_w - name_x - 10
         display_name = name
         bbox = draw.textbbox((0, 0), display_name, font=font_card)
         while (bbox[2] - bbox[0]) > max_name_w and len(display_name) > 3:
