@@ -410,7 +410,7 @@ def run_vk_bot():
                                     60,
                                     card_data
                                 )
-                                                              print(f"[DECK] Изображение собрано (размер: {len(img_bytes)} байт), отправляю...", flush=True)
+                                print(f"[DECK] Изображение собрано (размер: {len(img_bytes)} байт), отправляю...", flush=True)
 
                                 up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
                                 upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
