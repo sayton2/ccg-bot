@@ -266,17 +266,25 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 w, h = card_img.size
-                # Глубже обрезаем боковые рамки (18%) и зону ниже стоимости (20%-54%)
+                # Обрезаем боковые рамки и зону ниже стоимости
                 side = int(w * 0.18)
                 top = int(h * 0.20)
                 bot = int(h * 0.54)
                 crop = card_img.crop((side, top, w - side, bot))
+                cw, ch = crop.size
+                # Центрированный кроп под нужное соотношение
+                target_ratio = bar_w / CARD_H
+                crop_ratio = cw / ch
+                if crop_ratio > target_ratio:
+                    new_w = int(ch * target_ratio)
+                    left = (cw - new_w) // 2
+                    crop = crop.crop((left, 0, left + new_w, ch))
+                else:
+                    new_h = int(cw / target_ratio)
+                    top2 = (ch - new_h) // 2
+                    crop = crop.crop((0, top2, cw, top2 + new_h))
                 crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
                 canvas.paste(crop, (bar_x, row_y))
-            except:
-                draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
-        else:
-            draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
 
         # --- Плавный теневой переход для читаемости текста ---
         shadow = Image.new("L", (bar_w, CARD_H), 0)
