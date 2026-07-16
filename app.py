@@ -213,16 +213,6 @@ def get_font(size):
 
 # ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
 
-CARD_W   = 300
-CARD_H   = 52
-COST_W   = 36
-COUNT_W  = 42
-PADDING  = 3
-HEADER_H = 80
-BG_COLOR        = (18, 22, 30)
-HEADER_COLOR    = (200, 150, 30)
-SUBHEADER_COLOR = (100, 200, 80)
-
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     font_header = get_font(26)
     font_sub    = get_font(16)
@@ -235,7 +225,6 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     HEX_R    = 24
     COST_W   = 48
     COUNT_W  = 54
-    THUMB_S  = 48
     PADDING  = 2
     HEADER_H = 80
 
@@ -259,7 +248,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         row_bottom = row_y + CARD_H
         element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
 
-                # --- Изображение карты на всю полоску (включая зону шестиугольника) ---
+        # --- Изображение карты на всю полоску (включая зону шестиугольника) ---
         bar_x = 0
         bar_w = CARD_W - COUNT_W
         if img_bytes:
@@ -283,7 +272,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
                     new_h = int(cw / target_ratio)
                     top2 = (ch - new_h) // 2
                     crop = crop.crop((0, top2, cw, top2 + new_h))
-crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
+                crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
                 canvas.paste(crop, (bar_x, row_y))
             except:
                 draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
@@ -345,6 +334,7 @@ crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=92)
     return output.getvalue()
+
 # ==================== ПАРСИНГ КОЛОДЫ ====================
 
 def parse_deck_text(text):
