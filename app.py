@@ -225,73 +225,105 @@ SUBHEADER_COLOR = (100, 200, 80)
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     font_header = get_font(26)
     font_sub    = get_font(16)
-    font_card   = get_font(17)
-    font_cost   = get_font(20)
-    font_count  = get_font(17)
+    font_card   = get_font(18)
+    font_cost   = get_font(22)
+    font_count  = get_font(18)
+
+    CARD_W   = 340
+    CARD_H   = 58
+    HEX_R    = 24
+    COST_W   = 48
+    COUNT_W  = 54
+    THUMB_S  = 48
+    PADDING  = 2
+    HEADER_H = 80
+
+    BG_COLOR     = (30, 40, 55)
+    BAR_COLOR    = (42, 55, 74)    # #2a374a
+    HEX_COLOR    = (197, 165, 87)  # #c5a557 золото
+    HEX_TEXT     = (46, 46, 46)    # #2e2e2e
+    TEXT_COLOR   = (255, 255, 255)
+    SHADOW_COLOR = (0, 0, 0)
 
     img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
     canvas = Image.new("RGB", (CARD_W, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
-    draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
-    draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
+    draw.text((14, 12), hero_name, font=font_header, fill=HEX_COLOR)
+    draw.text((14, 48), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=(180, 200, 220))
 
     y = HEADER_H
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        element_color      = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-        element_text_color = ELEMENT_TEXT_COLORS.get(element_key, DEFAULT_ELEMENT_TEXT_COLOR)
+        row_bottom = row_y + CARD_H
+        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
 
-        # Арт с запасом по краям чтобы скрыть рамки
-        art_x = -15
-        art_w = CARD_W + 30
+        # --- Тёмно-синяя полоса ---
+        bar_x = COST_W
+        bar_w = CARD_W - COST_W - COUNT_W
+        draw.rectangle([bar_x, row_y, bar_x + bar_w, row_bottom], fill=BAR_COLOR)
 
+        # --- Круглый миниатюр карты (справа в полосе) ---
+        thumb_x = bar_x + bar_w - THUMB_S - 6
+        thumb_y = row_y + (CARD_H - THUMB_S) // 2
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                scale = art_w / card_img.width
-                new_h = int(card_img.height * scale)
-                card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
-                offset_y = int(new_h * 0.25)
-                offset_y = min(offset_y, max(0, new_h - CARD_H))
-                card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
-                canvas.paste(card_img, (art_x, row_y))
+                w, h = card_img.size
+                cs = min(w, h)
+                left = (w - cs) // 2
+                top = max(0, int(h * 0.15))
+                card_img = card_img.crop((left, top, left + cs, top + cs))
+                card_img = card_img.resize((THUMB_S, THUMB_S), Image.Resampling.BILINEAR)
+                mask = Image.new("L", (THUMB_S, THUMB_S), 0)
+                ImageDraw.Draw(mask).ellipse([0, 0, THUMB_S - 1, THUMB_S - 1], fill=255)
+                canvas.paste(card_img, (thumb_x, thumb_y), mask)
             except:
-                draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
-        else:
-            draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
+                pass
 
-        # Затемнение
-        overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 110))
-        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), (20, 25, 35)), (0, row_y), overlay)
+        # --- Название карты (с тенью) ---
+        name_x = bar_x + 10
+        name_y = row_y + (CARD_H - 18) // 2
+        display_name = name
+        bbox = draw.textbbox((0, 0), display_name, font=font_card)
+        max_name_w = thumb_x - name_x - 8
+        while (bbox[2] - bbox[0]) > max_name_w and len(display_name) > 3:
+            display_name = display_name[:-1]
+            bbox = draw.textbbox((0, 0), display_name, font=font_card)
+        if display_name != name:
+            display_name = display_name.rstrip('.') + "…"
+        draw.text((name_x + 1, name_y + 1), display_name, font=font_card, fill=SHADOW_COLOR)
+        draw.text((name_x, name_y), display_name, font=font_card, fill=TEXT_COLOR)
 
-        # Стоимость (цвет стихии слева)
-        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
+        # --- Шестиугольный бейдж стоимости ---
+        hex_cx = COST_W // 2
+        hex_cy = row_y + CARD_H // 2
+        hex_pts = [(hex_cx + HEX_R * math.cos(math.pi / 3 * i - math.pi / 2),
+                    hex_cy + HEX_R * math.sin(math.pi / 3 * i - math.pi / 2)) for i in range(6)]
+        draw.polygon(hex_pts, fill=HEX_COLOR)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2),
-                  cost_str, font=font_cost, fill=element_text_color)
+        draw.text((hex_cx - tw // 2 - bbox[0], hex_cy - th // 2 - bbox[1] - 2),
+                  cost_str, font=font_cost, fill=HEX_TEXT)
 
-        # Название карты
-        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
-                  name, font=font_card, fill=(255, 255, 255))
-
-        # Количество (цвет стихии справа)
-        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
-        count_str = f"{count}x"
+        # --- Бейдж количества с шевроном ---
+        qty_x = CARD_W - COUNT_W
+        draw.rectangle([qty_x, row_y, CARD_W, row_bottom], fill=element_color)
+        draw.polygon([(qty_x, row_y), (qty_x - 10, row_y + CARD_H // 2), (qty_x, row_bottom)],
+                     fill=element_color)
+        count_str = str(count)
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
         tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-        draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
-                  count_str, font=font_count, fill=element_text_color)
+        draw.text((qty_x + (COUNT_W - tw2) // 2 - bbox2[0],
+                   row_y + (CARD_H - th2) // 2 - bbox2[1] - 1),
+                  count_str, font=font_count, fill=TEXT_COLOR)
 
-        draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
         y += CARD_H + PADDING
 
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=92)
     return output.getvalue()
-
 # ==================== ПАРСИНГ КОЛОДЫ ====================
 
 def parse_deck_text(text):
