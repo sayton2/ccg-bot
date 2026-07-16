@@ -283,7 +283,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
                     new_h = int(cw / target_ratio)
                     top2 = (ch - new_h) // 2
                     crop = crop.crop((0, top2, cw, top2 + new_h))
-              crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
+crop = crop.resize((bar_w, CARD_H), Image.Resampling.BILINEAR)
                 canvas.paste(crop, (bar_x, row_y))
             except:
                 draw.rectangle([bar_x, row_y, bar_x + bar_w, row_y + CARD_H], fill=BAR_COLOR)
