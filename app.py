@@ -9,6 +9,7 @@ import io
 import time
 import re
 import json
+import random
 import traceback
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
@@ -26,6 +27,9 @@ VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 ELEMENT_CACHE_FILE = "element_cache.json"
 # ====================================================
+
+def rnd_id():
+    return random.randint(0, 2**31)
 
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
@@ -342,7 +346,7 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': "Использование: !deck [текст колоды из игры]",
-                                        'random_id': 0
+                                        'random_id': rnd_id()
                                     })
                                     continue
 
@@ -354,7 +358,7 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
-                                        'random_id': 0
+                                        'random_id': rnd_id()
                                     })
                                     continue
 
@@ -392,9 +396,9 @@ def run_vk_bot():
 
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
-                                    'message': "",
+                                    'message': " ",
                                     'attachment': attachment,
-                                    'random_id': 0
+                                    'random_id': rnd_id()
                                 })
                                 print(f"[DECK] Отправлено!", flush=True)
                                 continue
@@ -421,7 +425,7 @@ def run_vk_bot():
                                     'peer_id': peer_id,
                                     'message': response_msg,
                                     'attachment': ATTACHMENT_CACHE[cache_key],
-                                    'random_id': 0
+                                    'random_id': rnd_id()
                                 })
                                 continue
 
@@ -469,7 +473,7 @@ def run_vk_bot():
                                         'peer_id': peer_id,
                                         'message': response_msg,
                                         'attachment': attachment,
-                                        'random_id': 0
+                                        'random_id': rnd_id()
                                     })
                                 except Exception as e:
                                     print(f"[CARD ERROR] {e}", flush=True)
@@ -477,13 +481,13 @@ def run_vk_bot():
                                     vk_session.method('messages.send', {
                                         'peer_id': peer_id,
                                         'message': f"Ошибка: {e}",
-                                        'random_id': 0
+                                        'random_id': rnd_id()
                                     })
                             else:
                                 vk_session.method('messages.send', {
                                     'peer_id': peer_id,
                                     'message': f"Карта не найдена: {full_filename}",
-                                    'random_id': 0
+                                    'random_id': rnd_id()
                                 })
 
                 except Exception as e:
