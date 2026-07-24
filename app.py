@@ -31,6 +31,9 @@ ELEMENT_CACHE_FILE = "element_cache.json"
 def rnd_id():
     return random.randint(0, 2**31)
 
+# Транслитерация проверена против реальных slug'ов и имён файлов ep-ccg.ru:
+#   Чёрный -> chernyj, Шаман -> shaman, саламандры -> salamandry,
+#   Иккол -> ikkol, Воля Архааля -> volya-arhaalya, щ -> shh, ц -> cz
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -108,7 +111,8 @@ def update_site_files_index():
     try:
         res = requests.get("https://ep-ccg.ru", headers=BROWSER_HEADERS, timeout=10)
         if res.status_code == 200:
-            links = re.findall(r'href__="([^"]+\.webp)"', res.text, re.IGNORECASE)
+            # Ловим webp-ссылки в любых атрибутах (href, src, data-src, href__ и т.д.)
+            links = re.findall(r'(?:href|src|data-src|data-lazy-src)__?="([^"]+\.webp)"', res.text, re.IGNORECASE)
             found = list(set([l.split('/')[-1] for l in links]))
             if found:
                 with INDEX_LOCK:
@@ -181,18 +185,34 @@ def fetch_photo(path, full_filename, headers):
         pass
     return None, photo_url
 
-def download_card_image(card_name_ru, prefix="bgo-"):
-    cleaned = card_name_ru.strip().lower()
-    lat = to_lat(cleaned)
-    ideal = prefix + lat + ".webp"
-    filename = get_smart_filename(ideal)
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def _try_fetch_filename(filename, headers):
+    """Пробует скачать файл с заданным именем по всем путям. Возвращает content или None."""
     with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
         futures = [executor.submit(fetch_photo, path, filename, headers) for path in POSSIBLE_PATHS]
         for future in as_completed(futures):
             content, _ = future.result()
             if content:
                 return content
+    return None
+
+def download_card_image(card_name_ru, prefix="bgo-"):
+    cleaned = card_name_ru.strip().lower()
+    lat = to_lat(cleaned)
+    ideal = prefix + lat + ".webp"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    # СНАЧАЛА пробуем точное имя — это чинит "Иккол", "Воля Архааля" и др.
+    content = _try_fetch_filename(ideal, headers)
+    if content:
+        return content
+
+    # Только если точное не нашлось — пробуем "умное" совпадение из индекса
+    smart = get_smart_filename(ideal)
+    if smart != ideal:
+        print(f"[CARD] Точное не найдено, пробую smart: {ideal} -> {smart}", flush=True)
+        content = _try_fetch_filename(smart, headers)
+        if content:
+            return content
     return None
 
 # ==================== ШРИФТ ====================
@@ -317,7 +337,163 @@ def parse_deck_text(text):
             cards.append((count, cost, name))
     return hero_name, cards
 
-# ==================== ОСНОВНОЙ БОТ ====================
+# ==================== ОТПРАВКА КАРТИНОК В ВК ====================
+
+def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
+    up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+    upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
+    upload_resp = requests.post(upload_url, files={'photo': (filename, img_bytes, 'image/jpeg')}).json()
+    save_resp = vk_session.method('photos.saveMessagesPhoto', {
+        'photo': upload_resp.get('photo', ''),
+        'server': upload_resp.get('server', ''),
+        'hash': upload_resp.get('hash', '')
+    })
+    actual_data = save_resp['response'] if 'response' in save_resp else save_resp
+    return f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+
+# ==================== ОБРАБОТКА ОДНОГО СООБЩЕНИЯ ====================
+
+def handle_message(vk_session, message_obj):
+    raw_text = message_obj.get('text', '').strip()
+    peer_id  = message_obj.get('peer_id')
+
+    text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
+    text_lower = text.lower()
+
+    # ==================== !deck ====================
+    if text_lower.startswith("!deck"):
+        deck_text = text[5:].strip()
+        if not deck_text:
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': "Использование: !deck [текст колоды из игры]",
+                'random_id': rnd_id()
+            })
+            return
+
+        print(f"[DECK] Получен текст длиной {len(deck_text)}", flush=True)
+        hero_name, cards = parse_deck_text(deck_text)
+        print(f"[DECK] Герой: '{hero_name}', карт: {len(cards)}", flush=True)
+
+        if not cards:
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
+                'random_id': rnd_id()
+            })
+            return
+
+        total_cards = sum(c[0] for c in cards)
+
+        def load_card(item):
+            count, cost, name = item
+            img     = download_card_image(name, prefix="bgo-")
+            element = get_card_element(name)
+            return cost, name, count, img, element
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            card_data = list(executor.map(load_card, cards))
+        card_data.sort(key=lambda x: x[0])
+
+        print(f"[DECK] Карты загружены, собираю изображение...", flush=True)
+        img_bytes = build_deck_image(
+            hero_name or "Колода",
+            total_cards,
+            60,
+            card_data
+        )
+        print(f"[DECK] Изображение собрано, отправляю...", flush=True)
+
+        attachment = upload_and_get_attachment(vk_session, img_bytes, 'deck.jpg', peer_id)
+        vk_session.method('messages.send', {
+            'peer_id': peer_id,
+            'message': " ",
+            'attachment': attachment,
+            'random_id': rnd_id()
+        })
+        print(f"[DECK] Отправлено!", flush=True)
+        return
+
+    # ==================== !бго / !бк ====================
+    chosen_command = None
+    for command in ["!бго", "!бк"]:
+        if text_lower.startswith(command + " "):
+            chosen_command = command
+            break
+    if not chosen_command:
+        return
+
+    card_name_ru = text[len(chosen_command) + 1:].strip().lower()
+    if not card_name_ru:
+        return
+
+    cache_key  = f"{chosen_command}_{card_name_ru}"
+    game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
+    response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
+
+    if cache_key in ATTACHMENT_CACHE:
+        vk_session.method('messages.send', {
+            'peer_id': peer_id,
+            'message': response_msg,
+            'attachment': ATTACHMENT_CACHE[cache_key],
+            'random_id': rnd_id()
+        })
+        return
+
+    cleaned_text   = card_name_ru.replace(" ", "-").replace("_", "-")
+    card_name_lat  = to_lat(cleaned_text)
+    prefix         = "bgo-" if chosen_command == "!бго" else "bk-"
+    ideal_filename = prefix + card_name_lat + ".webp"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    # СНАЧАЛА точное имя, потом smart
+    photo_content = _try_fetch_filename(ideal_filename, headers)
+    if not photo_content:
+        smart_filename = get_smart_filename(ideal_filename)
+        if smart_filename != ideal_filename:
+            print(f"[CARD] Точное не найдено, пробую smart: {ideal_filename} -> {smart_filename}", flush=True)
+            photo_content = _try_fetch_filename(smart_filename, headers)
+        full_filename = smart_filename
+    else:
+        full_filename = ideal_filename
+
+    if photo_content:
+        try:
+            img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
+            canvas_size = 800
+            white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+            scale = canvas_size / img.height
+            card_width = int(img.width * scale)
+            img = img.resize((card_width, canvas_size), Image.Resampling.BILINEAR)
+            white_bg.paste(img, ((canvas_size - card_width) // 2, 0), img)
+            output = io.BytesIO()
+            white_bg.convert("RGB").save(output, format="JPEG", quality=90)
+
+            attachment = upload_and_get_attachment(vk_session, output.getvalue(), 'card.jpg', peer_id)
+            ATTACHMENT_CACHE[cache_key] = attachment
+
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': response_msg,
+                'attachment': attachment,
+                'random_id': rnd_id()
+            })
+        except Exception as e:
+            print(f"[CARD ERROR] {e}", flush=True)
+            traceback.print_exc()
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': f"Ошибка: {e}",
+                'random_id': rnd_id()
+            })
+    else:
+        vk_session.method('messages.send', {
+            'peer_id': peer_id,
+            'message': f"Карта не найдена: {full_filename}",
+            'random_id': rnd_id()
+        })
+
+# ==================== ОСНОВНОЙ БОТ (с авто-восстановлением) ====================
 
 def run_vk_bot():
     update_site_files_index()
@@ -332,171 +508,17 @@ def run_vk_bot():
                     events = bot_longpoll.check()
                     for event in events:
                         if event.type == VkBotEventType.MESSAGE_NEW:
-                            message_obj = event.obj.message
-                            raw_text = message_obj.get('text', '').strip()
-                            peer_id  = message_obj.get('peer_id')
-
-                            text = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
-                            text_lower = text.lower()
-
-                            # ==================== !deck ====================
-                            if text_lower.startswith("!deck"):
-                                deck_text = text[5:].strip()
-                                if not deck_text:
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': "Использование: !deck [текст колоды из игры]",
-                                        'random_id': rnd_id()
-                                    })
-                                    continue
-
-                                print(f"[DECK] Получен текст длиной {len(deck_text)}", flush=True)
-                                hero_name, cards = parse_deck_text(deck_text)
-                                print(f"[DECK] Герой: '{hero_name}', карт: {len(cards)}", flush=True)
-
-                                if not cards:
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
-                                        'random_id': rnd_id()
-                                    })
-                                    continue
-
-                                total_cards = sum(c[0] for c in cards)
-
-                                def load_card(item):
-                                    count, cost, name = item
-                                    img     = download_card_image(name, prefix="bgo-")
-                                    element = get_card_element(name)
-                                    return cost, name, count, img, element
-
-                                with ThreadPoolExecutor(max_workers=10) as executor:
-                                    card_data = list(executor.map(load_card, cards))
-                                card_data.sort(key=lambda x: x[0])
-
-                                print(f"[DECK] Карты загружены, собираю изображение...", flush=True)
-                                img_bytes = build_deck_image(
-                                    hero_name or "Колода",
-                                    total_cards,
-                                    60,
-                                    card_data
-                                )
-                                print(f"[DECK] Изображение собрано, отправляю...", flush=True)
-
-                                up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-                                upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-                                upload_resp = requests.post(upload_url, files={'photo': ('deck.jpg', img_bytes, 'image/jpeg')}).json()
-                                save_resp = vk_session.method('photos.saveMessagesPhoto', {
-                                    'photo': upload_resp['photo'],
-                                    'server': upload_resp['server'],
-                                    'hash': upload_resp['hash']
-                                })
-                                actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-                                attachment  = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
-
-                                vk_session.method('messages.send', {
-                                    'peer_id': peer_id,
-                                    'message': " ",
-                                    'attachment': attachment,
-                                    'random_id': rnd_id()
-                                })
-                                print(f"[DECK] Отправлено!", flush=True)
-                                continue
-
-                            # ==================== !бго / !бк ====================
-                            chosen_command = None
-                            for command in ["!бго", "!бк"]:
-                                if text_lower.startswith(command + " "):
-                                    chosen_command = command
-                                    break
-                            if not chosen_command:
-                                continue
-
-                            card_name_ru = text[len(chosen_command) + 1:].strip().lower()
-                            if not card_name_ru:
-                                continue
-
-                            cache_key  = f"{chosen_command}_{card_name_ru}"
-                            game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
-                            response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
-
-                            if cache_key in ATTACHMENT_CACHE:
-                                vk_session.method('messages.send', {
-                                    'peer_id': peer_id,
-                                    'message': response_msg,
-                                    'attachment': ATTACHMENT_CACHE[cache_key],
-                                    'random_id': rnd_id()
-                                })
-                                continue
-
-                            cleaned_text   = card_name_ru.replace(" ", "-").replace("_", "-")
-                            card_name_lat  = to_lat(cleaned_text)
-                            prefix         = "bgo-" if chosen_command == "!бго" else "bk-"
-                            ideal_filename = prefix + card_name_lat + ".webp"
-                            full_filename  = get_smart_filename(ideal_filename)
-
-                            photo_content = None
-                            headers = {'User-Agent': 'Mozilla/5.0'}
-                            with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
-                                futures = [executor.submit(fetch_photo, path, full_filename, headers) for path in POSSIBLE_PATHS]
-                                for future in as_completed(futures):
-                                    content, _ = future.result()
-                                    if content:
-                                        photo_content = content
-                                        break
-
-                            if photo_content:
-                                try:
-                                    img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
-                                    canvas_size = 800
-                                    white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
-                                    scale = canvas_size / img.height
-                                    card_width = int(img.width * scale)
-                                    img = img.resize((card_width, canvas_size), Image.Resampling.BILINEAR)
-                                    white_bg.paste(img, ((canvas_size - card_width) // 2, 0), img)
-                                    output = io.BytesIO()
-                                    white_bg.convert("RGB").save(output, format="JPEG", quality=90)
-
-                                    up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-                                    upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-                                    upload_resp = requests.post(upload_url, files={'photo': ('card.jpg', output.getvalue(), 'image/jpeg')}).json()
-                                    save_resp = vk_session.method('photos.saveMessagesPhoto', {
-                                        'photo': upload_resp['photo'],
-                                        'server': upload_resp['server'],
-                                        'hash': upload_resp['hash']
-                                    })
-                                    actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-                                    attachment  = f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
-                                    ATTACHMENT_CACHE[cache_key] = attachment
-
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': response_msg,
-                                        'attachment': attachment,
-                                        'random_id': rnd_id()
-                                    })
-                                except Exception as e:
-                                    print(f"[CARD ERROR] {e}", flush=True)
-                                    traceback.print_exc()
-                                    vk_session.method('messages.send', {
-                                        'peer_id': peer_id,
-                                        'message': f"Ошибка: {e}",
-                                        'random_id': rnd_id()
-                                    })
-                            else:
-                                vk_session.method('messages.send', {
-                                    'peer_id': peer_id,
-                                    'message': f"Карта не найдена: {full_filename}",
-                                    'random_id': rnd_id()
-                                })
-
+                            try:
+                                handle_message(vk_session, event.obj.message)
+                            except Exception as e:
+                                print(f"[EVENT ERROR] {e}", flush=True)
+                                traceback.print_exc()
                 except Exception as e:
-                    print(f"[LOOP ERROR] {e}", flush=True)
+                    print(f"[LOOP ERROR] {e} — reconnect через 3 сек", flush=True)
                     traceback.print_exc()
-                    time.sleep(1)
-                time.sleep(0.1)
+                    time.sleep(3)
         except Exception as e:
-            print(f"[BOT ERROR] {e}", flush=True)
+            print(f"[BOT ERROR] {e} — полный рестарт через 5 сек", flush=True)
             traceback.print_exc()
             time.sleep(5)
 
