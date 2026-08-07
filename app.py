@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 
-app = Flask(__name__)
+app = Flask(__app__)
 
 @app.route('/')
 def home():
@@ -31,9 +31,6 @@ ELEMENT_CACHE_FILE = "element_cache.json"
 def rnd_id():
     return random.randint(0, 2**31)
 
-# Транслитерация проверена против реальных slug'ов и имён файлов ep-ccg.ru:
-#   Чёрный -> chernyj, Шаман -> shaman, саламандры -> salamandry,
-#   Иккол -> ikkol, Воля Архааля -> volya-arhaalya, щ -> shh, ц -> cz
 RULES = {
     'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
     'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -42,37 +39,21 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-# Цвета из декбилдера
+# Цвета стихий (из декбилдера)
 ELEMENT_COLORS = {
-    'stepi':    (241, 196,  15),   # #f1c40f Степи
-    'gory':     ( 41, 128, 185),   # #2980b9 Горы
-    'boloto':   (168, 213, 162),   # #a8d5a2 Болото
-    'les':      ( 39, 174,  96),   # #27ae60 Лес
-    'tma':      (142,  68, 173),   # #8e44ad Тьма
-    'nejtraly': (205, 127,  50),   # #cd7f32 Нейтралы
+    'stepi':    (212, 175,  55),   # #D4AF37 Степи (gold)
+    'gory':     ( 41, 128, 185),   # #2980B9 Горы
+    'boloto':   (168, 213, 162),   # #A8D5A2 Болото
+    'les':      ( 39, 174,  96),   # #27AE60 Лес
+    'tma':      (142,  68, 173),   # #8E44AD Тьма
+    'nejtraly': (205, 127,  50),   # #CD7F32 Нейтралы (bronze)
 }
-ELEMENT_TEXT_COLORS = {
-    'stepi':    (0, 0, 0),
-    'gory':     (255, 255, 255),
-    'boloto':   (0, 0, 0),
-    'les':      (255, 255, 255),
-    'tma':      (255, 255, 255),
-    'nejtraly': (255, 255, 255),
-}
-DEFAULT_ELEMENT_COLOR      = (205, 127, 50)
-DEFAULT_ELEMENT_TEXT_COLOR = (255, 255, 255)
+DEFAULT_ELEMENT_COLOR = (205, 127, 50)
 
-# Маппинг: класс с сайта -> наш ключ
 API_ELEMENT_MAP = {
-    'forest':    'les',
-    'steppe':    'stepi',
-    'mountains': 'gory',
-    'mountain':  'gory',
-    'swamp':     'boloto',
-    'darkness':  'tma',
-    'dark':      'tma',
-    'nejtraly':  'nejtraly',
-    'neutral':   'nejtraly',
+    'forest': 'les', 'steppe': 'stepi', 'mountains': 'gory', 'mountain': 'gory',
+    'swamp': 'boloto', 'darkness': 'tma', 'dark': 'tma',
+    'nejtraly': 'nejtraly', 'neutral': 'nejtraly',
 }
 
 BROWSER_HEADERS = {
@@ -111,7 +92,6 @@ def update_site_files_index():
     try:
         res = requests.get("https://ep-ccg.ru", headers=BROWSER_HEADERS, timeout=10)
         if res.status_code == 200:
-            # Ловим webp-ссылки в любых атрибутах (href, src, data-src, href__ и т.д.)
             links = re.findall(r'(?:href|src|data-src|data-lazy-src)__?="([^"]+\.webp)"', res.text, re.IGNORECASE)
             found = list(set([l.split('/')[-1] for l in links]))
             if found:
@@ -135,10 +115,8 @@ def to_lat(text):
 
 def get_card_element(card_name_ru):
     slug = to_lat(card_name_ru.strip().lower())
-
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
-
     try:
         url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
         res = requests.get(url, headers=BROWSER_HEADERS, timeout=7)
@@ -159,7 +137,6 @@ def get_card_element(card_name_ru):
             print(f"[ELEMENT] 447 для {slug}", flush=True)
     except Exception as e:
         print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
-
     if slug not in ELEMENT_CACHE:
         ELEMENT_CACHE[slug] = 'nejtraly'
     return ELEMENT_CACHE[slug]
@@ -186,7 +163,6 @@ def fetch_photo(path, full_filename, headers):
     return None, photo_url
 
 def _try_fetch_filename(filename, headers):
-    """Пробует скачать файл с заданным именем по всем путям. Возвращает content или None."""
     with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
         futures = [executor.submit(fetch_photo, path, filename, headers) for path in POSSIBLE_PATHS]
         for future in as_completed(futures):
@@ -200,13 +176,9 @@ def download_card_image(card_name_ru, prefix="bgo-"):
     lat = to_lat(cleaned)
     ideal = prefix + lat + ".webp"
     headers = {'User-Agent': 'Mozilla/5.0'}
-
-    # СНАЧАЛА пробуем точное имя — это чинит "Иккол", "Воля Архааля" и др.
     content = _try_fetch_filename(ideal, headers)
     if content:
         return content
-
-    # Только если точное не нашлось — пробуем "умное" совпадение из индекса
     smart = get_smart_filename(ideal)
     if smart != ideal:
         print(f"[CARD] Точное не найдено, пробую smart: {ideal} -> {smart}", flush=True)
@@ -234,82 +206,93 @@ def get_font(size):
                 pass
     return ImageFont.load_default()
 
-# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
+# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ (в стиле декбилдера) ====================
 
-CARD_W   = 300
-CARD_H   = 52
-COST_W   = 36
-COUNT_W  = 42
-PADDING  = 3
-HEADER_H = 80
-BG_COLOR        = (18, 22, 30)
-HEADER_COLOR    = (200, 150, 30)
-SUBHEADER_COLOR = (100, 200, 80)
+CARD_W    = 320
+CARD_H    = 54
+COST_W    = 34
+COUNT_W   = 44
+PADDING   = 2
+HEADER_H  = 78
+BG_COLOR        = (26, 26, 26)       # #1A1A1A
+HEADER_COLOR    = (255, 215,   0)    # #FFD700 yellow-gold
+SUBHEADER_COLOR = (102, 102, 102)    # #666666 gray
+TEXT_WHITE      = (255, 255, 255)
+TEXT_SHADOW     = (0, 0, 0)
+
+def _draw_text_with_outline(draw, xy, text, font, fill, outline, width=2):
+    """Рисует текст с тёмной обводкой для читаемости на цветном фоне."""
+    x, y = xy
+    for dx in range(-width, width + 1):
+        for dy in range(-width, width + 1):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, font=font, fill=outline)
+    draw.text((x, y), text, font=font, fill=fill)
 
 def build_deck_image(hero_name, total_cards, max_cards, cards):
     font_header = get_font(26)
-    font_sub    = get_font(16)
+    font_sub    = get_font(15)
     font_card   = get_font(17)
-    font_cost   = get_font(20)
+    font_cost   = get_font(22)
     font_count  = get_font(17)
 
     img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
     canvas = Image.new("RGB", (CARD_W, img_h), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
 
-    draw.text((12, 12), hero_name, font=font_header, fill=HEADER_COLOR)
+    # Заголовок
+    draw.text((12, 10), hero_name, font=font_header, fill=HEADER_COLOR)
     draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
 
     y = HEADER_H
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        element_color      = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
-        element_text_color = ELEMENT_TEXT_COLORS.get(element_key, DEFAULT_ELEMENT_TEXT_COLOR)
+        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
 
-        # Арт с запасом по краям чтобы скрыть рамки
-        art_x = -15
-        art_w = CARD_W + 30
-
+        # Фон строки: цвет стихии полупрозрачный поверх арта карты
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                scale = art_w / card_img.width
+                scale = CARD_W / card_img.width
                 new_h = int(card_img.height * scale)
-                card_img = card_img.resize((art_w, new_h), Image.Resampling.BILINEAR)
+                card_img = card_img.resize((CARD_W, new_h), Image.Resampling.BILINEAR)
                 offset_y = int(new_h * 0.25)
                 offset_y = min(offset_y, max(0, new_h - CARD_H))
-                card_img = card_img.crop((0, offset_y, art_w, offset_y + CARD_H))
-                canvas.paste(card_img, (art_x, row_y))
+                card_img = card_img.crop((0, offset_y, CARD_W, offset_y + CARD_H))
+                canvas.paste(card_img, (0, row_y))
             except:
-                draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
-        else:
-            draw.rectangle([0, row_y, CARD_W, row_y + CARD_H], fill=(40, 45, 55))
+                pass
 
-        # Затемнение
-        overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 110))
-        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), (20, 25, 35)), (0, row_y), overlay)
+        # Полупрозрачный цветной оверлей стихии (70% непрозрачности)
+        overlay = Image.new("RGBA", (CARD_W, CARD_H), element_color + (180,))
+        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), element_color), (0, row_y), overlay)
 
-        # Стоимость (цвет стихии слева)
-        draw.rectangle([0, row_y, COST_W - 1, row_y + CARD_H], fill=element_color)
+        # Тонкая разделительная линия снизу
+        draw.rectangle([0, row_y + CARD_H - 1, CARD_W, row_y + CARD_H], fill=(10, 10, 10))
+
+        # Стоимость (белый текст с обводкой, слева)
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((COST_W - tw) // 2, row_y + (CARD_H - th) // 2 - 2),
-                  cost_str, font=font_cost, fill=element_text_color)
+        _draw_text_with_outline(draw, ((COST_W - tw) // 2 - 1, row_y + (CARD_H - th) // 2 - 3),
+                                cost_str, font_cost, TEXT_WHITE, TEXT_SHADOW, width=2)
 
-        # Название карты
-        draw.text((COST_W + 6, row_y + (CARD_H - 17) // 2),
-                  name, font=font_card, fill=(255, 255, 255))
+        # Название карты (белый текст с обводкой, центр)
+        _draw_text_with_outline(draw, (COST_W + 8, row_y + (CARD_H - 17) // 2 - 1),
+                                name, font_card, TEXT_WHITE, TEXT_SHADOW, width=2)
 
-        # Количество (цвет стихии справа)
-        draw.rectangle([CARD_W - COUNT_W, row_y, CARD_W, row_y + CARD_H], fill=element_color)
+        # Бейдж количества (непрозрачный цвет стихии, белый текст, справа)
+        badge_x = CARD_W - COUNT_W
+        draw.rectangle([badge_x, row_y, CARD_W, row_y + CARD_H], fill=element_color)
+        # Тонкая левая граница бейджа
+        draw.rectangle([badge_x, row_y, badge_x, row_y + CARD_H], fill=(10, 10, 10))
         count_str = f"{count}x"
         bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
         tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-        draw.text((CARD_W - COUNT_W + (COUNT_W - tw2) // 2, row_y + (CARD_H - th2) // 2 - 1),
-                  count_str, font=font_count, fill=element_text_color)
+        _draw_text_with_outline(draw, (badge_x + (COUNT_W - tw2) // 2 - 1, row_y + (CARD_H - th2) // 2 - 2),
+                                count_str, font_count, TEXT_WHITE, TEXT_SHADOW, width=1)
 
-        draw.rectangle([0, row_y + CARD_H, CARD_W, row_y + CARD_H + PADDING], fill=BG_COLOR)
         y += CARD_H + PADDING
 
     output = io.BytesIO()
@@ -446,7 +429,6 @@ def handle_message(vk_session, message_obj):
     ideal_filename = prefix + card_name_lat + ".webp"
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # СНАЧАЛА точное имя, потом smart
     photo_content = _try_fetch_filename(ideal_filename, headers)
     if not photo_content:
         smart_filename = get_smart_filename(ideal_filename)
@@ -508,11 +490,14 @@ def run_vk_bot():
                     events = bot_longpoll.check()
                     for event in events:
                         if event.type == VkBotEventType.MESSAGE_NEW:
-                            try:
-                                handle_message(vk_session, event.obj.message)
-                            except Exception as e:
-                                print(f"[EVENT ERROR] {e}", flush=True)
-                                traceback.print_exc()
+                            # Обрабатываем в отдельном потоке — long poll не блокируется,
+                            # и бот не "молчит" на первое сообщение
+                            t = threading.Thread(
+                                target=_safe_handle,
+                                args=(vk_session, event.obj.message),
+                                daemon=True
+                            )
+                            t.start()
                 except Exception as e:
                     print(f"[LOOP ERROR] {e} — reconnect через 3 сек", flush=True)
                     traceback.print_exc()
@@ -521,6 +506,24 @@ def run_vk_bot():
             print(f"[BOT ERROR] {e} — полный рестарт через 5 сек", flush=True)
             traceback.print_exc()
             time.sleep(5)
+
+def _safe_handle(vk_session, message_obj):
+    """Обёртка: ловит любые ошибки и сообщает пользователю, чтобы бот не 'молчал'."""
+    try:
+        handle_message(vk_session, message_obj)
+    except Exception as e:
+        print(f"[HANDLE ERROR] {e}", flush=True)
+        traceback.print_exc()
+        try:
+            peer_id = message_obj.get('peer_id')
+            if peer_id:
+                vk_session.method('messages.send', {
+                    'peer_id': peer_id,
+                    'message': f"Произошла ошибка при обработке. Попробуйте ещё раз.\n\n{e}",
+                    'random_id': rnd_id()
+                })
+        except:
+            pass
 
 if __name__ == '__main__':
     bot_thread = threading.Thread(target=run_vk_bot)
