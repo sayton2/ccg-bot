@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 
-app = Flask(__app__)
+app = Flask(__name__)
 
 @app.route('/')
 def home():
@@ -264,7 +264,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
             except:
                 pass
 
-        # Полупрозрачный цветной оверлей стихии (70% непрозрачности)
+        # Полупрозрачный цветной оверлей стихии
         overlay = Image.new("RGBA", (CARD_W, CARD_H), element_color + (180,))
         canvas.paste(Image.new("RGB", (CARD_W, CARD_H), element_color), (0, row_y), overlay)
 
@@ -325,14 +325,39 @@ def parse_deck_text(text):
 def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
     up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
     upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-    upload_resp = requests.post(upload_url, files={'photo': (filename, img_bytes, 'image/jpeg')}).json()
-    save_resp = vk_session.method('photos.saveMessagesPhoto', {
-        'photo': upload_resp.get('photo', ''),
-        'server': upload_resp.get('server', ''),
-        'hash': upload_resp.get('hash', '')
-    })
-    actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-    return f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            upload_resp = requests.post(
+                upload_url,
+                files={'photo': (filename, img_bytes, 'image/jpeg')},
+                timeout=30
+            ).json()
+
+            print(f"[UPLOAD] attempt={attempt+1} resp={upload_resp}", flush=True)
+
+            photo_val = upload_resp.get('photo')
+            if not photo_val or photo_val == '[]':
+                last_error = f"upload server вернул пустой photo: {upload_resp}"
+                print(f"[UPLOAD RETRY] {last_error}", flush=True)
+                time.sleep(1)
+                continue
+
+            save_resp = vk_session.method('photos.saveMessagesPhoto', {
+                'photo':  upload_resp.get('photo', ''),
+                'server': upload_resp.get('server', ''),
+                'hash':   upload_resp.get('hash', '')
+            })
+            actual_data = save_resp['response'] if 'response' in save_resp else save_resp
+            return f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
+
+        except Exception as e:
+            last_error = str(e)
+            print(f"[UPLOAD ERROR] attempt={attempt+1}: {e}", flush=True)
+            time.sleep(1)
+
+    raise RuntimeError(f"Не удалось загрузить фото после 3 попыток: {last_error}")
 
 # ==================== ОБРАБОТКА ОДНОГО СООБЩЕНИЯ ====================
 
@@ -519,7 +544,7 @@ def _safe_handle(vk_session, message_obj):
             if peer_id:
                 vk_session.method('messages.send', {
                     'peer_id': peer_id,
-                    'message': f"Произошла ошибка при обработке. Попробуйте ещё раз.\n\n{e}",
+                    'message': "Ошибка при обработке. Попробуйте ещё раз.",
                     'random_id': rnd_id()
                 })
         except:
