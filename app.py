@@ -100,6 +100,78 @@ def to_lat(text):
     cleaned = text.replace(" ", "-").replace("_", "-")
     return "".join(RULES.get(c, c) for c in cleaned)
 
+# ==================== API-ПОИСК КАРТЫ (по русскому названию) ====================
+
+def resolve_card_via_api(card_name_ru):
+    """Ищет карту через WP REST API по русскому названию.
+    Возвращает (image_bytes, element_key) или (None, None).
+    Надёжнее транслитерации — сайт сам отдаёт правильный slug и URL картинки."""
+    try:
+        res = requests.get(
+            "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
+            params={
+                'search': card_name_ru,
+                '_fields': 'id,featured_media,title,class_list'
+            },
+            headers=BROWSER_HEADERS, timeout=7
+        )
+        print(f"[API SEARCH] '{card_name_ru}' status={res.status_code}", flush=True)
+        if res.status_code != 200 or not res.text.strip():
+            return None, None
+
+        data = res.json()
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return None, None
+
+        # Точное совпадение по названию; иначе берём первый результат
+        target = card_name_ru.strip().lower()
+        card = None
+        for c in data:
+            title = c.get('title', {}).get('rendered', '').strip().lower()
+            if title == target:
+                card = c
+                break
+        if not card:
+            card = data[0]
+
+        # Элемент из class_list
+        element_key = 'nejtraly'
+        for cls in card.get('class_list', []):
+            m = re.match(r'mmf_element-(\w+)', cls)
+            if m:
+                raw = m.group(1)
+                element_key = API_ELEMENT_MAP.get(raw, 'nejtraly')
+                break
+
+        # Кэшируем стихию
+        slug = card.get('slug', to_lat(card_name_ru.strip().lower()))
+        ELEMENT_CACHE[slug] = element_key
+        save_element_cache(ELEMENT_CACHE)
+
+        # URL картинки через media endpoint
+        media_id = card.get('featured_media')
+        if not media_id:
+            return None, element_key
+
+        media_res = requests.get(
+            f"https://ep-ccg.ru/wp-json/wp/v2/media/{media_id}",
+            params={'_fields': 'source_url'},
+            headers=BROWSER_HEADERS, timeout=7
+        )
+        if media_res.status_code != 200:
+            return None, element_key
+        image_url = media_res.json().get('source_url')
+        if not image_url:
+            return None, element_key
+
+        img_res = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if img_res.status_code == 200:
+            return img_res.content, element_key
+
+    except Exception as e:
+        print(f"[API RESOLVE ERROR] {card_name_ru}: {e}", flush=True)
+    return None, None
+
 # ==================== СТИХИЯ КАРТЫ ====================
 
 def get_card_element(card_name_ru):
@@ -133,6 +205,7 @@ def get_card_element(card_name_ru):
 # ==================== ЗАГРУЗКА КАРТ ====================
 
 POSSIBLE_PATHS = [
+    "wp-content/uploads/2026/08/",
     "wp-content/uploads/2026/07/",
     "wp-content/uploads/2026/06/",
     "wp-content/uploads/2026/05/",
@@ -161,6 +234,13 @@ def _try_fetch_filename(filename, headers):
     return None
 
 def download_card_image(card_name_ru, prefix="bgo-"):
+    # Сначала пробуем API — надёжно, без транслитерации
+    img, _ = resolve_card_via_api(card_name_ru)
+    if img:
+        print(f"[CARD] API нашёл: {card_name_ru}", flush=True)
+        return img
+
+    # Фолбэк: старый способ через транслитерацию
     cleaned = card_name_ru.strip().lower()
     lat = to_lat(cleaned)
     ideal = prefix + lat + ".webp"
@@ -439,8 +519,11 @@ def handle_message(vk_session, message_obj):
 
         def load_card(item):
             count, cost, name = item
-            img     = download_card_image(name, prefix="bgo-")
-            element = get_card_element(name)
+            img, element = resolve_card_via_api(name)
+            if not img:
+                img = download_card_image(name, prefix="bgo-")
+            if not element or element == 'nejtraly':
+                element = get_card_element(name)
             return cost, name, count, img, element
 
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -492,21 +575,25 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    cleaned_text   = card_name_ru.replace(" ", "-").replace("_", "-")
-    card_name_lat  = to_lat(cleaned_text)
-    prefix         = "bgo-" if chosen_command == "!бго" else "bk-"
-    ideal_filename = prefix + card_name_lat + ".webp"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-
-    photo_content = _try_fetch_filename(ideal_filename, headers)
+    # Сначала пробуем API — надёжно, без транслитерации
+    photo_content, _ = resolve_card_via_api(card_name_ru)
+    full_filename = "api"
     if not photo_content:
-        smart_filename = get_smart_filename(ideal_filename)
-        if smart_filename != ideal_filename:
-            print(f"[CARD] Точное не найдено, пробую smart: {ideal_filename} -> {smart_filename}", flush=True)
-            photo_content = _try_fetch_filename(smart_filename, headers)
-        full_filename = smart_filename
-    else:
-        full_filename = ideal_filename
+        cleaned_text   = card_name_ru.replace(" ", "-").replace("_", "-")
+        card_name_lat  = to_lat(cleaned_text)
+        prefix         = "bgo-" if chosen_command == "!бго" else "bk-"
+        ideal_filename = prefix + card_name_lat + ".webp"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+
+        photo_content = _try_fetch_filename(ideal_filename, headers)
+        if not photo_content:
+            smart_filename = get_smart_filename(ideal_filename)
+            if smart_filename != ideal_filename:
+                print(f"[CARD] Точное не найдено, пробую smart: {ideal_filename} -> {smart_filename}", flush=True)
+                photo_content = _try_fetch_filename(smart_filename, headers)
+            full_filename = smart_filename
+        else:
+            full_filename = ideal_filename
 
     if photo_content:
         try:
