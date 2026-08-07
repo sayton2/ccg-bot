@@ -39,17 +39,6 @@ RULES = {
     'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
 }
 
-# Цвета стихий (из декбилдера)
-ELEMENT_COLORS = {
-    'stepi':    (212, 175,  55),   # #D4AF37 Степи (gold)
-    'gory':     ( 41, 128, 185),   # #2980B9 Горы
-    'boloto':   (168, 213, 162),   # #A8D5A2 Болото
-    'les':      ( 39, 174,  96),   # #27AE60 Лес
-    'tma':      (142,  68, 173),   # #8E44AD Тьма
-    'nejtraly': (205, 127,  50),   # #CD7F32 Нейтралы (bronze)
-}
-DEFAULT_ELEMENT_COLOR = (205, 127, 50)
-
 API_ELEMENT_MAP = {
     'forest': 'les', 'steppe': 'stepi', 'mountains': 'gory', 'mountain': 'gory',
     'swamp': 'boloto', 'darkness': 'tma', 'dark': 'tma',
@@ -350,7 +339,7 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
         y += CARD_H + PADDING
 
     output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=92)
+    canvas.save(output, format="JPEG", quality=85)
     return output.getvalue()
 
 # ==================== ПАРСИНГ КОЛОДЫ ====================
@@ -377,12 +366,13 @@ def parse_deck_text(text):
 # ==================== ОТПРАВКА КАРТИНОК В ВК ====================
 
 def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
-    up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-    upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-
     last_error = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
+            # Свежий URL для каждой попытки
+            up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+            upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
+
             upload_resp = requests.post(
                 upload_url,
                 files={'photo': (filename, img_bytes, 'image/jpeg')},
@@ -393,9 +383,9 @@ def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
 
             photo_val = upload_resp.get('photo')
             if not photo_val or photo_val == '[]':
-                last_error = f"upload server вернул пустой photo: {upload_resp}"
+                last_error = f"empty photo: {upload_resp}"
                 print(f"[UPLOAD RETRY] {last_error}", flush=True)
-                time.sleep(1)
+                time.sleep(2 + attempt * 2)
                 continue
 
             save_resp = vk_session.method('photos.saveMessagesPhoto', {
@@ -409,9 +399,9 @@ def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
         except Exception as e:
             last_error = str(e)
             print(f"[UPLOAD ERROR] attempt={attempt+1}: {e}", flush=True)
-            time.sleep(1)
+            time.sleep(2 + attempt * 2)
 
-    raise RuntimeError(f"Не удалось загрузить фото после 3 попыток: {last_error}")
+    raise RuntimeError(f"Upload failed: {last_error}")
 
 # ==================== ОБРАБОТКА ОДНОГО СООБЩЕНИЯ ====================
 
@@ -569,8 +559,6 @@ def run_vk_bot():
                     events = bot_longpoll.check()
                     for event in events:
                         if event.type == VkBotEventType.MESSAGE_NEW:
-                            # Обрабатываем в отдельном потоке — long poll не блокируется,
-                            # и бот не "молчит" на первое сообщение
                             t = threading.Thread(
                                 target=_safe_handle,
                                 args=(vk_session, event.obj.message),
@@ -587,7 +575,7 @@ def run_vk_bot():
             time.sleep(5)
 
 def _safe_handle(vk_session, message_obj):
-    """Обёртка: ловит любые ошибки и сообщает пользователю, чтобы бот не 'молчал'."""
+    """Обёртка: ловит любые ошибки и сообщает пользователю реальную ошибку."""
     try:
         handle_message(vk_session, message_obj)
     except Exception as e:
@@ -598,7 +586,7 @@ def _safe_handle(vk_session, message_obj):
             if peer_id:
                 vk_session.method('messages.send', {
                     'peer_id': peer_id,
-                    'message': "Ошибка при обработке. Попробуйте ещё раз.",
+                    'message': f"⚠️ Ошибка: {e}\n\nПопробуйте ещё раз.",
                     'random_id': rnd_id()
                 })
         except:
