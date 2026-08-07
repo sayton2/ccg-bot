@@ -206,92 +206,146 @@ def get_font(size):
                 pass
     return ImageFont.load_default()
 
-# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ (в стиле декбилдера) ====================
+# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ (в стиле декбилдера v41) ====================
 
-CARD_W    = 320
-CARD_H    = 54
-COST_W    = 34
-COUNT_W   = 44
-PADDING   = 2
-HEADER_H  = 78
-BG_COLOR        = (26, 26, 26)       # #1A1A1A
-HEADER_COLOR    = (255, 215,   0)    # #FFD700 yellow-gold
-SUBHEADER_COLOR = (102, 102, 102)    # #666666 gray
+CARD_W    = 480
+CARD_H    = 64
+COST_W    = 44
+COUNT_W   = 64
+BORDER_W  = 8
+PADDING   = 5
+HEADER_H  = 80
+BG_COLOR        = (7, 7, 7)         # #070707
+PANEL_COLOR     = (17, 17, 17)      # #111
+HEADER_COLOR    = (241, 196, 15)    # #f1c40f
+SUBHEADER_COLOR = (85, 85, 85)     # #555
+COUNTER_OK      = (39, 174, 96)    # #27ae60
+COUNTER_ERR     = (231, 76, 60)   # #e74c3c
 TEXT_WHITE      = (255, 255, 255)
-TEXT_SHADOW     = (0, 0, 0)
+TEXT_BLACK      = (0, 0, 0)
 
-def _draw_text_with_outline(draw, xy, text, font, fill, outline, width=2):
-    """Рисует текст с тёмной обводкой для читаемости на цветном фоне."""
-    x, y = xy
-    for dx in range(-width, width + 1):
-        for dy in range(-width, width + 1):
-            if dx == 0 and dy == 0:
-                continue
-            draw.text((x + dx, y + dy), text, font=font, fill=outline)
-    draw.text((x, y), text, font=font, fill=fill)
+ELEMENT_DATA = {
+    'stepi':    {'color': (241, 196,  15), 'text': (0, 0, 0),     'alpha': (180, 150,   0)},
+    'gory':     {'color': ( 41, 128, 185), 'text': (255,255,255), 'alpha': ( 20,  80, 160)},
+    'boloto':   {'color': (168, 213, 162), 'text': (0, 0, 0),     'alpha': (100, 170, 100)},
+    'les':      {'color': ( 39, 174,  96), 'text': (255,255,255), 'alpha': ( 15, 110,  50)},
+    'tma':      {'color': (142,  68, 173), 'text': (255,255,255), 'alpha': ( 80,  20, 120)},
+    'nejtraly': {'color': (205, 127,  50), 'text': (255,255,255), 'alpha': (130,  80,  20)},
+}
+DEFAULT_ELEMENT = ELEMENT_DATA['nejtraly']
+
+
+def _make_gradient_overlay(width, height, elem_alpha_rgb):
+    """Градиент как в декбилдере:
+       linear-gradient(90deg, elem_alpha 0%, rgba(0,0,0,0.55) 45%, rgba(0,0,0,0.05) 100%)"""
+    grad_line = Image.new("RGBA", (width, 1), (0, 0, 0, 0))
+    for x in range(width):
+        t = x / max(1, width - 1)
+        if t < 0.45:
+            lt = t / 0.45
+            r = int(elem_alpha_rgb[0] * (1 - lt))
+            g = int(elem_alpha_rgb[1] * (1 - lt))
+            b = int(elem_alpha_rgb[2] * (1 - lt))
+            a = int((0.93 * (1 - lt) + 0.55 * lt) * 255)
+        else:
+            lt = (t - 0.45) / 0.55
+            r, g, b = 0, 0, 0
+            a = int((0.55 * (1 - lt) + 0.05 * lt) * 255)
+        grad_line.putpixel((x, 0), (r, g, b, a))
+    return grad_line.resize((width, height))
+
 
 def build_deck_image(hero_name, total_cards, max_cards, cards):
-    font_header = get_font(26)
-    font_sub    = get_font(15)
-    font_card   = get_font(17)
-    font_cost   = get_font(22)
-    font_count  = get_font(17)
+    font_hero    = get_font(22)
+    font_counter = get_font(20)
+    font_cost    = get_font(22)
+    font_title   = get_font(18)
+    font_count   = get_font(18)
 
     img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
-    canvas = Image.new("RGB", (CARD_W, img_h), BG_COLOR)
+    canvas = Image.new("RGB", (CARD_W, img_h), PANEL_COLOR)
     draw = ImageDraw.Draw(canvas)
 
     # Заголовок
-    draw.text((12, 10), hero_name, font=font_header, fill=HEADER_COLOR)
-    draw.text((12, 46), f"Карт: {total_cards} / {max_cards}", font=font_sub, fill=SUBHEADER_COLOR)
+    draw.text((14, 12), hero_name, font=font_hero, fill=HEADER_COLOR)
+
+    # Счётчик: зелёный если >=40, красный если >60
+    counter_text = f"Карт: {total_cards} / {max_cards}"
+    if total_cards > max_cards:
+        counter_color = COUNTER_ERR
+    elif total_cards >= 40:
+        counter_color = COUNTER_OK
+    else:
+        counter_color = SUBHEADER_COLOR
+    draw.text((14, 44), counter_text, font=font_counter, fill=counter_color)
 
     y = HEADER_H
     for cost, name, count, img_bytes, element_key in cards:
         row_y = y
-        element_color = ELEMENT_COLORS.get(element_key, DEFAULT_ELEMENT_COLOR)
+        ed = ELEMENT_DATA.get(element_key, DEFAULT_ELEMENT)
+        elem_color = ed['color']
+        elem_text  = ed['text']
+        elem_alpha_rgb = ed['alpha']
 
-        # Фон строки: цвет стихии полупрозрачный поверх арта карты
+        # Фон: арт карты, zoom 160%, center 30% (верх с лицом)
+        row_bg = Image.new("RGB", (CARD_W, CARD_H), PANEL_COLOR)
         if img_bytes:
             try:
                 card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                scale = CARD_W / card_img.width
-                new_h = int(card_img.height * scale)
-                card_img = card_img.resize((CARD_W, new_h), Image.Resampling.BILINEAR)
-                offset_y = int(new_h * 0.25)
-                offset_y = min(offset_y, max(0, new_h - CARD_H))
-                card_img = card_img.crop((0, offset_y, CARD_W, offset_y + CARD_H))
-                canvas.paste(card_img, (0, row_y))
+                zoom = 1.6
+                zw = int(card_img.width * zoom)
+                zh = int(card_img.height * zoom)
+                card_img = card_img.resize((zw, zh), Image.Resampling.BILINEAR)
+                center_x = zw // 2
+                center_y = int(zh * 0.30)
+                left = max(0, min(center_x - CARD_W // 2, zw - CARD_W))
+                top  = max(0, min(center_y - CARD_H // 2, zh - CARD_H))
+                row_bg = card_img.crop((left, top, left + CARD_W, top + CARD_H))
             except:
                 pass
 
-        # Полупрозрачный цветной оверлей стихии
-        overlay = Image.new("RGBA", (CARD_W, CARD_H), element_color + (180,))
-        canvas.paste(Image.new("RGB", (CARD_W, CARD_H), element_color), (0, row_y), overlay)
+        # Градиент-оверлей поверх арта
+        overlay = _make_gradient_overlay(CARD_W, CARD_H, elem_alpha_rgb)
+        row_rgba = row_bg.convert("RGBA")
+        row_rgba = Image.alpha_composite(row_rgba, overlay)
+        canvas.paste(row_rgba.convert("RGB"), (0, row_y))
 
-        # Тонкая разделительная линия снизу
-        draw.rectangle([0, row_y + CARD_H - 1, CARD_W, row_y + CARD_H], fill=(10, 10, 10))
+        # Border-left: сплошной цвет стихии слева
+        draw.rectangle([0, row_y, BORDER_W, row_y + CARD_H - 1], fill=elem_color)
 
-        # Стоимость (белый текст с обводкой, слева)
+        # Стоимость: по центру слева, белый с тенью
         cost_str = str(cost)
         bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        _draw_text_with_outline(draw, ((COST_W - tw) // 2 - 1, row_y + (CARD_H - th) // 2 - 3),
-                                cost_str, font_cost, TEXT_WHITE, TEXT_SHADOW, width=2)
+        cost_x = BORDER_W + (COST_W - tw) // 2 - bbox[0]
+        cost_y = row_y + (CARD_H - th) // 2 - bbox[1] - 1
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]:
+            draw.text((cost_x + dx, cost_y + dy), cost_str, font=font_cost, fill=TEXT_BLACK)
+        draw.text((cost_x, cost_y), cost_str, font=font_cost, fill=TEXT_WHITE)
 
-        # Название карты (белый текст с обводкой, центр)
-        _draw_text_with_outline(draw, (COST_W + 8, row_y + (CARD_H - 17) // 2 - 1),
-                                name, font_card, TEXT_WHITE, TEXT_SHADOW, width=2)
+        # Название: flex, белый, text-shadow, обрезка с …
+        title_x = BORDER_W + COST_W + 4
+        title_max_w = CARD_W - title_x - COUNT_W
+        title = name
+        if draw.textlength(title, font=font_title) > title_max_w:
+            ellipsis_w = draw.textlength("…", font=font_title)
+            while len(title) > 1 and draw.textlength(title, font=font_title) + ellipsis_w > title_max_w:
+                title = title[:-1]
+            title = title + "…"
+        bbox_t = draw.textbbox((0, 0), title, font=font_title)
+        title_y = row_y + (CARD_H - (bbox_t[3] - bbox_t[1])) // 2 - bbox_t[1] - 1
+        draw.text((title_x + 1, title_y + 1), title, font=font_title, fill=TEXT_BLACK)
+        draw.text((title_x, title_y), title, font=font_title, fill=TEXT_WHITE)
 
-        # Бейдж количества (непрозрачный цвет стихии, белый текст, справа)
-        badge_x = CARD_W - COUNT_W
-        draw.rectangle([badge_x, row_y, CARD_W, row_y + CARD_H], fill=element_color)
-        # Тонкая левая граница бейджа
-        draw.rectangle([badge_x, row_y, badge_x, row_y + CARD_H], fill=(10, 10, 10))
+        # Количество: фон = цвет стихии, текст = цвет элемента (чёрный для степей/болота)
+        count_x = CARD_W - COUNT_W
+        draw.rectangle([count_x, row_y, CARD_W, row_y + CARD_H], fill=elem_color)
         count_str = f"{count}x"
-        bbox2 = draw.textbbox((0, 0), count_str, font=font_count)
-        tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-        _draw_text_with_outline(draw, (badge_x + (COUNT_W - tw2) // 2 - 1, row_y + (CARD_H - th2) // 2 - 2),
-                                count_str, font_count, TEXT_WHITE, TEXT_SHADOW, width=1)
+        bbox_c = draw.textbbox((0, 0), count_str, font=font_count)
+        cw, ch = bbox_c[2] - bbox_c[0], bbox_c[3] - bbox_c[1]
+        cx = count_x + (COUNT_W - cw) // 2 - bbox_c[0]
+        cy = row_y + (CARD_H - ch) // 2 - bbox_c[1] - 1
+        draw.text((cx, cy), count_str, font=font_count, fill=elem_text)
 
         y += CARD_H + PADDING
 
