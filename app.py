@@ -29,8 +29,6 @@ def home():
 # ==================== НАСТРОЙКИ ====================
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
-# Ваш VK ID — только вы можете добавлять/удалять чаты из конкурса
-# Узнать свой ID: https://vk.com/id... (цифры после id=) или через @vk_id_bot
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 ELEMENT_CACHE_FILE   = "element_cache.json"
@@ -67,8 +65,12 @@ BROWSER_HEADERS = {
 }
 
 ATTACHMENT_CACHE = {}
+# НОВОЕ: Кэш изображений карт и метаданных в памяти для ускорения
+CARD_IMAGE_CACHE = {}   # card_name_lower -> (image_bytes, element_key)
+CARD_META_CACHE = {}    # card_name_lower -> (slug, media_id, element_key)
 SITE_FILES_INDEX = []
 INDEX_LOCK = threading.Lock()
+CACHE_LOCK = threading.Lock()
 
 # ==================== КЭШ И СОСТОЯНИЕ ====================
 
@@ -118,22 +120,26 @@ def to_lat(text):
     cleaned = text.replace(" ", "-").replace("_", "-")
     return "".join(RULES.get(c, c) for c in cleaned)
 
-# ==================== API-ПОИСК КАРТЫ ====================
+# ==================== API-ПОИСК КАРТЫ (УСКОРЕННЫЙ) ====================
 
-def resolve_card_via_api(card_name_ru):
+def resolve_card_meta(card_name_ru):
+    """НОВОЕ: Быстрый поиск метаданных карты с кэшем в памяти."""
+    key = card_name_ru.strip().lower()
+    with CACHE_LOCK:
+        if key in CARD_META_CACHE:
+            return CARD_META_CACHE[key]
     try:
         res = requests.get(
             "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-            params={'search': card_name_ru, '_fields': 'id,featured_media,title,class_list,content,slug'},
+            params={'search': card_name_ru, '_fields': 'id,featured_media,title,class_list,slug'},
             headers=BROWSER_HEADERS, timeout=7
         )
         if res.status_code != 200 or not res.text.strip():
-            return None, None
+            return None
         data = res.json()
         if not data or not isinstance(data, list) or len(data) == 0:
-            return None, None
-
-        target = card_name_ru.strip().lower()
+            return None
+        target = key
         card = None
         for c in data:
             if c.get('title', {}).get('rendered', '').strip().lower() == target:
@@ -141,21 +147,39 @@ def resolve_card_via_api(card_name_ru):
                 break
         if not card:
             card = data[0]
-
         element_key = 'nejtraly'
         for cls in card.get('class_list', []):
             m = re.match(r'mmf_element-(\w+)', cls)
             if m:
                 element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
                 break
-
-        slug = card.get('slug', to_lat(card_name_ru.strip().lower()))
+        slug = card.get('slug', to_lat(key))
+        media_id = card.get('featured_media')
+        result = (slug, media_id, element_key)
+        with CACHE_LOCK:
+            CARD_META_CACHE[key] = result
+        # Сохраняем стихию в файловый кэш
         ELEMENT_CACHE[slug] = element_key
         save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
+        return result
+    except Exception as e:
+        print(f"[META ERROR] {card_name_ru}: {e}", flush=True)
+    return None
 
-        media_id = card.get('featured_media')
-        if not media_id:
-            return None, element_key
+def download_card_image_fast(card_name_ru):
+    """НОВОЕ: Быстрая загрузка изображения карты с кэшем в памяти."""
+    key = card_name_ru.strip().lower()
+    with CACHE_LOCK:
+        if key in CARD_IMAGE_CACHE:
+            return CARD_IMAGE_CACHE[key]
+    # Ищем метаданные
+    meta = resolve_card_meta(card_name_ru)
+    if not meta:
+        return None, None
+    slug, media_id, element_key = meta
+    if not media_id:
+        return None, element_key
+    try:
         media_res = requests.get(f"https://ep-ccg.ru/wp-json/wp/v2/media/{media_id}",
                                  params={'_fields': 'source_url'}, headers=BROWSER_HEADERS, timeout=7)
         if media_res.status_code != 200:
@@ -165,10 +189,17 @@ def resolve_card_via_api(card_name_ru):
             return None, element_key
         img_res = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         if img_res.status_code == 200:
-            return img_res.content, element_key
+            result = (img_res.content, element_key)
+            with CACHE_LOCK:
+                CARD_IMAGE_CACHE[key] = result
+            return result
     except Exception as e:
-        print(f"[API RESOLVE ERROR] {card_name_ru}: {e}", flush=True)
-    return None, None
+        print(f"[IMG DOWNLOAD ERROR] {card_name_ru}: {e}", flush=True)
+    return None, element_key
+
+def resolve_card_via_api(card_name_ru):
+    """Совместимость: возвращает (image_bytes, element_key)."""
+    return download_card_image_fast(card_name_ru)
 
 # ==================== СТИХИЯ КАРТЫ ====================
 
@@ -176,26 +207,14 @@ def get_card_element(card_name_ru):
     slug = to_lat(card_name_ru.strip().lower())
     if slug in ELEMENT_CACHE:
         return ELEMENT_CACHE[slug]
-    try:
-        url = f"https://ep-ccg.ru/wp-json/wp/v2/mmf_card?slug={slug}&_fields=class_list"
-        res = requests.get(url, headers=BROWSER_HEADERS, timeout=7)
-        if res.status_code == 200:
-            data = res.json()
-            if data and isinstance(data, list) and len(data) > 0:
-                for cls in data[0].get('class_list', []):
-                    m = re.match(r'mmf_element-(\w+)', cls)
-                    if m:
-                        element = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
-                        ELEMENT_CACHE[slug] = element
-                        save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
-                        return element
-    except Exception as e:
-        print(f"[ELEMENT ERROR] {slug}: {e}", flush=True)
+    meta = resolve_card_meta(card_name_ru)
+    if meta:
+        return meta[2]
     if slug not in ELEMENT_CACHE:
         ELEMENT_CACHE[slug] = 'nejtraly'
     return ELEMENT_CACHE[slug]
 
-# ==================== ЗАГРУЗКА КАРТ ====================
+# ==================== ЗАГРУЗКА КАРТ (FALLBACK) ====================
 
 POSSIBLE_PATHS = [
     "wp-content/uploads/2026/08/", "wp-content/uploads/2026/07/",
@@ -223,7 +242,7 @@ def _try_fetch_filename(filename, headers):
     return None
 
 def download_card_image(card_name_ru, prefix="bgo-"):
-    img, _ = resolve_card_via_api(card_name_ru)
+    img, elem = download_card_image_fast(card_name_ru)
     if img:
         return img
     cleaned = card_name_ru.strip().lower()
@@ -461,29 +480,24 @@ def make_art_crop(img_bytes):
         return None
 
 def start_contest(vk_session):
-    """Запускает новый раунд конкурса ТОЛЬКО в чатах из белого списка."""
     global CONTEST_STATE
     if not CONTEST_CHATS:
         print("[CONTEST] Белый список пуст — конкурс не запущен", flush=True)
         return
-
     card = get_random_card()
     if not card:
         print("[CONTEST] Не удалось получить карту", flush=True)
         return
-
     card_name = card.get('title', {}).get('rendered', '').strip()
     card_slug = card.get('slug', '')
     if not card_name:
         return
-
     element_key = 'nejtraly'
     for cls in card.get('class_list', []):
         m = re.match(r'mmf_element-(\w+)', cls)
         if m:
             element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
             break
-
     img_bytes = None
     media_id = card.get('featured_media')
     if media_id:
@@ -498,26 +512,19 @@ def start_contest(vk_session):
                         img_bytes = img_res.content
         except:
             pass
-
     content_html = card.get('content', {}).get('rendered', '')
     card_text = re.sub(r'<[^>]+>', '', content_html).strip()
     clue_type = 'art' if img_bytes else 'text'
-
     new_state = {}
     for chat_id in CONTEST_CHATS:
         new_state[str(chat_id)] = {
-            'card_name': card_name,
-            'card_slug': card_slug,
-            'element': element_key,
-            'started_at': moscow_now().isoformat(),
-            'guessed': False,
-            'revealed': False,
+            'card_name': card_name, 'card_slug': card_slug, 'element': element_key,
+            'started_at': moscow_now().isoformat(), 'guessed': False, 'revealed': False,
             'clue_type': clue_type
         }
     CONTEST_STATE = new_state
     save_json(CONTEST_FILE, CONTEST_STATE)
     print(f"[CONTEST] Запущен в {len(CONTEST_CHATS)} чат(ах)! Карта: «{card_name}», подсказка: {clue_type}", flush=True)
-
     for chat_id in CONTEST_CHATS:
         try:
             send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text)
@@ -532,8 +539,7 @@ def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
             vk_session.method('messages.send', {
                 'peer_id': chat_id,
                 'message': "🎯 Угадай карту!\n\nЧто это за карта? Первый правильный ответ — +10 баллов.\nОтвет будет раскрыт в 23:55, если никто не угадает.",
-                'attachment': attachment,
-                'random_id': rnd_id()
+                'attachment': attachment, 'random_id': rnd_id()
             })
             return
     clue = card_text if card_text else "Карта из вселенной Берсерк"
@@ -550,26 +556,22 @@ def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
     state = CONTEST_STATE.get(str(peer_id))
     if not state or state.get('guessed') or state.get('revealed'):
         return False
-
     if normalize_text(text) == normalize_text(state['card_name']):
         state['guessed'] = True
         save_json(CONTEST_FILE, CONTEST_STATE)
         add_score(peer_id, user_id, user_name, 10)
-
         vk_session.method('messages.send', {
             'peer_id': peer_id,
             'message': f"🎉 {user_name} угадал(а)! Это «{state['card_name']}».\n+10 баллов в рейтинг!",
             'random_id': rnd_id()
         })
         try:
-            img, _ = resolve_card_via_api(state['card_name'])
+            img, _ = download_card_image_fast(state['card_name'])
             if img:
                 attachment = upload_and_get_attachment(vk_session, img, 'card.jpg', peer_id)
                 vk_session.method('messages.send', {
-                    'peer_id': peer_id,
-                    'message': state['card_name'],
-                    'attachment': attachment,
-                    'random_id': rnd_id()
+                    'peer_id': peer_id, 'message': state['card_name'],
+                    'attachment': attachment, 'random_id': rnd_id()
                 })
         except:
             pass
@@ -590,14 +592,12 @@ def end_contest_timeout(vk_session):
                     'message': f"⏰ Время вышло! Никто не угадал.\nЭто была карта «{state['card_name']}».",
                     'random_id': rnd_id()
                 })
-                img, _ = resolve_card_via_api(state['card_name'])
+                img, _ = download_card_image_fast(state['card_name'])
                 if img:
                     attachment = upload_and_get_attachment(vk_session, img, 'card.jpg', chat_id)
                     vk_session.method('messages.send', {
-                        'peer_id': chat_id,
-                        'message': state['card_name'],
-                        'attachment': attachment,
-                        'random_id': rnd_id()
+                        'peer_id': chat_id, 'message': state['card_name'],
+                        'attachment': attachment, 'random_id': rnd_id()
                     })
             except Exception as e:
                 print(f"[CONTEST TIMEOUT ERROR] chat={chat_id}: {e}", flush=True)
@@ -621,7 +621,6 @@ def remove_contest_chat(peer_id):
     if peer_id in CONTEST_CHATS:
         CONTEST_CHATS.remove(peer_id)
         save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
-        # Чистим состояние конкурса для этого чата
         CONTEST_STATE.pop(str(peer_id), None)
         save_json(CONTEST_FILE, CONTEST_STATE)
         return True
@@ -638,7 +637,7 @@ def show_contest_chats(vk_session, peer_id):
         msg = "\n".join(lines)
     vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
 
-# ==================== РЕЙТИНГ ЧАТА ====================
+# ==================== РЕЙТИНГ ЧАТА (С РЕАЛЬНЫМИ ИМЕНАМИ) ====================
 
 def check_monthly_reset(chat_id_str):
     current_month = moscow_now().strftime('%Y-%m')
@@ -663,9 +662,43 @@ def add_score(chat_id, user_id, user_name, points):
     CHAT_SCORES[chat_id_str][user_id_str]['score'] += points
     save_json(SCORES_FILE, CHAT_SCORES)
 
+def fetch_users_names(vk_session, user_ids):
+    """НОВОЕ: Массово запрашивает реальные имена пользователей через users.get (до 1000 за раз)."""
+    if not user_ids:
+        return {}
+    names = {}
+    try:
+        info = vk_session.method('users.get', {'user_ids': ','.join(str(uid) for uid in user_ids)})
+        for u in info.get('response', []):
+            uid = str(u.get('id', ''))
+            full = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+            if uid and full:
+                names[uid] = full
+    except Exception as e:
+        print(f"[NAMES FETCH ERROR] {e}", flush=True)
+    return names
+
+def refresh_chat_names(vk_session, chat_id_str):
+    """НОВОЕ: Обновляет реальные имена всех игроков в таблице рейтинга чата."""
+    chat_data = CHAT_SCORES.get(chat_id_str, {})
+    user_ids = [uid for uid in chat_data.keys() if uid != '_reset_month' and uid.isdigit()]
+    if not user_ids:
+        return
+    fresh_names = fetch_users_names(vk_session, user_ids)
+    updated = False
+    for uid in user_ids:
+        if uid in fresh_names and chat_data[uid].get('name') != fresh_names[uid]:
+            chat_data[uid]['name'] = fresh_names[uid]
+            updated = True
+    if updated:
+        save_json(SCORES_FILE, CHAT_SCORES)
+
 def show_top(vk_session, peer_id):
+    """НОВОЕ: Выводит рейтинг таблицей с реальными именами игроков."""
     chat_id_str = str(peer_id)
     check_monthly_reset(chat_id_str)
+    # Обновляем реальные имена перед показом
+    refresh_chat_names(vk_session, chat_id_str)
     scores = CHAT_SCORES.get(chat_id_str, {})
     entries = [(uid, data) for uid, data in scores.items() if uid != '_reset_month' and isinstance(data, dict)]
     entries.sort(key=lambda x: x[1].get('score', 0), reverse=True)
@@ -678,10 +711,23 @@ def show_top(vk_session, peer_id):
         })
         return
 
+    # Формируем таблицу
     lines = ["📊 Рейтинг чата за этот месяц:\n"]
+    lines.append("┌────┬──────────────────────┬────────┐")
+    lines.append("│ №  │ Игрок                │ Баллы  │")
+    lines.append("├────┼──────────────────────┼────────┤")
     for i, (uid, data) in enumerate(entries[:10], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lines.append(f"{medal} {data.get('name', '???')} — {data.get('score', 0)} баллов")
+        name = data.get('name', '???')
+        if len(name) > 18:
+            name = name[:17] + "…"
+        score = data.get('score', 0)
+        # Выравнивание: имя фиксированной ширины, баллы по правому краю
+        name_padded = name.ljust(18)
+        score_str = str(score).rjust(6)
+        lines.append(f"│ {medal} │ {name_padded} │ {score_str} │")
+    lines.append("└────┴──────────────────────┴────────┘")
+    lines.append(f"\nВсего игроков: {len(entries)}")
     vk_session.method('messages.send', {'peer_id': peer_id, 'message': "\n".join(lines), 'random_id': rnd_id()})
 
 # ==================== ПЛАНИРОВЩИК КОНКУРСА ====================
@@ -720,10 +766,10 @@ def handle_message(vk_session, message_obj):
     peer_id  = message_obj.get('peer_id')
     user_id  = message_obj.get('from_id')
 
-    # --- Команды управления конкурсом (только владелец) ---
     text_clean = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
     text_lower = text_clean.lower()
 
+    # --- Команды управления конкурсом (только владелец) ---
     if text_lower in ("!конкурс +", "!конкурс+", "!конкурс добавить"):
         if is_owner(user_id):
             added = add_contest_chat(peer_id)
@@ -742,13 +788,12 @@ def handle_message(vk_session, message_obj):
         vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
         return
 
-    if text_lower in ("!конкурс список", "!конкурс список", "!конкурс"):
+    if text_lower in ("!конкурс список", "!конкурс"):
         if is_owner(user_id):
             show_contest_chats(vk_session, peer_id)
         else:
             vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': "❌ Только владелец бота может смотреть список чатов.",
+                'peer_id': peer_id, 'message': "❌ Только владелец бота может смотреть список чатов.",
                 'random_id': rnd_id()
             })
         return
@@ -757,31 +802,27 @@ def handle_message(vk_session, message_obj):
     in_contest = peer_id in CONTEST_CHATS
     if in_contest and user_id and user_id > 0:
         user_name = get_user_name(vk_session, user_id)
-        # +1 балл за любое сообщение
         add_score(peer_id, user_id, user_name, 1)
-        # Проверка ответа конкурса
         check_contest_answer(vk_session, peer_id, user_id, user_name, raw_text)
 
-    # --- !топ (доступен везде, показывает рейтинг текущего чата) ---
+    # --- !топ ---
     if text_lower in ("!топ", "!top"):
         show_top(vk_session, peer_id)
         return
 
-    # --- !deck ---
+    # --- !deck (УСКОРЕННЫЙ) ---
     if text_lower.startswith("!deck"):
         deck_text = text_clean[5:].strip()
         if not deck_text:
             vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': "Использование: !deck [текст колоды из игры]",
+                'peer_id': peer_id, 'message': "Использование: !deck [текст колоды из игры]",
                 'random_id': rnd_id()
             })
             return
         hero_name, cards = parse_deck_text(deck_text)
         if not cards:
             vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
+                'peer_id': peer_id, 'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
                 'random_id': rnd_id()
             })
             return
@@ -789,14 +830,16 @@ def handle_message(vk_session, message_obj):
 
         def load_card(item):
             count, cost, name = item
-            img, element = resolve_card_via_api(name)
+            # НОВОЕ: Используем быстрый кэшированный загрузчик
+            img, element = download_card_image_fast(name)
             if not img:
                 img = download_card_image(name, prefix="bgo-")
             if not element or element == 'nejtraly':
                 element = get_card_element(name)
             return cost, name, count, img, element
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # НОВОЕ: Больше параллельных потоков для ускорения
+        with ThreadPoolExecutor(max_workers=20) as executor:
             card_data = list(executor.map(load_card, cards))
         card_data.sort(key=lambda x: x[0])
 
@@ -807,7 +850,7 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    # --- !бго / !бк ---
+    # --- !бго / !бк (УСКОРЕННЫЙ) ---
     chosen_command = None
     for command in ["!бго", "!бк"]:
         if text_lower.startswith(command + " "):
@@ -831,7 +874,8 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    photo_content, _ = resolve_card_via_api(card_name_ru)
+    # НОВОЕ: Быстрая загрузка через кэш
+    photo_content, _ = download_card_image_fast(card_name_ru)
     full_filename = "api"
     if not photo_content:
         cleaned_text  = card_name_ru.replace(" ", "-").replace("_", "-")
@@ -896,7 +940,6 @@ def _safe_handle(vk_session, message_obj):
 def run_vk_bot():
     update_site_files_index()
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
-
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
     print(f"Планировщик конкурса запущен. Чатов в конкурсе: {len(CONTEST_CHATS)}", flush=True)
     if not OWNER_ID:
@@ -927,4 +970,5 @@ if __name__ == '__main__':
     bot_thread.start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+  
 
