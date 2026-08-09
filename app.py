@@ -679,7 +679,7 @@ def fetch_users_names(vk_session, user_ids):
     return names
 
 def refresh_chat_names(vk_session, chat_id_str):
-    """НОВОЕ: Обновляет реальные имена всех игроков в таблице рейтинга чата."""
+    """Обновляет реальные имена всех игроков в таблице рейтинга чата."""
     chat_data = CHAT_SCORES.get(chat_id_str, {})
     user_ids = [uid for uid in chat_data.keys() if uid != '_reset_month' and uid.isdigit()]
     if not user_ids:
@@ -687,17 +687,18 @@ def refresh_chat_names(vk_session, chat_id_str):
     fresh_names = fetch_users_names(vk_session, user_ids)
     updated = False
     for uid in user_ids:
-        if uid in fresh_names and chat_data[uid].get('name') != fresh_names[uid]:
-            chat_data[uid]['name'] = fresh_names[uid]
+        new_name = fresh_names.get(uid)
+        if new_name and chat_data[uid].get('name') != new_name:
+            chat_data[uid]['name'] = new_name
             updated = True
     if updated:
         save_json(SCORES_FILE, CHAT_SCORES)
 
 def show_top(vk_session, peer_id):
-    """НОВОЕ: Выводит рейтинг таблицей с реальными именами игроков."""
+    """Выводит рейтинг аккуратным списком до 10 игроков с реальными именами."""
     chat_id_str = str(peer_id)
     check_monthly_reset(chat_id_str)
-    # Обновляем реальные имена перед показом
+    # Всегда обновляем реальные имена перед показом
     refresh_chat_names(vk_session, chat_id_str)
     scores = CHAT_SCORES.get(chat_id_str, {})
     entries = [(uid, data) for uid, data in scores.items() if uid != '_reset_month' and isinstance(data, dict)]
@@ -711,22 +712,12 @@ def show_top(vk_session, peer_id):
         })
         return
 
-    # Формируем таблицу
     lines = ["📊 Рейтинг чата за этот месяц:\n"]
-    lines.append("┌────┬──────────────────────┬────────┐")
-    lines.append("│ №  │ Игрок                │ Баллы  │")
-    lines.append("├────┼──────────────────────┼────────┤")
     for i, (uid, data) in enumerate(entries[:10], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
         name = data.get('name', '???')
-        if len(name) > 18:
-            name = name[:17] + "…"
         score = data.get('score', 0)
-        # Выравнивание: имя фиксированной ширины, баллы по правому краю
-        name_padded = name.ljust(18)
-        score_str = str(score).rjust(6)
-        lines.append(f"│ {medal} │ {name_padded} │ {score_str} │")
-    lines.append("└────┴──────────────────────┴────────┘")
+        lines.append(f"{medal} {name} — {score} баллов")
     lines.append(f"\nВсего игроков: {len(entries)}")
     vk_session.method('messages.send', {'peer_id': peer_id, 'message': "\n".join(lines), 'random_id': rnd_id()})
 
