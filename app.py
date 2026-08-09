@@ -65,9 +65,8 @@ BROWSER_HEADERS = {
 }
 
 ATTACHMENT_CACHE = {}
-# НОВОЕ: Кэш изображений карт и метаданных в памяти для ускорения
-CARD_IMAGE_CACHE = {}   # card_name_lower -> (image_bytes, element_key)
-CARD_META_CACHE = {}    # card_name_lower -> (slug, media_id, element_key)
+CARD_IMAGE_CACHE = {}
+CARD_META_CACHE = {}
 SITE_FILES_INDEX = []
 INDEX_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
@@ -123,7 +122,6 @@ def to_lat(text):
 # ==================== API-ПОИСК КАРТЫ (УСКОРЕННЫЙ) ====================
 
 def resolve_card_meta(card_name_ru):
-    """НОВОЕ: Быстрый поиск метаданных карты с кэшем в памяти."""
     key = card_name_ru.strip().lower()
     with CACHE_LOCK:
         if key in CARD_META_CACHE:
@@ -158,7 +156,6 @@ def resolve_card_meta(card_name_ru):
         result = (slug, media_id, element_key)
         with CACHE_LOCK:
             CARD_META_CACHE[key] = result
-        # Сохраняем стихию в файловый кэш
         ELEMENT_CACHE[slug] = element_key
         save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
         return result
@@ -167,12 +164,10 @@ def resolve_card_meta(card_name_ru):
     return None
 
 def download_card_image_fast(card_name_ru):
-    """НОВОЕ: Быстрая загрузка изображения карты с кэшем в памяти."""
     key = card_name_ru.strip().lower()
     with CACHE_LOCK:
         if key in CARD_IMAGE_CACHE:
             return CARD_IMAGE_CACHE[key]
-    # Ищем метаданные
     meta = resolve_card_meta(card_name_ru)
     if not meta:
         return None, None
@@ -198,7 +193,6 @@ def download_card_image_fast(card_name_ru):
     return None, element_key
 
 def resolve_card_via_api(card_name_ru):
-    """Совместимость: возвращает (image_bytes, element_key)."""
     return download_card_image_fast(card_name_ru)
 
 # ==================== СТИХИЯ КАРТЫ ====================
@@ -663,13 +657,15 @@ def add_score(chat_id, user_id, user_name, points):
     save_json(SCORES_FILE, CHAT_SCORES)
 
 def fetch_users_names(vk_session, user_ids):
-    """НОВОЕ: Массово запрашивает реальные имена пользователей через users.get (до 1000 за раз)."""
+    """Массово запрашивает реальные имена пользователей через users.get."""
     if not user_ids:
         return {}
     names = {}
     try:
-        info = vk_session.method('users.get', {'user_ids': ','.join(str(uid) for uid in user_ids)})
-        for u in info.get('response', []):
+        result = vk_session.method('users.get', {'user_ids': ','.join(str(uid) for uid in user_ids)})
+        # vk_api может вернуть как список, так и {'response': [...]}
+        users = result if isinstance(result, list) else result.get('response', [])
+        for u in users:
             uid = str(u.get('id', ''))
             full = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
             if uid and full:
@@ -744,10 +740,10 @@ def contest_scheduler(vk_session):
 
 def get_user_name(vk_session, user_id):
     try:
-        info = vk_session.method('users.get', {'user_ids': user_id})
-        resp = info.get('response', [])
-        if resp:
-            return f"{resp[0].get('first_name', '')} {resp[0].get('last_name', '')}".strip()
+        result = vk_session.method('users.get', {'user_ids': user_id})
+        users = result if isinstance(result, list) else result.get('response', [])
+        if users:
+            return f"{users[0].get('first_name', '')} {users[0].get('last_name', '')}".strip()
     except:
         pass
     return "Игрок"
@@ -801,7 +797,7 @@ def handle_message(vk_session, message_obj):
         show_top(vk_session, peer_id)
         return
 
-    # --- !deck (УСКОРЕННЫЙ) ---
+    # --- !deck ---
     if text_lower.startswith("!deck"):
         deck_text = text_clean[5:].strip()
         if not deck_text:
@@ -821,7 +817,6 @@ def handle_message(vk_session, message_obj):
 
         def load_card(item):
             count, cost, name = item
-            # НОВОЕ: Используем быстрый кэшированный загрузчик
             img, element = download_card_image_fast(name)
             if not img:
                 img = download_card_image(name, prefix="bgo-")
@@ -829,7 +824,6 @@ def handle_message(vk_session, message_obj):
                 element = get_card_element(name)
             return cost, name, count, img, element
 
-        # НОВОЕ: Больше параллельных потоков для ускорения
         with ThreadPoolExecutor(max_workers=20) as executor:
             card_data = list(executor.map(load_card, cards))
         card_data.sort(key=lambda x: x[0])
@@ -841,7 +835,7 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    # --- !бго / !бк (УСКОРЕННЫЙ) ---
+    # --- !бго / !бк ---
     chosen_command = None
     for command in ["!бго", "!бк"]:
         if text_lower.startswith(command + " "):
@@ -865,7 +859,6 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    # НОВОЕ: Быстрая загрузка через кэш
     photo_content, _ = download_card_image_fast(card_name_ru)
     full_filename = "api"
     if not photo_content:
