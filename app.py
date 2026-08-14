@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # CardHero Connect — VK бот для карточной игры «Берсерк»
-# Возможности: поиск карт, визуализация колод, конкурс «Угадай карту» (по белому списку чатов)
+# Возможности: поиск карт, визуализация колод, конкурс «Угадай карту» (ротация 3 типов подсказок)
+# Рейтинг чата сбрасывается 1-го числа каждого месяца автоматически.
 
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -15,7 +16,7 @@ import json
 import random
 import traceback
 import datetime
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
@@ -35,7 +36,10 @@ ELEMENT_CACHE_FILE   = "element_cache.json"
 SCORES_FILE          = "chat_scores.json"
 CONTEST_FILE         = "contest_state.json"
 CONTEST_CHATS_FILE   = "contest_chats.json"
+CLUE_INDEX_FILE      = "clue_index.json"
 MOSCOW_OFFSET = datetime.timedelta(hours=3)
+
+CLUE_TYPES = ["blur", "text", "fragment"]  # порядок ротации подсказок
 
 def rnd_id():
     return random.randint(0, 2**31)
@@ -91,6 +95,7 @@ ELEMENT_CACHE  = load_json(ELEMENT_CACHE_FILE, {})
 CHAT_SCORES    = load_json(SCORES_FILE, {})
 CONTEST_STATE  = load_json(CONTEST_FILE, {})
 CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
+CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
 print(f"[CACHE] Стихий: {len(ELEMENT_CACHE)}, Чатов в конкурсе: {len(CONTEST_CHATS)}", flush=True)
 
 # ==================== ИНДЕКС САЙТА ====================
@@ -191,9 +196,6 @@ def download_card_image_fast(card_name_ru):
     except Exception as e:
         print(f"[IMG DOWNLOAD ERROR] {card_name_ru}: {e}", flush=True)
     return None, element_key
-
-def resolve_card_via_api(card_name_ru):
-    return download_card_image_fast(card_name_ru)
 
 # ==================== СТИХИЯ КАРТЫ ====================
 
@@ -431,7 +433,7 @@ def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
             time.sleep(2 + attempt * 2)
     raise RuntimeError(f"Upload failed: {last_error}")
 
-# ==================== КОНКУРС «УГАДАЙ КАРТУ» ====================
+# ==================== КОНКУРС «УГАДАЙ КАРТУ» (РОТАЦИЯ ПОДСКАЗОК) ====================
 
 def get_random_card():
     try:
@@ -454,27 +456,44 @@ def get_random_card():
         print(f"[RANDOM CARD ERROR] {e}", flush=True)
     return None
 
-def make_art_crop(img_bytes):
+# --- Вариант 1: сильно размытый фрагмент арта ---
+def make_blur_crop(img_bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         zw, zh = int(img.width * 2.5), int(img.height * 2.5)
         img = img.resize((zw, zh), Image.Resampling.BILINEAR)
-        crop_size = 200
-        max_left = max(0, zw - crop_size)
-        max_top  = max(0, int(zh * 0.60) - crop_size)
-        left = random.randint(0, max_left)
-        top  = random.randint(0, max_top)
+        img = img.filter(ImageFilter.GaussianBlur(radius=18))
+        crop_size = 400
+        left = random.randint(0, max(0, zw - crop_size))
+        top  = random.randint(0, max(0, int(zh * 0.60) - crop_size))
         cropped = img.crop((left, top, left + crop_size, top + crop_size))
-        cropped = cropped.resize((400, 400), Image.Resampling.BILINEAR)
         output = io.BytesIO()
-        cropped.save(output, format="JPEG", quality=90)
+        cropped.save(output, format="JPEG", quality=85)
         return output.getvalue()
     except Exception as e:
-        print(f"[ART CROP ERROR] {e}", flush=True)
+        print(f"[BLUR CROP ERROR] {e}", flush=True)
+        return None
+
+# --- Вариант 3: мелкий ч/б фрагмент 80×80 ---
+def make_fragment_crop(img_bytes):
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("L")
+        zw, zh = int(img.width * 2.5), int(img.height * 2.5)
+        img = img.resize((zw, zh), Image.Resampling.BILINEAR)
+        frag_size = 80
+        left = random.randint(0, max(0, zw - frag_size))
+        top  = random.randint(0, max(0, int(zh * 0.60) - frag_size))
+        cropped = img.crop((left, top, left + frag_size, top + frag_size))
+        cropped = cropped.resize((400, 400), Image.Resampling.NEAREST)
+        output = io.BytesIO()
+        cropped.save(output, format="JPEG", quality=80)
+        return output.getvalue()
+    except Exception as e:
+        print(f"[FRAGMENT CROP ERROR] {e}", flush=True)
         return None
 
 def start_contest(vk_session):
-    global CONTEST_STATE
+    global CONTEST_STATE, CLUE_INDEX
     if not CONTEST_CHATS:
         print("[CONTEST] Белый список пуст — конкурс не запущен", flush=True)
         return
@@ -508,7 +527,14 @@ def start_contest(vk_session):
             pass
     content_html = card.get('content', {}).get('rendered', '')
     card_text = re.sub(r'<[^>]+>', '', content_html).strip()
-    clue_type = 'art' if img_bytes else 'text'
+
+    # Ротация типов подсказок
+    idx = CLUE_INDEX.get('index', 0) % len(CLUE_TYPES)
+    clue_type = CLUE_TYPES[idx]
+    CLUE_INDEX['index'] = (idx + 1) % len(CLUE_TYPES)
+    save_json(CLUE_INDEX_FILE, CLUE_INDEX)
+    print(f"[CONTEST] Тип подсказки сегодня: {clue_type} (карта: «{card_name}»)", flush=True)
+
     new_state = {}
     for chat_id in CONTEST_CHATS:
         new_state[str(chat_id)] = {
@@ -518,7 +544,7 @@ def start_contest(vk_session):
         }
     CONTEST_STATE = new_state
     save_json(CONTEST_FILE, CONTEST_STATE)
-    print(f"[CONTEST] Запущен в {len(CONTEST_CHATS)} чат(ах)! Карта: «{card_name}», подсказка: {clue_type}", flush=True)
+
     for chat_id in CONTEST_CHATS:
         try:
             send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text)
@@ -526,16 +552,41 @@ def start_contest(vk_session):
             print(f"[CONTEST SEND ERROR] chat={chat_id}: {e}", flush=True)
 
 def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
-    if clue_type == 'art' and img_bytes:
-        crop = make_art_crop(img_bytes)
+    # Вариант 2: только текст — без картинки
+    if clue_type == "text":
+        clue = card_text if card_text else "Карта из вселенной Берсерк"
+        vk_session.method('messages.send', {
+            'peer_id': chat_id,
+            'message': f"🎯 Угадай карту по описанию!\n\n«{clue}»\n\nПервый правильный ответ — +10 баллов. Ответ будет раскрыт в 23:55.",
+            'random_id': rnd_id()
+        })
+        return
+
+    # Вариант 1: размытый арт
+    if clue_type == "blur" and img_bytes:
+        crop = make_blur_crop(img_bytes)
         if crop:
             attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
             vk_session.method('messages.send', {
                 'peer_id': chat_id,
-                'message': "🎯 Угадай карту!\n\nЧто это за карта? Первый правильный ответ — +10 баллов.\nОтвет будет раскрыт в 23:55, если никто не угадает.",
+                'message': "🎯 Угадай карту!\n\nНа картинке — сильно размытый фрагмент арта. Что это за карта? Первый правильный ответ — +10 баллов.",
                 'attachment': attachment, 'random_id': rnd_id()
             })
             return
+
+    # Вариант 3: мелкий ч/б фрагмент
+    if clue_type == "fragment" and img_bytes:
+        crop = make_fragment_crop(img_bytes)
+        if crop:
+            attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
+            vk_session.method('messages.send', {
+                'peer_id': chat_id,
+                'message': "🎯 Угадай карту!\n\nНа картинке — мелкий чёрно-белый фрагмент арта. Что это за карта? Первый правильный ответ — +10 баллов.",
+                'attachment': attachment, 'random_id': rnd_id()
+            })
+            return
+
+    # Fallback, если картинки нет — текстовая подсказка
     clue = card_text if card_text else "Карта из вселенной Берсерк"
     vk_session.method('messages.send', {
         'peer_id': chat_id,
@@ -631,20 +682,36 @@ def show_contest_chats(vk_session, peer_id):
         msg = "\n".join(lines)
     vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
 
-# ==================== РЕЙТИНГ ЧАТА (С РЕАЛЬНЫМИ ИМЕНАМИ) ====================
+# ==================== РЕЙТИНГ ЧАТА (С АВТОСБРОСОМ 1-ГО ЧИСЛА) ====================
+
+def reset_chat_scores(chat_id_str):
+    """Полный сброс рейтинга чата — все баллы в 0, имена сохраняются."""
+    if chat_id_str in CHAT_SCORES:
+        for uid in list(CHAT_SCORES[chat_id_str].keys()):
+            if uid != '_reset_month':
+                if isinstance(CHAT_SCORES[chat_id_str][uid], dict):
+                    CHAT_SCORES[chat_id_str][uid]['score'] = 0
+        CHAT_SCORES[chat_id_str]['_reset_month'] = moscow_now().strftime('%Y-%m')
+        save_json(SCORES_FILE, CHAT_SCORES)
+        print(f"[SCORES] Рейтинг чата {chat_id_str} сброшен (1-е число)", flush=True)
+
+def reset_all_scores():
+    """Сброс рейтинга во всех чатах — вызывается 1-го числа месяца."""
+    if not CHAT_SCORES:
+        return
+    current_month = moscow_now().strftime('%Y-%m')
+    for chat_id_str in list(CHAT_SCORES.keys()):
+        reset_chat_scores(chat_id_str)
+    print(f"[SCORES] Полный сброс всех рейтингов ({current_month})", flush=True)
 
 def check_monthly_reset(chat_id_str):
+    """Проверяет, наступило ли новое число месяца — если да, сбрасывает рейтинг."""
     current_month = moscow_now().strftime('%Y-%m')
     if chat_id_str not in CHAT_SCORES:
         CHAT_SCORES[chat_id_str] = {'_reset_month': current_month}
         return
     if CHAT_SCORES[chat_id_str].get('_reset_month') != current_month:
-        for key in list(CHAT_SCORES[chat_id_str].keys()):
-            if key != '_reset_month':
-                CHAT_SCORES[chat_id_str][key]['score'] = 0
-        CHAT_SCORES[chat_id_str]['_reset_month'] = current_month
-        save_json(SCORES_FILE, CHAT_SCORES)
-        print(f"[SCORES] Рейтинг чата {chat_id_str} обнулён ({current_month})", flush=True)
+        reset_chat_scores(chat_id_str)
 
 def add_score(chat_id, user_id, user_name, points):
     chat_id_str = str(chat_id)
@@ -663,7 +730,6 @@ def fetch_users_names(vk_session, user_ids):
     names = {}
     try:
         result = vk_session.method('users.get', {'user_ids': ','.join(str(uid) for uid in user_ids)})
-        # vk_api может вернуть как список, так и {'response': [...]}
         users = result if isinstance(result, list) else result.get('response', [])
         for u in users:
             uid = str(u.get('id', ''))
@@ -694,7 +760,6 @@ def show_top(vk_session, peer_id):
     """Выводит рейтинг аккуратным списком до 10 игроков с реальными именами."""
     chat_id_str = str(peer_id)
     check_monthly_reset(chat_id_str)
-    # Всегда обновляем реальные имена перед показом
     refresh_chat_names(vk_session, chat_id_str)
     scores = CHAT_SCORES.get(chat_id_str, {})
     entries = [(uid, data) for uid, data in scores.items() if uid != '_reset_month' and isinstance(data, dict)]
@@ -715,11 +780,13 @@ def show_top(vk_session, peer_id):
         score = data.get('score', 0)
         lines.append(f"{medal} {name} — {score} баллов")
     lines.append(f"\nВсего игроков: {len(entries)}")
+    lines.append(f"\n📅 Сброс рейтинга — 1-го числа каждого месяца")
     vk_session.method('messages.send', {'peer_id': peer_id, 'message': "\n".join(lines), 'random_id': rnd_id()})
 
-# ==================== ПЛАНИРОВЩИК КОНКУРСА ====================
+# ==================== ПЛАНИРОВЩИКИ ====================
 
 def contest_scheduler(vk_session):
+    """Ежедневно: 20:00 — старт конкурса, 23:55 — раскрытие ответа."""
     last_start = None
     last_end   = None
     while True:
@@ -735,6 +802,22 @@ def contest_scheduler(vk_session):
         except Exception as e:
             print(f"[SCHEDULER ERROR] {e}", flush=True)
         time.sleep(20)
+
+def monthly_reset_scheduler():
+    """Проверяет каждый час, не наступило ли 1-е число месяца — если да, сбрасывает все рейтинги."""
+    last_reset_month = moscow_now().strftime('%Y-%m')
+    while True:
+        try:
+            now = moscow_now()
+            current_month = now.strftime('%Y-%m')
+            # 1-е число любого месяца, с 00:00 до 01:00
+            if now.day == 1 and current_month != last_reset_month:
+                print(f"[MONTHLY RESET] 1-е число месяца — сброс всех рейтингов...", flush=True)
+                reset_all_scores()
+                last_reset_month = current_month
+        except Exception as e:
+            print(f"[MONTHLY RESET ERROR] {e}", flush=True)
+        time.sleep(1800)  # проверка каждые 30 минут
 
 # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
 
@@ -925,7 +1008,8 @@ def run_vk_bot():
     update_site_files_index()
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
-    print(f"Планировщик конкурса запущен. Чатов в конкурсе: {len(CONTEST_CHATS)}", flush=True)
+    threading.Thread(target=monthly_reset_scheduler, daemon=True).start()
+    print(f"Планировщики запущены: конкурс ({len(CONTEST_CHATS)} чатов) + ежемесячный сброс рейтинга", flush=True)
     if not OWNER_ID:
         print("⚠️ OWNER_ID не задан — управление конкурсом недоступно!", flush=True)
 
