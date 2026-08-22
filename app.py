@@ -39,7 +39,7 @@ CONTEST_CHATS_FILE   = "contest_chats.json"
 CLUE_INDEX_FILE      = "clue_index.json"
 MOSCOW_OFFSET = datetime.timedelta(hours=3)
 
-CLUE_TYPES = ["blur", "text", "fragment"]  # порядок ротации подсказок
+CLUE_TYPES = ["blur", "text", "fragment"]
 
 def rnd_id():
     return random.randint(0, 2**31)
@@ -124,17 +124,50 @@ def to_lat(text):
     cleaned = text.replace(" ", "-").replace("_", "-")
     return "".join(RULES.get(c, c) for c in cleaned)
 
-# ==================== API-ПОИСК КАРТЫ (УСКОРЕННЫЙ) ====================
+# ==================== API-ПОИСК КАРТЫ ====================
 
 def resolve_card_meta(card_name_ru):
     key = card_name_ru.strip().lower()
     with CACHE_LOCK:
         if key in CARD_META_CACHE:
             return CARD_META_CACHE[key]
+
+    def _extract_card(card):
+        element_key = 'nejtraly'
+        for cls in card.get('class_list', []):
+            m = re.match(r'mmf_element-(\w+)', cls)
+            if m:
+                element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
+                break
+        slug = card.get('slug', to_lat(key))
+        media_id = card.get('featured_media')
+        return (slug, media_id, element_key)
+
+    # 1. Поиск по slug — точное совпадение (надёжнее для новых карт)
+    slug_candidate = to_lat(key)
     try:
         res = requests.get(
             "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-            params={'search': card_name_ru, '_fields': 'id,featured_media,title,class_list,slug'},
+            params={'slug': slug_candidate, '_fields': 'id,featured_media,title,class_list,slug'},
+            headers=BROWSER_HEADERS, timeout=7
+        )
+        if res.status_code == 200 and res.text.strip():
+            data = res.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                result = _extract_card(data[0])
+                with CACHE_LOCK:
+                    CARD_META_CACHE[key] = result
+                ELEMENT_CACHE[result[0]] = result[2]
+                save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
+                return result
+    except Exception as e:
+        print(f"[META SLUG ERROR] {card_name_ru}: {e}", flush=True)
+
+    # 2. Полнотекстовый поиск с увеличенным лимитом
+    try:
+        res = requests.get(
+            "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
+            params={'search': card_name_ru, 'per_page': 50, '_fields': 'id,featured_media,title,class_list,slug'},
             headers=BROWSER_HEADERS, timeout=7
         )
         if res.status_code != 200 or not res.text.strip():
@@ -150,18 +183,10 @@ def resolve_card_meta(card_name_ru):
                 break
         if not card:
             card = data[0]
-        element_key = 'nejtraly'
-        for cls in card.get('class_list', []):
-            m = re.match(r'mmf_element-(\w+)', cls)
-            if m:
-                element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
-                break
-        slug = card.get('slug', to_lat(key))
-        media_id = card.get('featured_media')
-        result = (slug, media_id, element_key)
+        result = _extract_card(card)
         with CACHE_LOCK:
             CARD_META_CACHE[key] = result
-        ELEMENT_CACHE[slug] = element_key
+        ELEMENT_CACHE[result[0]] = result[2]
         save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
         return result
     except Exception as e:
@@ -433,7 +458,7 @@ def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
             time.sleep(2 + attempt * 2)
     raise RuntimeError(f"Upload failed: {last_error}")
 
-# ==================== КОНКУРС «УГАДАЙ КАРТУ» (РОТАЦИЯ ПОДСКАЗОК) ====================
+# ==================== КОНКУРС «УГАДАЙ КАРТУ» ====================
 
 def get_random_card():
     try:
@@ -456,7 +481,6 @@ def get_random_card():
         print(f"[RANDOM CARD ERROR] {e}", flush=True)
     return None
 
-# --- Вариант 1: сильно размытый фрагмент арта ---
 def make_blur_crop(img_bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -474,7 +498,6 @@ def make_blur_crop(img_bytes):
         print(f"[BLUR CROP ERROR] {e}", flush=True)
         return None
 
-# --- Вариант 3: мелкий ч/б фрагмент 80×80 ---
 def make_fragment_crop(img_bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("L")
@@ -528,7 +551,6 @@ def start_contest(vk_session):
     content_html = card.get('content', {}).get('rendered', '')
     card_text = re.sub(r'<[^>]+>', '', content_html).strip()
 
-    # Ротация типов подсказок
     idx = CLUE_INDEX.get('index', 0) % len(CLUE_TYPES)
     clue_type = CLUE_TYPES[idx]
     CLUE_INDEX['index'] = (idx + 1) % len(CLUE_TYPES)
@@ -552,7 +574,6 @@ def start_contest(vk_session):
             print(f"[CONTEST SEND ERROR] chat={chat_id}: {e}", flush=True)
 
 def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
-    # Вариант 2: только текст — без картинки
     if clue_type == "text":
         clue = card_text if card_text else "Карта из вселенной Берсерк"
         vk_session.method('messages.send', {
@@ -562,7 +583,6 @@ def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
         })
         return
 
-    # Вариант 1: размытый арт
     if clue_type == "blur" and img_bytes:
         crop = make_blur_crop(img_bytes)
         if crop:
@@ -574,7 +594,6 @@ def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
             })
             return
 
-    # Вариант 3: мелкий ч/б фрагмент
     if clue_type == "fragment" and img_bytes:
         crop = make_fragment_crop(img_bytes)
         if crop:
@@ -586,7 +605,6 @@ def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
             })
             return
 
-    # Fallback, если картинки нет — текстовая подсказка
     clue = card_text if card_text else "Карта из вселенной Берсерк"
     vk_session.method('messages.send', {
         'peer_id': chat_id,
@@ -685,7 +703,6 @@ def show_contest_chats(vk_session, peer_id):
 # ==================== РЕЙТИНГ ЧАТА (С АВТОСБРОСОМ 1-ГО ЧИСЛА) ====================
 
 def reset_chat_scores(chat_id_str):
-    """Полный сброс рейтинга чата — все баллы в 0, имена сохраняются."""
     if chat_id_str in CHAT_SCORES:
         for uid in list(CHAT_SCORES[chat_id_str].keys()):
             if uid != '_reset_month':
@@ -696,7 +713,6 @@ def reset_chat_scores(chat_id_str):
         print(f"[SCORES] Рейтинг чата {chat_id_str} сброшен (1-е число)", flush=True)
 
 def reset_all_scores():
-    """Сброс рейтинга во всех чатах — вызывается 1-го числа месяца."""
     if not CHAT_SCORES:
         return
     current_month = moscow_now().strftime('%Y-%m')
@@ -705,7 +721,6 @@ def reset_all_scores():
     print(f"[SCORES] Полный сброс всех рейтингов ({current_month})", flush=True)
 
 def check_monthly_reset(chat_id_str):
-    """Проверяет, наступило ли новое число месяца — если да, сбрасывает рейтинг."""
     current_month = moscow_now().strftime('%Y-%m')
     if chat_id_str not in CHAT_SCORES:
         CHAT_SCORES[chat_id_str] = {'_reset_month': current_month}
@@ -724,7 +739,6 @@ def add_score(chat_id, user_id, user_name, points):
     save_json(SCORES_FILE, CHAT_SCORES)
 
 def fetch_users_names(vk_session, user_ids):
-    """Массово запрашивает реальные имена пользователей через users.get."""
     if not user_ids:
         return {}
     names = {}
@@ -741,7 +755,6 @@ def fetch_users_names(vk_session, user_ids):
     return names
 
 def refresh_chat_names(vk_session, chat_id_str):
-    """Обновляет реальные имена всех игроков в таблице рейтинга чата."""
     chat_data = CHAT_SCORES.get(chat_id_str, {})
     user_ids = [uid for uid in chat_data.keys() if uid != '_reset_month' and uid.isdigit()]
     if not user_ids:
@@ -757,7 +770,6 @@ def refresh_chat_names(vk_session, chat_id_str):
         save_json(SCORES_FILE, CHAT_SCORES)
 
 def show_top(vk_session, peer_id):
-    """Выводит рейтинг аккуратным списком до 10 игроков с реальными именами."""
     chat_id_str = str(peer_id)
     check_monthly_reset(chat_id_str)
     refresh_chat_names(vk_session, chat_id_str)
@@ -786,7 +798,6 @@ def show_top(vk_session, peer_id):
 # ==================== ПЛАНИРОВЩИКИ ====================
 
 def contest_scheduler(vk_session):
-    """Ежедневно: 20:00 — старт конкурса, 23:55 — раскрытие ответа."""
     last_start = None
     last_end   = None
     while True:
@@ -804,20 +815,18 @@ def contest_scheduler(vk_session):
         time.sleep(20)
 
 def monthly_reset_scheduler():
-    """Проверяет каждый час, не наступило ли 1-е число месяца — если да, сбрасывает все рейтинги."""
     last_reset_month = moscow_now().strftime('%Y-%m')
     while True:
         try:
             now = moscow_now()
             current_month = now.strftime('%Y-%m')
-            # 1-е число любого месяца, с 00:00 до 01:00
             if now.day == 1 and current_month != last_reset_month:
                 print(f"[MONTHLY RESET] 1-е число месяца — сброс всех рейтингов...", flush=True)
                 reset_all_scores()
                 last_reset_month = current_month
         except Exception as e:
             print(f"[MONTHLY RESET ERROR] {e}", flush=True)
-        time.sleep(1800)  # проверка каждые 30 минут
+        time.sleep(1800)
 
 # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
 
@@ -839,7 +848,6 @@ def handle_message(vk_session, message_obj):
     text_clean = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
     text_lower = text_clean.lower()
 
-    # --- Команды управления конкурсом (только владелец) ---
     if text_lower in ("!конкурс +", "!конкурс+", "!конкурс добавить"):
         if is_owner(user_id):
             added = add_contest_chat(peer_id)
@@ -868,19 +876,16 @@ def handle_message(vk_session, message_obj):
             })
         return
 
-    # --- Рейтинг и конкурс (только для чатов из белого списка) ---
     in_contest = peer_id in CONTEST_CHATS
     if in_contest and user_id and user_id > 0:
         user_name = get_user_name(vk_session, user_id)
         add_score(peer_id, user_id, user_name, 1)
         check_contest_answer(vk_session, peer_id, user_id, user_name, raw_text)
 
-    # --- !топ ---
     if text_lower in ("!топ", "!top"):
         show_top(vk_session, peer_id)
         return
 
-    # --- !deck ---
     if text_lower.startswith("!deck"):
         deck_text = text_clean[5:].strip()
         if not deck_text:
@@ -918,7 +923,6 @@ def handle_message(vk_session, message_obj):
         })
         return
 
-    # --- !бго / !бк ---
     chosen_command = None
     for command in ["!бго", "!бк"]:
         if text_lower.startswith(command + " "):
