@@ -17,7 +17,7 @@ import random
 import traceback
 import datetime
 import sys
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
@@ -470,6 +470,46 @@ def parse_deck_text(text):
 
 # ==================== ОТПРАВКА КАРТИНОК В ВК ====================
 
+def trim_card_margins(img):
+    """Обрезает прозрачные и почти белые поля по краям карты."""
+    img = img.convert("RGBA")
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+
+    # Белые/почти белые поля: сравниваем с белым фоном и берём bbox отличий
+    alpha = img.split()[-1]
+    solid = Image.new("RGB", img.size, (255, 255, 255))
+    solid.paste(img, mask=alpha)
+    diff = ImageChops.difference(solid, Image.new("RGB", img.size, (255, 255, 255)))
+    mask = diff.convert("L").point(lambda p: 255 if p > 12 else 0)
+    bbox = mask.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    return img
+
+def prepare_card_square_jpeg(photo_content, max_side=800):
+    """Кадрирует пустые поля и отдаёт карту без полей: от края до края холста."""
+    img = Image.open(io.BytesIO(photo_content))
+    img = trim_card_margins(img)
+    if img.width < 2 or img.height < 2:
+        raise ValueError("Карта пустая после обрезки полей")
+
+    # Масштаб по большей стороне; холст = размер карты (без белых полей)
+    scale = max_side / max(img.width, img.height)
+    new_w = max(1, int(round(img.width * scale)))
+    new_h = max(1, int(round(img.height * scale)))
+    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    canvas = Image.new("RGB", (new_w, new_h), (255, 255, 255))
+    if img.mode == "RGBA":
+        canvas.paste(img, (0, 0), img)
+    else:
+        canvas.paste(img.convert("RGB"), (0, 0))
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=90)
+    return output.getvalue()
+
 def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
     last_error = None
     for attempt in range(5):
@@ -665,7 +705,8 @@ def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
         try:
             img, _ = download_card_image_fast(state['card_name'])
             if img:
-                attachment = upload_and_get_attachment(vk_session, img, 'card.jpg', peer_id)
+                card_jpeg = prepare_card_square_jpeg(img)
+                attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', peer_id)
                 vk_session.method('messages.send', {
                     'peer_id': peer_id, 'message': state['card_name'],
                     'attachment': attachment, 'random_id': rnd_id()
@@ -691,7 +732,8 @@ def end_contest_timeout(vk_session):
                 })
                 img, _ = download_card_image_fast(state['card_name'])
                 if img:
-                    attachment = upload_and_get_attachment(vk_session, img, 'card.jpg', chat_id)
+                    card_jpeg = prepare_card_square_jpeg(img)
+                    attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', chat_id)
                     vk_session.method('messages.send', {
                         'peer_id': chat_id, 'message': state['card_name'],
                         'attachment': attachment, 'random_id': rnd_id()
@@ -999,16 +1041,8 @@ def handle_message(vk_session, message_obj):
 
     if photo_content:
         try:
-            img = Image.open(io.BytesIO(photo_content)).convert("RGBA")
-            canvas_size = 800
-            white_bg = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
-            scale = canvas_size / img.height
-            card_width = int(img.width * scale)
-            img = img.resize((card_width, canvas_size), Image.Resampling.BILINEAR)
-            white_bg.paste(img, ((canvas_size - card_width) // 2, 0), img)
-            output = io.BytesIO()
-            white_bg.convert("RGB").save(output, format="JPEG", quality=90)
-            attachment = upload_and_get_attachment(vk_session, output.getvalue(), 'card.jpg', peer_id)
+            card_jpeg = prepare_card_square_jpeg(photo_content)
+            attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', peer_id)
             ATTACHMENT_CACHE[cache_key] = attachment
             vk_session.method('messages.send', {
                 'peer_id': peer_id, 'message': response_msg,
