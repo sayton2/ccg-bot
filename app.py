@@ -470,23 +470,37 @@ def parse_deck_text(text):
 
 # ==================== ОТПРАВКА КАРТИНОК В ВК ====================
 
-def trim_card_margins(img):
-    """Обрезает прозрачные и почти белые поля по краям карты."""
+def trim_card_margins(img, padding=18):
+    """Обрезает прозрачные/белые поля, оставляя отступ под родную рамку карты."""
     img = img.convert("RGBA")
-    bbox = img.getbbox()
-    if bbox:
-        img = img.crop(bbox)
+    w, h = img.size
 
-    # Белые/почти белые поля: сравниваем с белым фоном и берём bbox отличий
-    alpha = img.split()[-1]
-    solid = Image.new("RGB", img.size, (255, 255, 255))
-    solid.paste(img, mask=alpha)
-    diff = ImageChops.difference(solid, Image.new("RGB", img.size, (255, 255, 255)))
+    bbox = img.getbbox()
+    if not bbox:
+        return img
+
+    # Уточняем границы по почти белым полям (в координатах временного кропа)
+    cropped = img.crop(bbox)
+    alpha = cropped.split()[-1]
+    solid = Image.new("RGB", cropped.size, (255, 255, 255))
+    solid.paste(cropped, mask=alpha)
+    diff = ImageChops.difference(solid, Image.new("RGB", cropped.size, (255, 255, 255)))
     mask = diff.convert("L").point(lambda p: 255 if p > 12 else 0)
-    bbox = mask.getbbox()
-    if bbox:
-        img = img.crop(bbox)
-    return img
+    white_bbox = mask.getbbox()
+    if white_bbox:
+        bbox = (
+            bbox[0] + white_bbox[0],
+            bbox[1] + white_bbox[1],
+            bbox[0] + white_bbox[2],
+            bbox[1] + white_bbox[3],
+        )
+
+    # Расширяем bbox: возвращаем рамку и скругления, не упираясь в края
+    left = max(0, bbox[0] - padding)
+    top = max(0, bbox[1] - padding)
+    right = min(w, bbox[2] + padding)
+    bottom = min(h, bbox[3] + padding)
+    return img.crop((left, top, right, bottom))
 
 def prepare_card_square_jpeg(photo_content, max_side=800):
     """Кадрирует пустые поля и отдаёт карту без полей: от края до края холста."""
