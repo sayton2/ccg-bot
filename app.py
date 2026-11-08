@@ -17,7 +17,7 @@ import random
 import traceback
 import datetime
 import sys
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
@@ -470,32 +470,13 @@ def parse_deck_text(text):
 
 # ==================== ОТПРАВКА КАРТИНОК В ВК ====================
 
-def trim_card_margins(img, padding=18):
-    """Обрезает прозрачные/белые поля, оставляя отступ под родную рамку карты."""
+def trim_card_margins(img, padding=10):
+    """Убирает внешнюю пустоту через getbbox(), сохраняя рамку с отступом padding."""
     img = img.convert("RGBA")
     w, h = img.size
-
     bbox = img.getbbox()
     if not bbox:
         return img
-
-    # Уточняем границы по почти белым полям (в координатах временного кропа)
-    cropped = img.crop(bbox)
-    alpha = cropped.split()[-1]
-    solid = Image.new("RGB", cropped.size, (255, 255, 255))
-    solid.paste(cropped, mask=alpha)
-    diff = ImageChops.difference(solid, Image.new("RGB", cropped.size, (255, 255, 255)))
-    mask = diff.convert("L").point(lambda p: 255 if p > 12 else 0)
-    white_bbox = mask.getbbox()
-    if white_bbox:
-        bbox = (
-            bbox[0] + white_bbox[0],
-            bbox[1] + white_bbox[1],
-            bbox[0] + white_bbox[2],
-            bbox[1] + white_bbox[3],
-        )
-
-    # Расширяем bbox: возвращаем рамку и скругления, не упираясь в края
     left = max(0, bbox[0] - padding)
     top = max(0, bbox[1] - padding)
     right = min(w, bbox[2] + padding)
@@ -503,23 +484,41 @@ def trim_card_margins(img, padding=18):
     return img.crop((left, top, right, bottom))
 
 def prepare_card_square_jpeg(photo_content, max_side=800):
-    """Кадрирует пустые поля и отдаёт карту без полей: от края до края холста."""
+    """Белый квадрат со целой пропорциональной картой по центру (без растягивания)."""
     img = Image.open(io.BytesIO(photo_content))
-    img = trim_card_margins(img)
+    img = trim_card_margins(img, padding=10)
     if img.width < 2 or img.height < 2:
         raise ValueError("Карта пустая после обрезки полей")
 
-    # Масштаб по большей стороне; холст = размер карты (без белых полей)
-    scale = max_side / max(img.width, img.height)
-    new_w = max(1, int(round(img.width * scale)))
-    new_h = max(1, int(round(img.height * scale)))
+    card_w, card_h = img.size
+
+    # Квадратный холст: высота карты + поля, но не больше max_side
+    square_side = card_h + 40
+    if square_side > max_side:
+        square_side = max_side
+    elif square_side < 400:
+        square_side = min(max_side, max(400, square_side))
+
+    # Пропорциональный масштаб под высоту квадрата (без искажений)
+    scale = square_side / card_h
+    new_w = max(1, int(round(card_w * scale)))
+    new_h = square_side
+    # Если после масштаба карта шире квадрата — чуть уменьшаем, чтобы влезла целиком
+    if new_w > square_side:
+        scale = square_side / card_w
+        new_w = square_side
+        new_h = max(1, int(round(card_h * scale)))
+
     img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
-    canvas = Image.new("RGB", (new_w, new_h), (255, 255, 255))
+    canvas = Image.new("RGB", (square_side, square_side), (255, 255, 255))
+    paste_x = (square_side - new_w) // 2
+    paste_y = (square_side - new_h) // 2
     if img.mode == "RGBA":
-        canvas.paste(img, (0, 0), img)
+        canvas.paste(img, (paste_x, paste_y), img)
     else:
-        canvas.paste(img.convert("RGB"), (0, 0))
+        canvas.paste(img.convert("RGB"), (paste_x, paste_y))
+
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=90)
     return output.getvalue()
