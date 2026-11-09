@@ -6,6 +6,8 @@
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 import requests
+from requests.exceptions import ReadTimeout as RequestsReadTimeout
+from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 import threading
 from flask import Flask
 import os
@@ -24,8 +26,10 @@ import difflib
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def healthcheck(path):
+    """Отвечает 200 OK на любые веб-пинги Render / health-check."""
     return "CardHero Connect — бот активен", 200
 
 # ==================== НАСТРОЙКИ ====================
@@ -34,17 +38,17 @@ GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
 ELEMENT_CACHE_FILE   = "element_cache.json"
-SCORES_FILE          = "chat_scores.json"
-CONTEST_FILE         = "contest_state.json"
+CONTESTS_FILE        = "contests.json"          # state + scores (переживает рестарт процесса)
+SCORES_FILE          = "chat_scores.json"       # legacy (миграция)
+CONTEST_FILE         = "contest_state.json"     # legacy (миграция)
 CONTEST_CHATS_FILE   = "contest_chats.json"
 CLUE_INDEX_FILE      = "clue_index.json"
 MOSCOW_OFFSET = datetime.timedelta(hours=3)
 
 CLUE_TYPES = ["blur", "text", "fragment"]
 
-# FIX: Watchdog — если long poll завис, heartbeat перестанет обновляться,
-# и процесс принудительно перезапустится (Render поднимет новый контейнер).
-HEARTBEAT_TIMEOUT = 120  # секунд без heartbeat = рестарт
+# Watchdog: мягкий контроль зависания long poll (без убийства на обычных ReadTimeout)
+HEARTBEAT_TIMEOUT = 300  # секунд без heartbeat = рестарт
 _last_heartbeat = time.time()
 _heartbeat_lock = threading.Lock()
 
@@ -58,14 +62,13 @@ def get_heartbeat_age():
         return time.time() - _last_heartbeat
 
 def watchdog_loop():
-    """Фоновый поток: если long poll завис (heartbeat не обновлялся > timeout), убиваем процесс."""
+    """Фоновый поток: если long poll реально завис (нет heartbeat), перезапуск процесса."""
     while True:
         time.sleep(15)
         age = get_heartbeat_age()
         if age > HEARTBEAT_TIMEOUT:
             print(f"[WATCHDOG] Long poll завис (heartbeat {age:.0f}с) — принудительный рестарт процесса", flush=True)
-            os._exit(1)  # жёсткий выход; Render перезапустит контейнер
-
+            os._exit(1)
 def rnd_id():
     return random.randint(0, 2**31)
 
@@ -112,15 +115,38 @@ def load_json(filename, default):
 def save_json(filename, data):
     try:
         with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[SAVE ERROR] {filename}: {e}", flush=True)
 
+def load_contests():
+    """Загружает состояние конкурсов и баллы из contests.json (с миграцией со старых файлов)."""
+    data = load_json(CONTESTS_FILE, None)
+    if isinstance(data, dict) and ('state' in data or 'scores' in data):
+        return {
+            'state': data.get('state') or {},
+            'scores': data.get('scores') or {},
+        }
+    # Миграция со старых отдельных файлов
+    return {
+        'state': load_json(CONTEST_FILE, {}),
+        'scores': load_json(SCORES_FILE, {}),
+    }
+
+def save_contests():
+    """Сохраняет конкурсы и баллы в contests.json — переживает рестарт процесса."""
+    save_json(CONTESTS_FILE, {
+        'state': CONTEST_STATE,
+        'scores': CHAT_SCORES,
+    })
+
 ELEMENT_CACHE  = load_json(ELEMENT_CACHE_FILE, {})
-CHAT_SCORES    = load_json(SCORES_FILE, {})
-CONTEST_STATE  = load_json(CONTEST_FILE, {})
+_contests_data = load_contests()
+CHAT_SCORES    = _contests_data['scores']
+CONTEST_STATE  = _contests_data['state']
 CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
 CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
+save_contests()  # сразу зафиксировать актуальный снимок / миграцию
 
 # FIX: Белый список из env-переменной — переживает рестарт Render (эфемерный диск).
 # Формат: CONTEST_CHATS=2000000001,2000000002 (через запятую).
@@ -652,7 +678,7 @@ def start_contest(vk_session):
             'clue_type': clue_type
         }
     CONTEST_STATE = new_state
-    save_json(CONTEST_FILE, CONTEST_STATE)
+    save_contests()
 
     for chat_id in CONTEST_CHATS:
         try:
@@ -708,7 +734,7 @@ def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
         return False
     if normalize_text(text) == normalize_text(state['card_name']):
         state['guessed'] = True
-        save_json(CONTEST_FILE, CONTEST_STATE)
+        save_contests()
         add_score(peer_id, user_id, user_name, 10)
         vk_session.method('messages.send', {
             'peer_id': peer_id,
@@ -754,7 +780,7 @@ def end_contest_timeout(vk_session):
             except Exception as e:
                 print(f"[CONTEST TIMEOUT ERROR] chat={chat_id}: {e}", flush=True)
     if changed:
-        save_json(CONTEST_FILE, CONTEST_STATE)
+        save_contests()
         print("[CONTEST] Тайм-аут: ответы раскрыты", flush=True)
 
 # ==================== УПРАВЛЕНИЕ БЕЛЫМ СПИСКОМ ЧАТОВ ====================
@@ -774,7 +800,7 @@ def remove_contest_chat(peer_id):
         CONTEST_CHATS.remove(peer_id)
         save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
         CONTEST_STATE.pop(str(peer_id), None)
-        save_json(CONTEST_FILE, CONTEST_STATE)
+        save_contests()
         return True
     return False
 
@@ -798,7 +824,7 @@ def reset_chat_scores(chat_id_str):
                 if isinstance(CHAT_SCORES[chat_id_str][uid], dict):
                     CHAT_SCORES[chat_id_str][uid]['score'] = 0
         CHAT_SCORES[chat_id_str]['_reset_month'] = moscow_now().strftime('%Y-%m')
-        save_json(SCORES_FILE, CHAT_SCORES)
+        save_contests()
         print(f"[SCORES] Рейтинг чата {chat_id_str} сброшен (1-е число)", flush=True)
 
 def reset_all_scores():
@@ -825,7 +851,7 @@ def add_score(chat_id, user_id, user_name, points):
         CHAT_SCORES[chat_id_str][user_id_str] = {'name': user_name, 'score': 0}
     CHAT_SCORES[chat_id_str][user_id_str]['name'] = user_name
     CHAT_SCORES[chat_id_str][user_id_str]['score'] += points
-    save_json(SCORES_FILE, CHAT_SCORES)
+    save_contests()
 
 def fetch_users_names(vk_session, user_ids):
     if not user_ids:
@@ -856,7 +882,7 @@ def refresh_chat_names(vk_session, chat_id_str):
             chat_data[uid]['name'] = new_name
             updated = True
     if updated:
-        save_json(SCORES_FILE, CHAT_SCORES)
+        save_contests()
 
 def show_top(vk_session, peer_id):
     chat_id_str = str(peer_id)
@@ -1089,14 +1115,24 @@ def _safe_handle(vk_session, message_obj):
 
 # ==================== ОСНОВНОЙ БОТ ====================
 
+def run_flask_server():
+    """Фоновый Flask: отвечает на пинги Render, чтобы процесс не убивали за «тишину»."""
+    port = int(os.environ.get('PORT', 5000))
+    print(f"[FLASK] Health-check на 0.0.0.0:{port}", flush=True)
+    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 def run_vk_bot():
     update_site_files_index()
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
     threading.Thread(target=monthly_reset_scheduler, daemon=True).start()
-    # FIX: Запускаем watchdog — убивает процесс при зависании long poll
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    print(f"Планировщики запущены: конкурс ({len(CONTEST_CHATS)} чатов) + ежемесячный сброс рейтинга + watchdog", flush=True)
+    print(
+        f"Планировщики запущены: конкурс ({len(CONTEST_CHATS)} чатов) + "
+        f"ежемесячный сброс рейтинга + watchdog; contests.json загружен "
+        f"(state={len(CONTEST_STATE)}, scores={len(CHAT_SCORES)})",
+        flush=True,
+    )
     if not OWNER_ID:
         print("⚠️ OWNER_ID не задан — управление конкурсом недоступно!", flush=True)
 
@@ -1104,29 +1140,43 @@ def run_vk_bot():
         try:
             bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
             print("Бот успешно запущен и слушает ВК...", flush=True)
-            update_heartbeat()  # FIX: начальный heartbeat
+            update_heartbeat()
             while True:
                 try:
                     events = bot_longpoll.check()
-                    update_heartbeat()  # FIX: обновляем heartbeat после каждой успешной итерации
+                    update_heartbeat()
                     for event in events:
                         if event.type == VkBotEventType.MESSAGE_NEW:
-                            threading.Thread(target=_safe_handle, args=(vk_session, event.obj.message), daemon=True).start()
+                            threading.Thread(
+                                target=_safe_handle,
+                                args=(vk_session, event.obj.message),
+                                daemon=True,
+                            ).start()
+                except (RequestsReadTimeout, Urllib3ReadTimeoutError, requests.exceptions.Timeout) as e:
+                    # Таймаут long poll — НЕ падаем, просто продолжаем цикл
+                    print(f"[LONGPOLL TIMEOUT] {type(e).__name__}: {e} — переподключение через 3 сек", flush=True)
+                    update_heartbeat()
+                    time.sleep(3)
+                    continue
                 except Exception as e:
                     print(f"[LOOP ERROR] {e} — reconnect через 3 сек", flush=True)
                     traceback.print_exc()
-                    update_heartbeat()  # FIX: даже при ошибке цикл жив — обновляем heartbeat
+                    update_heartbeat()
                     time.sleep(3)
+                    break  # пересоздаём VkBotLongPoll
+        except (RequestsReadTimeout, Urllib3ReadTimeoutError, requests.exceptions.Timeout) as e:
+            print(f"[BOT TIMEOUT] {type(e).__name__}: {e} — переподключение через 3 сек", flush=True)
+            update_heartbeat()
+            time.sleep(3)
         except Exception as e:
             print(f"[BOT ERROR] {e} — рестарт через 5 сек", flush=True)
             traceback.print_exc()
+            update_heartbeat()
             time.sleep(5)
 
 if __name__ == '__main__':
-    bot_thread = threading.Thread(target=run_vk_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-  
+    # Flask в фоне (пинги Render), бот — в главном потоке
+    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+    run_vk_bot()
 
