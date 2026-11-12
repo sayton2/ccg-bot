@@ -19,6 +19,8 @@ import random
 import traceback
 import datetime
 import sys
+import base64
+import zlib
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,6 +90,8 @@ API_ELEMENT_MAP = {
     'forest': 'les', 'steppe': 'stepi', 'mountains': 'gory', 'mountain': 'gory',
     'swamp': 'boloto', 'darkness': 'tma', 'dark': 'tma',
     'nejtraly': 'nejtraly', 'neutral': 'nejtraly',
+    'лес': 'les', 'степи': 'stepi', 'степь': 'stepi', 'горы': 'gory',
+    'болото': 'boloto', 'тьма': 'tma', 'нейтральные': 'nejtraly', 'нейтрал': 'nejtraly',
 }
 
 BROWSER_HEADERS = {
@@ -96,12 +100,26 @@ BROWSER_HEADERS = {
     'Accept-Language': 'ru-RU,ru;q=0.9',
 }
 
+# Официальный бинарный формат колоды BHD1 (как decodeDeck в dekbilder)
+BH_SIGNATURE = b'BHD1'
+BH_ID_HIGH = 0x08005000
+PUBLIC_DECKS_URL = "https://ep-ccg.ru/wp-json/berserk/v1/decks/public"
+BERSERK_DATA_URL = "https://ep-ccg.ru/wp-json/berserk/v1/data"
+DECK_VIEW_URL = "https://ep-ccg.ru/koloda/?deck_id={}"
+PUBLIC_DECKS_TTL = 5 * 60  # кэш публичных колод, сек
+GAME_DB_TTL = 30 * 60      # кэш базы карт/героев, сек
+
 ATTACHMENT_CACHE = {}
 CARD_IMAGE_CACHE = {}
 CARD_META_CACHE = {}
 SITE_FILES_INDEX = []
 INDEX_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
+
+_GAME_DB = {'heroes': {}, 'cards': {}, 'by_title': {}, 'loaded_at': 0}
+_PUBLIC_DECKS_CACHE = {'items': [], 'loaded_at': 0}
+_GAME_DB_LOCK = threading.Lock()
+_PUBLIC_DECKS_LOCK = threading.Lock()
 
 # ==================== КЭШ И СОСТОЯНИЕ ====================
 
@@ -476,23 +494,314 @@ def build_deck_image(hero_name, total_cards, max_cards, cards):
     canvas.save(output, format="JPEG", quality=85)
     return output.getvalue()
 
-# ==================== ПАРСИНГ КОЛОДЫ ====================
+# ==================== ДЕКОДИРОВАНИЕ КОЛОДЫ (BHD1 / Base64) ====================
 
-def parse_deck_text(text):
-    hero_name = ""
-    cards = []
-    for line in text.splitlines():
-        clean = re.sub(r'^#+\s*', '', line).strip()
-        if not clean:
+def _element_from_list(elements):
+    for el in elements or []:
+        key = API_ELEMENT_MAP.get(str(el).strip().lower())
+        if key:
+            return key
+        low = str(el).strip().lower()
+        if low in ELEMENT_DATA:
+            return low
+    return 'nejtraly'
+
+def ensure_game_db(force=False):
+    """Локальная база героев/карт по game_id из /wp-json/berserk/v1/data."""
+    with _GAME_DB_LOCK:
+        age = time.time() - _GAME_DB['loaded_at']
+        if not force and _GAME_DB['heroes'] and age < GAME_DB_TTL:
+            return _GAME_DB
+    try:
+        res = requests.get(BERSERK_DATA_URL, headers=BROWSER_HEADERS, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        heroes, cards, by_title = {}, {}, {}
+        for h in data.get('heroes') or []:
+            gid = str(h.get('game_id') or '').strip().lower()
+            if gid:
+                heroes[gid] = h
+            title = str(h.get('title') or '').strip().lower()
+            if title:
+                by_title[title] = h
+        for c in data.get('cards') or []:
+            gid = str(c.get('game_id') or '').strip().lower()
+            if gid:
+                cards[gid] = c
+            title = str(c.get('title') or '').strip().lower()
+            if title and title not in by_title:
+                by_title[title] = c
+        with _GAME_DB_LOCK:
+            _GAME_DB['heroes'] = heroes
+            _GAME_DB['cards'] = cards
+            _GAME_DB['by_title'] = by_title
+            _GAME_DB['loaded_at'] = time.time()
+            print(f"[GAME DB] героев={len(heroes)}, карт={len(cards)}", flush=True)
+            return {
+                'heroes': heroes,
+                'cards': cards,
+                'by_title': by_title,
+                'loaded_at': _GAME_DB['loaded_at'],
+            }
+    except Exception as e:
+        print(f"[GAME DB ERROR] {e}", flush=True)
+        with _GAME_DB_LOCK:
+            return {
+                'heroes': dict(_GAME_DB['heroes']),
+                'cards': dict(_GAME_DB['cards']),
+                'by_title': dict(_GAME_DB['by_title']),
+                'loaded_at': _GAME_DB['loaded_at'],
+            }
+
+def looks_like_deck_base64(text):
+    """Грубая проверка: одна строка Base64 кода колоды BHD1."""
+    if not text:
+        return False
+    s = text.strip()
+    if '\n' in s or ' ' in s:
+        s = re.sub(r'\s+', '', s)
+    if not (24 <= len(s) <= 1024):
+        return False
+    if not re.fullmatch(r'[A-Za-z0-9+/=]+', s):
+        return False
+    # BHD1 в Base64 почти всегда начинается с QkhEM
+    return s.startswith('QkhEM') or s.startswith('QkhE')
+
+def decode_deck_bhd1(code):
+    """
+    Распаковка официального кода колоды BHD1 (decodeDeck с dekbilder):
+    signature(4) + hero_id(8) + count(1) + N*(card_id(8)+qty(1)) + crc32(4).
+    """
+    trimmed = re.sub(r'\s+', '', str(code or '').strip())
+    if not (24 <= len(trimmed) <= 1024):
+        raise ValueError('Неверная длина кода')
+    try:
+        raw = base64.b64decode(trimmed)
+    except Exception:
+        raise ValueError('Код не является Base64')
+    data = bytearray(raw)
+    if len(data) < 17 or len(data) > 4 + 8 + 1 + 80 * 9 + 4:
+        raise ValueError('Неверный размер данных')
+    crc_pos = len(data) - 4
+    stored_crc = int.from_bytes(data[crc_pos:crc_pos + 4], 'little')
+    calc_crc = zlib.crc32(bytes(data[:crc_pos])) & 0xFFFFFFFF
+    if stored_crc != calc_crc:
+        raise ValueError('Не сходится контрольная сумма')
+    if bytes(data[:4]) != BH_SIGNATURE:
+        raise ValueError('Это не код колоды BHD1')
+
+    def read_id(pos):
+        low = int.from_bytes(data[pos:pos + 4], 'little')
+        high = int.from_bytes(data[pos + 4:pos + 8], 'little')
+        if low == 0 and high == 0:
+            raise ValueError('Пустой ID карты')
+        if high != BH_ID_HIGH:
+            raise ValueError('Неизвестный формат ID карты')
+        return f'{low:08x}', pos + 8
+
+    pos = 4
+    hero_id, pos = read_id(pos)
+    count = data[pos]
+    pos += 1
+    if count > 80:
+        raise ValueError('Слишком много карт')
+    if len(data) != 13 + count * 9 + 4:
+        raise ValueError('Неверный размер данных')
+    entries = []
+    seen = set()
+    for _ in range(count):
+        cid, pos = read_id(pos)
+        n = data[pos]
+        pos += 1
+        if n < 1 or n > 10:
+            raise ValueError(f'Неверное количество карты {cid}')
+        if cid in seen:
+            raise ValueError(f'Карта {cid} указана дважды')
+        seen.add(cid)
+        entries.append((cid, int(n)))
+    return {'hero': hero_id, 'entries': entries, 'code': trimmed}
+
+def download_image_url(url):
+    if not url:
+        return None
+    try:
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if res.status_code == 200 and res.content:
+            return res.content
+    except Exception as e:
+        print(f"[IMG URL ERROR] {url}: {e}", flush=True)
+    return None
+
+def _meta_from_game_card(card):
+    title = str((card or {}).get('title') or '???').strip() or '???'
+    cost = (card or {}).get('cost')
+    try:
+        cost = int(cost)
+    except Exception:
+        cost = 0
+    element = _element_from_list((card or {}).get('elements'))
+    image_url = (card or {}).get('image') or ''
+    return title, cost, element, image_url
+
+def deck_entries_to_card_rows(decoded):
+    """game_id + count -> строки для build_deck_image: (cost, name, count, img_bytes, element)."""
+    db = ensure_game_db()
+    hero_meta = db['heroes'].get(decoded['hero']) or {}
+    hero_name = str(hero_meta.get('title') or f"Герой {decoded['hero']}").strip()
+
+    def load_one(item):
+        gid, count = item
+        card = db['cards'].get(gid) or db['heroes'].get(gid) or {}
+        title, cost, element, image_url = _meta_from_game_card(card)
+        img = download_image_url(image_url)
+        if not img and title and title != '???':
+            img, el2 = download_card_image_fast(title)
+            if el2 and (not element or element == 'nejtraly'):
+                element = el2
+            if not img:
+                img = download_card_image(title, prefix="bgo-")
+        if not title or title == '???':
+            title = f"ID {gid}"
+        return cost, title, count, img, element or 'nejtraly'
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        rows = list(executor.map(load_one, decoded['entries']))
+    rows.sort(key=lambda x: (x[0], x[1]))
+    total = sum(c for _, _, c, _, _ in rows)
+    return hero_name, total, rows
+
+def render_deck_image_from_base64(code):
+    decoded = decode_deck_bhd1(code)
+    hero_name, total, rows = deck_entries_to_card_rows(decoded)
+    if not rows:
+        raise ValueError('В колоде нет карт')
+    img_bytes = build_deck_image(hero_name, total, 60, rows)
+    return img_bytes, hero_name, total, decoded
+
+def fetch_public_decks(force=False):
+    with _PUBLIC_DECKS_LOCK:
+        age = time.time() - _PUBLIC_DECKS_CACHE['loaded_at']
+        if not force and _PUBLIC_DECKS_CACHE['items'] and age < PUBLIC_DECKS_TTL:
+            return list(_PUBLIC_DECKS_CACHE['items'])
+    res = requests.get(PUBLIC_DECKS_URL, headers=BROWSER_HEADERS, timeout=30)
+    res.raise_for_status()
+    items = res.json()
+    if not isinstance(items, list):
+        raise ValueError('Некорректный ответ API публичных колод')
+    with _PUBLIC_DECKS_LOCK:
+        _PUBLIC_DECKS_CACHE['items'] = items
+        _PUBLIC_DECKS_CACHE['loaded_at'] = time.time()
+    print(f"[PUBLIC DECKS] загружено {len(items)} колод", flush=True)
+    return list(items)
+
+def find_best_public_deck(hero_query):
+    """Фильтр по герою, сортировка: лайки ↓, дата обновления ↓; предпочтение колод с game_code."""
+    q = (hero_query or '').strip().lower()
+    if not q:
+        return None
+    decks = fetch_public_decks()
+    matched = []
+    for d in decks:
+        hero_title = ''
+        dj = d.get('deck_json') or {}
+        if isinstance(dj, dict):
+            hero_title = str(dj.get('heroTitle') or '')
+        if q in hero_title.lower() or hero_title.lower() in q or q == hero_title.lower():
+            matched.append(d)
+    if not matched:
+        # мягкий поиск по вхождению
+        matched = [
+            d for d in decks
+            if q in str(((d.get('deck_json') or {}).get('heroTitle') or '')).lower()
+        ]
+    if not matched:
+        return None
+
+    def sort_key(d):
+        likes = int(d.get('likes') or 0)
+        updated = int(d.get('updated_at') or 0)
+        has_code = 1 if str(d.get('game_code') or '').strip() else 0
+        return (has_code, likes, updated)
+
+    matched.sort(key=sort_key, reverse=True)
+    return matched[0]
+
+def build_rows_from_deck_json(deck_json, hero_fallback=''):
+    """Fallback: группировка карт из deck_json, если game_code пуст."""
+    dj = deck_json or {}
+    hero_name = str(dj.get('heroTitle') or hero_fallback or 'Колода').strip()
+    cards = dj.get('cards') or []
+    grouped = {}
+    for c in cards:
+        key = str(c.get('id') or c.get('title') or '').strip()
+        if not key:
             continue
-        m_hero = re.match(r'[Гг]ерой[:\s]+(.+)', clean)
-        if m_hero:
-            hero_name = m_hero.group(1).strip()
-            continue
-        m = re.match(r'(\d+)x\s*\((\d+)\)\s*(.+)', clean)
-        if m:
-            cards.append((int(m.group(1)), int(m.group(2)), m.group(3).strip()))
-    return hero_name, cards
+        if key not in grouped:
+            grouped[key] = {
+                'title': str(c.get('title') or '???'),
+                'cost': c.get('cost') or 0,
+                'count': 0,
+                'image': c.get('image') or '',
+                'elements': c.get('elements') or [],
+                'game_id': str(c.get('game_id') or '').strip().lower(),
+            }
+        grouped[key]['count'] += 1
+
+    def load_one(item):
+        meta = item
+        title = meta['title']
+        try:
+            cost = int(meta['cost'])
+        except Exception:
+            cost = 0
+        element = _element_from_list(meta['elements'])
+        img = download_image_url(meta['image'])
+        if not img:
+            img, el2 = download_card_image_fast(title)
+            if el2 and (not element or element == 'nejtraly'):
+                element = el2
+            if not img:
+                img = download_card_image(title, prefix="bgo-")
+        return cost, title, meta['count'], img, element or 'nejtraly'
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        rows = list(executor.map(load_one, grouped.values()))
+    rows.sort(key=lambda x: (x[0], x[1]))
+    total = sum(c for _, _, c, _, _ in rows)
+    return hero_name, total, rows
+
+def format_deck_caption(deck_obj, game_code=''):
+    name = str(deck_obj.get('name') or 'Колода').strip()
+    author = str(deck_obj.get('author') or '—').strip()
+    is_pro = bool(deck_obj.get('is_pro') or deck_obj.get('author_is_pro'))
+    pro_mark = " ✅PRO" if is_pro else ""
+    deck_id = deck_obj.get('id')
+    link = DECK_VIEW_URL.format(deck_id) if deck_id else "https://ep-ccg.ru/publichnye-kolody/"
+    hero = str(((deck_obj.get('deck_json') or {}).get('heroTitle')) or '').strip()
+    likes = int(deck_obj.get('likes') or 0)
+    lines = [
+        f"🃏 {name}",
+        f"🐉 Герой: {hero}" if hero else None,
+        f"👤 Автор: {author}{pro_mark}",
+        f"❤️ Лайков: {likes}",
+        f"🔗 {link}",
+    ]
+    code = (game_code or deck_obj.get('game_code') or '').strip()
+    if code:
+        lines.append("")
+        lines.append("📋 Код колоды (Base64):")
+        lines.append(code)
+    return "\n".join(x for x in lines if x is not None)
+
+def send_deck_image(vk_session, peer_id, img_bytes, message=' '):
+    attachment = upload_and_get_attachment(vk_session, img_bytes, 'deck.jpg', peer_id)
+    vk_session.method('messages.send', {
+        'peer_id': peer_id,
+        'message': message or ' ',
+        'attachment': attachment,
+        'random_id': rnd_id(),
+    })
+    return attachment
 
 # ==================== ОТПРАВКА КАРТИНОК В ВК ====================
 
@@ -1001,41 +1310,77 @@ def handle_message(vk_session, message_obj):
         show_top(vk_session, peer_id)
         return
 
+    # !колода <Герой> — лучшая публичная колода с ep-ccg.ru
+    if text_lower.startswith("!колода"):
+        hero_query = text_clean[len("!колода"):].strip()
+        if not hero_query:
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': "Использование: !колода <имя героя>\nПример: !колода Афари",
+                'random_id': rnd_id(),
+            })
+            return
+        try:
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': f"🔎 Ищу лучшую публичную колоду героя «{hero_query}»…",
+                'random_id': rnd_id(),
+            })
+            best = find_best_public_deck(hero_query)
+            if not best:
+                vk_session.method('messages.send', {
+                    'peer_id': peer_id,
+                    'message': f"Колоды героя «{hero_query}» не найдены на ep-ccg.ru.",
+                    'random_id': rnd_id(),
+                })
+                return
+            game_code = str(best.get('game_code') or '').strip()
+            if game_code:
+                img_bytes, hero_name, total, _ = render_deck_image_from_base64(game_code)
+            else:
+                hero_name, total, rows = build_rows_from_deck_json(best.get('deck_json') or {}, hero_query)
+                if not rows:
+                    raise ValueError('Пустая колода')
+                img_bytes = build_deck_image(hero_name, total, 60, rows)
+            caption = format_deck_caption(best, game_code)
+            send_deck_image(vk_session, peer_id, img_bytes, caption)
+        except Exception as e:
+            print(f"[KOLODA ERROR] {e}", flush=True)
+            traceback.print_exc()
+            vk_session.method('messages.send', {
+                'peer_id': peer_id,
+                'message': f"Не удалось собрать колоду: {e}",
+                'random_id': rnd_id(),
+            })
+        return
+
+    # !deck <Base64> или просто валидный Base64-код колоды BHD1
+    deck_code_candidate = None
     if text_lower.startswith("!deck"):
-        deck_text = text_clean[5:].strip()
-        if not deck_text:
+        deck_code_candidate = text_clean[5:].strip()
+        if not deck_code_candidate:
             vk_session.method('messages.send', {
-                'peer_id': peer_id, 'message': "Использование: !deck [текст колоды из игры]",
-                'random_id': rnd_id()
+                'peer_id': peer_id,
+                'message': "Использование:\n!deck <Base64-код колоды>\nили просто пришлите код колоды BHD1\n\nТакже: !колода <Герой>",
+                'random_id': rnd_id(),
             })
             return
-        hero_name, cards = parse_deck_text(deck_text)
-        if not cards:
+    elif looks_like_deck_base64(text_clean):
+        deck_code_candidate = text_clean.strip()
+
+    if deck_code_candidate is not None:
+        try:
+            img_bytes, hero_name, total, decoded = render_deck_image_from_base64(deck_code_candidate)
+            caption = f"🃏 Колода: {hero_name}\n📦 Карт: {total} / 60\n\n📋 Код:\n{decoded['code']}"
+            send_deck_image(vk_session, peer_id, img_bytes, caption)
+        except Exception as e:
+            print(f"[DECK B64 ERROR] {e}", flush=True)
+            traceback.print_exc()
             vk_session.method('messages.send', {
-                'peer_id': peer_id, 'message': "Не удалось распознать колоду. Вставьте текст из игры полностью.",
-                'random_id': rnd_id()
+                'peer_id': peer_id,
+                'message': f"Не удалось декодировать колоду: {e}",
+                'random_id': rnd_id(),
             })
-            return
-        total_cards = sum(c[0] for c in cards)
-
-        def load_card(item):
-            count, cost, name = item
-            img, element = download_card_image_fast(name)
-            if not img:
-                img = download_card_image(name, prefix="bgo-")
-            if not element or element == 'nejtraly':
-                element = get_card_element(name)
-            return cost, name, count, img, element
-
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            card_data = list(executor.map(load_card, cards))
-        card_data.sort(key=lambda x: x[0])
-
-        img_bytes = build_deck_image(hero_name or "Колода", total_cards, 60, card_data)
-        attachment = upload_and_get_attachment(vk_session, img_bytes, 'deck.jpg', peer_id)
-        vk_session.method('messages.send', {
-            'peer_id': peer_id, 'message': " ", 'attachment': attachment, 'random_id': rnd_id()
-        })
         return
 
     chosen_command = None
@@ -1123,6 +1468,7 @@ def run_flask_server():
 
 def run_vk_bot():
     update_site_files_index()
+    threading.Thread(target=ensure_game_db, daemon=True).start()
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
     threading.Thread(target=monthly_reset_scheduler, daemon=True).start()
