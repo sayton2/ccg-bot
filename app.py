@@ -1,2042 +1,2453 @@
-# -*- coding: utf-8 -*-
-# CardHero Connect — VK бот для карточной игры «Берсерк»
-# Возможности: поиск карт, визуализация колод, конкурс «Угадай карту» (ротация 3 типов подсказок)
-# Рейтинг чата сбрасывается 1-го числа каждого месяца автоматически.
+<?php
+/**
+ * Plugin Name: Berserk Deck Builder
+ * Description: Декбилдер для Berserk Heroes Online v63
+ * Version: 63
+ */
 
-import vk_api
-from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
-import requests
-from requests.exceptions import ReadTimeout as RequestsReadTimeout
-from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
-import threading
-from flask import Flask
-import os
-import io
-import time
-import re
-import json
-import random
-import traceback
-import datetime
-import sys
-import base64
-import zlib
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import difflib
+define('BH_DECKBUILDER_URL', 'https://ep-ccg.ru/dekbilder/');
+define('BH_DECKVIEW_URL', 'https://ep-ccg.ru/koloda/');
+if (!defined('BH_PUBLIC_DECKS_URL')) define('BH_PUBLIC_DECKS_URL', '/publichnye-kolody/');
 
-app = Flask(__name__)
+if (!defined('BH_DUST_EPIC'))      define('BH_DUST_EPIC', 400);
+if (!defined('BH_DUST_LEGENDARY')) define('BH_DUST_LEGENDARY', 2000);
+if (!defined('BH_DUST_RARE'))      define('BH_DUST_RARE', 120);
+if (!defined('BH_DUST_COMMON'))   define('BH_DUST_COMMON', 60);
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def healthcheck(path):
-    """Отвечает 200 OK на любые веб-пинги Render / health-check."""
-    return "CardHero Connect — бот активен", 200
-
-# ==================== НАСТРОЙКИ ====================
-VK_TOKEN = os.environ.get("VK_TOKEN", "")
-GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-ADMIN_VK_ID = int(os.environ.get("ADMIN_VK_ID", OWNER_ID or 0))
-
-ELEMENT_CACHE_FILE   = "element_cache.json"
-BOT_DATA_FILE        = "bot_data.json"          # единый снимок: scores + state + meta
-CONTESTS_FILE        = "contests.json"          # legacy (миграция)
-SCORES_FILE          = "chat_scores.json"       # legacy (миграция)
-CONTEST_FILE         = "contest_state.json"     # legacy (миграция)
-CONTEST_CHATS_FILE   = "contest_chats.json"
-CLUE_INDEX_FILE      = "clue_index.json"
-MOSCOW_OFFSET = datetime.timedelta(hours=3)
-
-# GitHub Gist — облачный бэкап состояния (таблица лидеров, викторины, флаг сброса)
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-GIST_ID = os.environ.get("GIST_ID", "").strip()
-GIST_FILENAME = "bot_data.json"
-GIST_DEBOUNCE_SEC = 2.5
-GIST_HTTP_TIMEOUT = 8
-
-CLUE_TYPES = ["blur", "text", "fragment"]
-BASE_CONTEST_REWARD = 10
-HINT_INTERVAL_SEC = 3600
-# Доля стороны карты для кропа: старт → почасовые подсказки
-BLUR_CROP_RATIOS = [0.22, 0.34, 0.48, 0.62, 0.78]
-FRAGMENT_CROP_RATIOS = [0.20, 0.32, 0.45, 0.60, 0.75]
-TEXT_REVEAL_RATIOS = [0.22, 0.40, 0.58, 0.75, 0.92]
-
-ELEMENT_NAMES_RU = {
-    'les': 'Лес', 'stepi': 'Степи', 'gory': 'Горы',
-    'boloto': 'Болото', 'tma': 'Тьма', 'nejtraly': 'Нейтралы',
-}
-TYPE_NAMES_RU = {
-    'creature': 'Существо', 'spell': 'Заклинание',
-    'equipment': 'Экипировка', 'hero': 'Герой',
+/** Игровой ID карты/героя из штатного meta/ACF поля записи WordPress. */
+function bh_get_card_game_id($post_id) {
+    $gid = '';
+    if (function_exists('get_field')) {
+        $val = get_field('card_game_id', $post_id);
+        if ($val) $gid = $val;
+    }
+    if ($gid === '' || $gid === null) {
+        $gid = get_post_meta($post_id, 'card_game_id', true);
+    }
+    return strtolower(trim((string)$gid));
 }
 
-# Watchdog: мягкий контроль зависания long poll (без убийства на обычных ReadTimeout)
-HEARTBEAT_TIMEOUT = 300  # секунд без heartbeat = рестарт
-_last_heartbeat = time.time()
-_heartbeat_lock = threading.Lock()
+/** URL картинки, привязанной к записи карты/героя (оригинал full, без мыльной миниатюры). */
+function bh_get_card_image_url($post_id) {
+    $url = get_the_post_thumbnail_url($post_id, 'full');
+    if ($url) return $url;
 
-def update_heartbeat():
-    global _last_heartbeat
-    with _heartbeat_lock:
-        _last_heartbeat = time.time()
-
-def get_heartbeat_age():
-    with _heartbeat_lock:
-        return time.time() - _last_heartbeat
-
-def watchdog_loop():
-    """Фоновый поток: если long poll реально завис (нет heartbeat), перезапуск процесса."""
-    while True:
-        time.sleep(15)
-        age = get_heartbeat_age()
-        if age > HEARTBEAT_TIMEOUT:
-            print(f"[WATCHDOG] Long poll завис (heartbeat {age:.0f}с) — принудительный рестарт процесса", flush=True)
-            os._exit(1)
-def rnd_id():
-    return random.randint(0, 2**31)
-
-def moscow_now():
-    return datetime.datetime.utcnow() + MOSCOW_OFFSET
-# ====================================================
-
-RULES = {
-    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
-    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm',
-    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-    'ф': 'f', 'х': 'h', 'ц': 'cz', 'ч': 'ch', 'ш': 'sh', 'щ': 'shh',
-    'ы': 'y', 'э': 'e', 'ю': 'yu', 'я': 'ya', 'ь': '', 'ъ': ''
-}
-
-API_ELEMENT_MAP = {
-    'forest': 'les', 'steppe': 'stepi', 'mountains': 'gory', 'mountain': 'gory',
-    'swamp': 'boloto', 'darkness': 'tma', 'dark': 'tma',
-    'nejtraly': 'nejtraly', 'neutral': 'nejtraly',
-    'лес': 'les', 'степи': 'stepi', 'степь': 'stepi', 'горы': 'gory',
-    'болото': 'boloto', 'тьма': 'tma', 'нейтральные': 'nejtraly', 'нейтрал': 'nejtraly',
-}
-
-BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-    'Accept': 'application/json',
-    'Accept-Language': 'ru-RU,ru;q=0.9',
-}
-
-# Официальный бинарный формат колоды BHD1 (как decodeDeck в dekbilder)
-BH_SIGNATURE = b'BHD1'
-BH_ID_HIGH = 0x08005000
-PUBLIC_DECKS_URL = "https://ep-ccg.ru/wp-json/berserk/v1/decks/public"
-BERSERK_DATA_URL = "https://ep-ccg.ru/wp-json/berserk/v1/data"
-DECK_VIEW_URL = "https://ep-ccg.ru/koloda/?deck_id={}"
-PUBLIC_DECKS_TTL = 5 * 60  # кэш публичных колод, сек
-GAME_DB_TTL = 30 * 60      # кэш базы карт/героев, сек
-
-ATTACHMENT_CACHE = {}
-CARD_IMAGE_CACHE = {}
-CARD_META_CACHE = {}
-SITE_FILES_INDEX = []
-INDEX_LOCK = threading.Lock()
-CACHE_LOCK = threading.Lock()
-
-_GAME_DB = {'heroes': {}, 'cards': {}, 'by_title': {}, 'loaded_at': 0}
-_PUBLIC_DECKS_CACHE = {'items': [], 'loaded_at': 0}
-_GAME_DB_LOCK = threading.Lock()
-_PUBLIC_DECKS_LOCK = threading.Lock()
-
-# ==================== КЭШ И СОСТОЯНИЕ ====================
-
-def load_json(filename, default):
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return default
-
-def save_json(filename, data):
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[SAVE ERROR] {filename}: {e}", flush=True)
-
-# ==================== ОБЛАЧНОЕ СОСТОЯНИЕ (GitHub Gist + local bot_data.json) ====================
-
-_state_lock = threading.Lock()
-_gist_sync_lock = threading.Lock()
-_gist_dirty = False
-_gist_last_push = 0.0
-_gist_worker_started = False
-_BOT_STATE_SOURCE = 'empty'
-
-def _normalize_bot_state(data):
-    """Единая схема: scores (топ), state (викторины), meta (флаг месячного сброса)."""
-    if not isinstance(data, dict):
-        data = {}
-    return {
-        'scores': data.get('scores') if isinstance(data.get('scores'), dict) else {},
-        'state': data.get('state') if isinstance(data.get('state'), dict) else {},
-        'meta': data.get('meta') if isinstance(data.get('meta'), dict) else {},
-        'updated_at': data.get('updated_at') or moscow_now().isoformat(),
+    if (function_exists('get_field')) {
+        foreach (array('card_image', 'hero_image', 'image', 'card_img', 'изображение', 'картинка') as $key) {
+            $val = get_field($key, $post_id);
+            $resolved = bh_resolve_image_field_url($val);
+            if ($resolved) return $resolved;
+        }
     }
 
-def _snapshot_bot_state():
-    return _normalize_bot_state({
-        'scores': CHAT_SCORES,
-        'state': CONTEST_STATE,
-        'meta': CONTEST_META,
-        'updated_at': moscow_now().isoformat(),
-    })
-
-def _gist_headers():
-    return {
-        'Authorization': f'token {GITHUB_TOKEN}',
-        'Accept': 'application/vnd.github.v3+json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'CardHeroConnect-VK-Bot',
+    if (function_exists('get_field_objects')) {
+        $fields = get_field_objects($post_id);
+        if (is_array($fields)) {
+            $use_mb = function_exists('mb_strtolower');
+            foreach ($fields as $field) {
+                $type = isset($field['type']) ? $field['type'] : '';
+                $label = isset($field['label']) ? $field['label'] : '';
+                $name = isset($field['name']) ? $field['name'] : '';
+                $label_l = $use_mb ? mb_strtolower($label . ' ' . $name) : strtolower($label . ' ' . $name);
+                $is_image = ($type === 'image');
+                if (!$is_image) {
+                    foreach (array('изображ', 'картин', 'image', 'thumb', 'photo', 'фото') as $kw) {
+                        if ($use_mb ? (mb_strpos($label_l, $kw) !== false) : (strpos($label_l, $kw) !== false)) {
+                            $is_image = true;
+                            break;
+                        }
+                    }
+                }
+                if (!$is_image) continue;
+                $resolved = bh_resolve_image_field_url(isset($field['value']) ? $field['value'] : null);
+                if ($resolved) return $resolved;
+            }
+        }
     }
 
-def _gist_api_url():
-    # Корректный REST endpoint GitHub Gist API (не github.com/{id})
-    return f'https://api.github.com/gists/{GIST_ID}'
+    return '';
+}
 
-def _fetch_state_from_gist():
-    """GET gist → содержимое files[bot_data.json]."""
-    if not (GITHUB_TOKEN and GIST_ID):
-        return None
-    try:
-        res = requests.get(
-            _gist_api_url(),
-            headers=_gist_headers(),
-            timeout=GIST_HTTP_TIMEOUT,
-        )
-        if res.status_code != 200:
-            print(f"[GIST LOAD] HTTP {res.status_code}: {res.text[:200]}", flush=True)
-            return None
-        files = (res.json() or {}).get('files') or {}
-        node = files.get(GIST_FILENAME) or {}
-        content = node.get('content')
-        if not content:
-            # иногда большой файл отдаётся только по raw_url
-            raw_url = node.get('raw_url')
-            if raw_url:
-                raw = requests.get(raw_url, headers=_gist_headers(), timeout=GIST_HTTP_TIMEOUT)
-                if raw.status_code == 200 and raw.text:
-                    content = raw.text
-        if not content:
-            print("[GIST LOAD] bot_data.json пуст или отсутствует в Gist", flush=True)
-            return None
-        data = json.loads(content)
-        print("[GIST LOAD] Состояние загружено из GitHub Gist", flush=True)
-        return _normalize_bot_state(data)
-    except Exception as e:
-        print(f"[GIST LOAD ERROR] {e}", flush=True)
-        return None
+/** Разобрать значение ACF image (ID / URL / массив) в URL оригинала. */
+function bh_resolve_image_field_url($val) {
+    if (!$val) return '';
+    if (is_numeric($val)) {
+        $url = wp_get_attachment_image_url(intval($val), 'full');
+        return $url ? $url : '';
+    }
+    if (is_string($val)) {
+        $val = trim($val);
+        if ($val === '') return '';
+        if (preg_match('#^https?://#i', $val) || strpos($val, '/') === 0) return $val;
+        if (ctype_digit($val)) {
+            $url = wp_get_attachment_image_url(intval($val), 'full');
+            return $url ? $url : '';
+        }
+        return '';
+    }
+    if (is_array($val)) {
+        if (!empty($val['url'])) return $val['url'];
+        if (!empty($val['sizes']['full'])) return $val['sizes']['full'];
+        if (!empty($val['ID'])) return bh_resolve_image_field_url($val['ID']);
+        if (!empty($val['id'])) return bh_resolve_image_field_url($val['id']);
+    }
+    return '';
+}
 
-def _push_state_to_gist(snapshot):
-    """PATCH gist: обновляет files.bot_data.json."""
-    if not (GITHUB_TOKEN and GIST_ID):
-        return False
-    try:
-        payload = {
-            'files': {
-                GIST_FILENAME: {
-                    'content': json.dumps(snapshot, ensure_ascii=False, indent=2),
+register_activation_hook(__FILE__, 'bh_create_tables');
+function bh_create_tables() {
+    global $wpdb;
+    $charset = $wpdb->get_charset_collate();
+    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}bh_decks (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        hero_wp_id BIGINT UNSIGNED NOT NULL,
+        deck_json LONGTEXT NOT NULL,
+        header_id VARCHAR(8) NOT NULL DEFAULT '',
+        hero_le VARCHAR(8) NOT NULL DEFAULT '',
+        game_code TEXT,
+        description LONGTEXT,
+        guide_url TEXT,
+        video_guide_url TEXT,
+        is_public TINYINT(1) DEFAULT 0,
+        likes INT DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) $charset");
+    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}bh_card_mappings (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        game_id_be VARCHAR(8) NOT NULL,
+        wp_post_id BIGINT UNSIGNED NOT NULL,
+        card_name VARCHAR(255) NOT NULL DEFAULT '',
+        votes INT DEFAULT 1,
+        status ENUM('pending','approved') DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_mapping (game_id_be, wp_post_id)
+    ) $charset");
+    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}bh_deck_likes (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        deck_id BIGINT UNSIGNED NOT NULL,
+        ip VARCHAR(45) NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_like (deck_id, ip)
+    ) $charset");
+    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}bh_deck_stats (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        deck_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        result ENUM('win','loss') NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_deck (deck_id)
+    ) $charset");
+    $cols = $wpdb->get_col("SHOW COLUMNS FROM {$wpdb->prefix}bh_decks");
+    if ($cols) {
+        if (!in_array('likes', $cols))       $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN likes INT DEFAULT 0");
+        if (!in_array('header_id', $cols))  $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN header_id VARCHAR(8) NOT NULL DEFAULT ''");
+        if (!in_array('hero_le', $cols))    $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN hero_le VARCHAR(8) NOT NULL DEFAULT ''");
+        if (!in_array('game_code', $cols))  $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN game_code TEXT");
+        if (!in_array('description', $cols)) $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN description LONGTEXT");
+        if (!in_array('guide_url', $cols)) $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN guide_url TEXT");
+        if (!in_array('video_guide_url', $cols)) $wpdb->query("ALTER TABLE {$wpdb->prefix}bh_decks ADD COLUMN video_guide_url TEXT");
+    }
+}
+
+// Авто-миграция схемы при обновлении плагина
+add_action('init', 'bh_ensure_schema');
+function bh_ensure_schema() {
+    if (get_option('bh_schema_version') >= 63) return;
+    bh_create_tables();
+    update_option('bh_schema_version', 63);
+}
+
+add_action('rest_api_init', function () {
+    register_rest_route('berserk/v1', '/data', array('methods' => 'GET', 'callback' => 'get_berserk_data', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/public', array('methods' => 'GET', 'callback' => 'bh_get_public_decks', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/my', array('methods' => 'GET', 'callback' => 'bh_get_my_decks', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/(?P<id>\d+)', array('methods' => 'GET', 'callback' => 'bh_get_deck', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/save', array('methods' => 'POST', 'callback' => 'bh_save_deck', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/(?P<id>\d+)/update-meta', array('methods' => 'POST', 'callback' => 'bh_update_deck_meta', 'permission_callback' => function () { return is_user_logged_in(); }));
+    register_rest_route('berserk/v1', '/decks/delete/(?P<id>\d+)', array('methods' => array('DELETE', 'POST'), 'callback' => 'bh_delete_deck', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/(?P<id>\d+)/like', array('methods' => 'POST', 'callback' => 'bh_like_deck', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/(?P<id>\d+)/visibility', array('methods' => 'POST', 'callback' => 'bh_set_deck_visibility', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/mappings/submit', array('methods' => 'POST', 'callback' => 'bh_submit_mapping', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/mappings', array('methods' => 'GET', 'callback' => 'bh_get_mappings', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/debug/acf', array('methods' => 'GET', 'callback' => 'bh_debug_acf', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/decks/(?P<id>\d+)/result', array('methods' => 'POST', 'callback' => 'bh_record_deck_result', 'permission_callback' => function () { return is_user_logged_in(); }));
+    register_rest_route('berserk/v1', '/stats/meta', array('methods' => 'GET', 'callback' => 'bh_get_meta_stats', 'permission_callback' => '__return_true'));
+    register_rest_route('berserk/v1', '/pro/request', array('methods' => 'POST', 'callback' => 'bh_pro_request', 'permission_callback' => function () { return is_user_logged_in(); }));
+    register_rest_route('berserk/v1', '/pro/me', array('methods' => 'GET', 'callback' => 'bh_pro_me', 'permission_callback' => function () { return is_user_logged_in(); }));
+});
+
+/** Нормализация типа карты к ключам creature / spell / equipment. */
+function bh_normalize_card_type($raw) {
+    $s = function_exists('mb_strtolower') ? mb_strtolower(trim((string)$raw)) : strtolower(trim((string)$raw));
+    if ($s === '') return '';
+    // Числовые коды (частый формат ACF select)
+    if ($s === '1' || $s === '01') return 'creature';
+    if ($s === '2' || $s === '02') return 'spell';
+    if ($s === '3' || $s === '03') return 'equipment';
+    // Заклинания
+    if (
+        strpos($s, 'закл') !== false || strpos($s, 'spell') !== false ||
+        strpos($s, 'магия') !== false || strpos($s, 'magic') !== false ||
+        $s === 's' || $s === 'sp'
+    ) return 'spell';
+    // Экипировка / предметы
+    if (
+        strpos($s, 'экип') !== false || strpos($s, 'equip') !== false || strpos($s, 'предм') !== false ||
+        strpos($s, 'оруж') !== false || strpos($s, 'weapon') !== false ||
+        strpos($s, 'доспех') !== false || strpos($s, 'armor') !== false || strpos($s, 'armour') !== false ||
+        strpos($s, 'амулет') !== false || strpos($s, 'amulet') !== false ||
+        strpos($s, 'артеф') !== false || strpos($s, 'artifact') !== false ||
+        strpos($s, 'item') !== false || strpos($s, 'gear') !== false ||
+        $s === 'e' || $s === 'eq'
+    ) return 'equipment';
+    // Герои (не считаем как существо в колоде карт)
+    if (strpos($s, 'герой') !== false || strpos($s, 'hero') !== false) return 'hero';
+    // Существа / юниты / монстры
+    if (
+        strpos($s, 'сущ') !== false || strpos($s, 'creat') !== false ||
+        strpos($s, 'unit') !== false || strpos($s, 'minion') !== false ||
+        strpos($s, 'monster') !== false || strpos($s, 'монстр') !== false ||
+        strpos($s, 'юнит') !== false || strpos($s, 'воин') !== false ||
+        strpos($s, 'fighter') !== false || strpos($s, 'warrior') !== false ||
+        strpos($s, 'troop') !== false || strpos($s, 'отряд') !== false ||
+        strpos($s, 'боец') !== false || strpos($s, 'персонаж') !== false ||
+        $s === 'c' || $s === 'cr' || $s === 'u'
+    ) return 'creature';
+    return '';
+}
+
+/** Тип карты из ACF / meta / таксономии mmf_card. Пустой/неизвестный → creature. */
+function bh_get_card_type($post_id) {
+    $raw = bh_get_field_by_label($post_id, array('тип', 'type', 'card type', 'вид карты', 'тип карты', 'card_type'));
+    if (!$raw) {
+        foreach (array('card_type', 'type', 'тип', 'mmf_type', 'cardtype', 'bgo_type') as $fk) {
+            if (function_exists('get_field')) {
+                $v = bh_to_string(get_field($fk, $post_id));
+                if ($v) { $raw = $v; break; }
+            }
+            $v = bh_to_string(get_post_meta($post_id, $fk, true));
+            if ($v) { $raw = $v; break; }
+        }
+    }
+    $norm = bh_normalize_card_type($raw);
+    if ($norm && $norm !== 'hero') return $norm;
+
+    $taxes = get_object_taxonomies('mmf_card', 'objects');
+    $use_mb = function_exists('mb_strtolower');
+    foreach ($taxes as $slug => $obj) {
+        $check = $use_mb
+            ? mb_strtolower(($obj->labels->name ?? '') . ' ' . ($obj->labels->singular_name ?? '') . ' ' . $slug)
+            : strtolower(($obj->labels->name ?? '') . ' ' . ($obj->labels->singular_name ?? '') . ' ' . $slug);
+        if (
+            strpos($check, 'тип') === false && strpos($check, 'type') === false &&
+            strpos($check, 'вид') === false && strpos($check, 'card_type') === false
+        ) continue;
+        $terms = wp_get_post_terms($post_id, $slug);
+        if (is_wp_error($terms) || !$terms) continue;
+        foreach ($terms as $term) {
+            $norm = bh_normalize_card_type($term->name);
+            if (!$norm) $norm = bh_normalize_card_type($term->slug);
+            if ($norm && $norm !== 'hero') return $norm;
+        }
+    }
+    // Любая карта mmf_card, не определённая как spell/equipment/hero — существо
+    return 'creature';
+}
+
+function bh_user_is_pro($user_id) {
+    $v = get_user_meta(intval($user_id), 'bgo_is_pro', true);
+    return ($v === '1' || $v === 1 || $v === true || $v === 'yes');
+}
+
+function bh_user_pro_achievements($user_id) {
+    return trim((string)get_user_meta(intval($user_id), 'bgo_pro_achievements', true));
+}
+
+function bh_attach_author_pro($row) {
+    if (!$row || !is_object($row)) return $row;
+    $uid = isset($row->user_id) ? intval($row->user_id) : 0;
+    $row->author_id = $uid;
+    $is_pro = $uid ? bh_user_is_pro($uid) : false;
+    $ach = ($is_pro && $uid) ? bh_user_pro_achievements($uid) : '';
+    $row->is_pro = (bool)$is_pro;
+    $row->pro_achievements = $ach;
+    // совместимость со старыми ключами во Vue
+    $row->author_is_pro = (bool)$is_pro;
+    $row->author_pro_achievements = $ach;
+    return $row;
+}
+
+function bh_user_pro_request_status($user_id) {
+    return trim((string)get_user_meta(intval($user_id), 'bgo_pro_request_status', true));
+}
+
+function bh_count_pending_pro_requests() {
+    $users = get_users(array(
+        'meta_key'   => 'bgo_pro_request_status',
+        'meta_value' => 'pending',
+        'fields'     => 'ID',
+        'number'     => 9999,
+        'count_total'=> false,
+    ));
+    return is_array($users) ? count($users) : 0;
+}
+
+function bh_pro_me() {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    $is_pro = bh_user_is_pro($user->ID);
+    $status = bh_user_pro_request_status($user->ID);
+    if ($is_pro && $status !== 'approved') {
+        $status = 'approved';
+    }
+    return array(
+        'is_pro' => $is_pro,
+        'achievements' => bh_user_pro_achievements($user->ID),
+        'request' => (string)get_user_meta($user->ID, 'bgo_pro_request', true),
+        'request_status' => $status,
+    );
+}
+
+function bh_pro_request(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+
+    $status = bh_user_pro_request_status($user->ID);
+    if (bh_user_is_pro($user->ID) || $status === 'pending') {
+        return array(
+            'success' => false,
+            'status'  => bh_user_is_pro($user->ID) ? 'approved' : 'pending',
+            'message' => 'Ваша заявка уже находится на рассмотрении',
+        );
+    }
+
+    $p = $request->get_json_params();
+    $text = isset($p['achievements']) ? sanitize_textarea_field($p['achievements']) : '';
+    if ($text === '') return new WP_Error('invalid', 'Укажите достижения', array('status' => 400));
+
+    update_user_meta($user->ID, 'bgo_pro_request', $text);
+    update_user_meta($user->ID, 'bgo_pro_request_status', 'pending');
+    if (!bh_user_pro_achievements($user->ID)) {
+        update_user_meta($user->ID, 'bgo_pro_achievements', $text);
+    }
+
+    $admin_email = get_option('admin_email');
+    if ($admin_email) {
+        $nick = $user->display_name ? $user->display_name : $user->user_login;
+        $edit_url = admin_url('user-edit.php?user_id=' . intval($user->ID));
+        $subject = '[BGO] Заявка на статус PRO: ' . $nick;
+        $body = "Новая заявка на статус PRO\n\n"
+            . "Автор: {$nick} ({$user->user_login})\n"
+            . "User ID: {$user->ID}\n"
+            . "Email: {$user->user_email}\n\n"
+            . "Достижения:\n{$text}\n\n"
+            . "Редактировать профиль:\n{$edit_url}\n";
+        wp_mail($admin_email, $subject, $body);
+    }
+
+    return array('success' => true, 'status' => 'pending', 'message' => 'Заявка отправлена');
+}
+
+add_action('show_user_profile', 'bh_pro_admin_profile_fields');
+add_action('edit_user_profile', 'bh_pro_admin_profile_fields');
+function bh_pro_admin_profile_fields($user) {
+    if (!current_user_can('edit_users')) return;
+    $is_pro = bh_user_is_pro($user->ID);
+    $ach = bh_user_pro_achievements($user->ID);
+    $req = (string)get_user_meta($user->ID, 'bgo_pro_request', true);
+    $req_status = bh_user_pro_request_status($user->ID);
+    echo '<h2>BGO PRO статус</h2><table class="form-table">';
+    echo '<tr><th><label>Заявка</label></th><td>';
+    echo $req !== '' || $req_status !== ''
+        ? '<p><strong>Статус:</strong> ' . esc_html($req_status !== '' ? $req_status : '—') . '</p>'
+          . ($req !== '' ? '<pre style="white-space:pre-wrap;background:#f6f7f7;padding:8px">' . esc_html($req) . '</pre>' : '')
+        : '<em>Заявок нет</em>';
+    echo '</td></tr>';
+    echo '<tr><th><label for="bgo_pro_achievements">Достижения (тултип PRO)</label></th><td>';
+    echo '<textarea name="bgo_pro_achievements" id="bgo_pro_achievements" rows="5" class="large-text">' . esc_textarea($ach) . '</textarea>';
+    echo '</td></tr>';
+    echo '<tr><th>Активировать статус PRO</th><td><label><input type="checkbox" name="bgo_is_pro" value="1" ' . checked($is_pro, true, false) . '> Показывать бейдж PRO на всех колодах автора</label></td></tr>';
+    echo '</table>';
+}
+add_action('personal_options_update', 'bh_pro_admin_profile_save');
+add_action('edit_user_profile_update', 'bh_pro_admin_profile_save');
+function bh_pro_admin_profile_save($user_id) {
+    if (!current_user_can('edit_users')) return;
+    $was_pro = bh_user_is_pro($user_id);
+    $make_pro = !empty($_POST['bgo_is_pro']);
+    update_user_meta($user_id, 'bgo_is_pro', $make_pro ? '1' : '0');
+    if (isset($_POST['bgo_pro_achievements'])) {
+        update_user_meta($user_id, 'bgo_pro_achievements', sanitize_textarea_field(wp_unslash($_POST['bgo_pro_achievements'])));
+    }
+    // При одобрении PRO: pending → approved
+    if ($make_pro) {
+        update_user_meta($user_id, 'bgo_pro_request_status', 'approved');
+    } elseif ($was_pro && !$make_pro) {
+        // сняли PRO — сбрасываем статус заявки, чтобы можно было подать снова
+        $st = bh_user_pro_request_status($user_id);
+        if ($st === 'approved') {
+            update_user_meta($user_id, 'bgo_pro_request_status', '');
+        }
+    }
+}
+
+// Счётчик pending-заявок PRO рядом с пунктом «Пользователи»
+add_action('admin_menu', function () {
+    $count = bh_count_pending_pro_requests();
+    if ($count <= 0) return;
+    global $menu, $submenu;
+    $badge = " <span class='awaiting-mod update-plugins count-{$count}'><span class='pending-count'>" . intval($count) . '</span></span>';
+    if (is_array($menu)) {
+        foreach ($menu as $i => $item) {
+            if (isset($item[2]) && $item[2] === 'users.php') {
+                $menu[$i][0] .= $badge;
+                break;
+            }
+        }
+    }
+    if (isset($submenu['users.php']) && is_array($submenu['users.php'])) {
+        foreach ($submenu['users.php'] as $i => $item) {
+            if (isset($item[2]) && $item[2] === 'users.php') {
+                $submenu['users.php'][$i][0] .= $badge;
+                break;
+            }
+        }
+    }
+}, 999);
+
+// Безопасное преобразование любого значения ACF в строку
+function bh_to_string($val) {
+    if ($val === null || $val === '') return '';
+    if (is_string($val)) return trim($val);
+    if (is_numeric($val)) return trim((string)$val);
+    if (is_array($val)) {
+        if (isset($val['value']) && $val['value'] !== '') return trim((string)$val['value']);
+        if (isset($val['label']) && $val['label'] !== '') return trim((string)$val['label']);
+        $parts = array();
+        foreach ($val as $item) {
+            if (is_object($item)) {
+                if (isset($item->name)) $parts[] = $item->name;
+                else if (isset($item->post_title)) $parts[] = $item->post_title;
+            } else if (is_array($item)) {
+                if (isset($item['name'])) $parts[] = $item['name'];
+                else if (isset($item['post_title'])) $parts[] = $item['post_title'];
+                else if (isset($item['title'])) $parts[] = $item['title'];
+            } else if (is_string($item)) {
+                $parts[] = $item;
+            }
+        }
+        return trim(implode(', ', $parts));
+    }
+    if (is_object($val)) {
+        if (isset($val->name)) return trim($val->name);
+        if (isset($val->post_title)) return trim($val->post_title);
+    }
+    return '';
+}
+
+// Поиск значения ACF-поля по фрагменту подписи (label)
+function bh_get_field_by_label($post_id, $label_keywords) {
+    if (!function_exists('get_field_objects')) return '';
+    static $cache = array();
+    if (!isset($cache[$post_id])) {
+        $fields = get_field_objects($post_id);
+        $cache[$post_id] = is_array($fields) ? $fields : array();
+    }
+    $use_mb = function_exists('mb_strtolower');
+    foreach ($cache[$post_id] as $field) {
+        $label = isset($field['label']) ? $field['label'] : '';
+        $label_lower = $use_mb ? mb_strtolower($label) : strtolower($label);
+        foreach ((array)$label_keywords as $kw) {
+            $kw_lower = $use_mb ? mb_strtolower($kw) : strtolower($kw);
+            $found = $use_mb ? (mb_strpos($label_lower, $kw_lower) !== false) : (strpos($label_lower, $kw_lower) !== false);
+            if ($found) {
+                return bh_to_string(isset($field['value']) ? $field['value'] : '');
+            }
+        }
+    }
+    return '';
+}
+
+// Нормализация редкости к английским ключам, используемым в фильтрах
+function bh_normalize_rarity($raw) {
+    $r = function_exists('mb_strtolower') ? mb_strtolower(trim((string)$raw)) : strtolower(trim((string)$raw));
+    if ($r === '') return '';
+    if (strpos($r, 'ультра') !== false) return 'legendary';
+    if (strpos($r, 'редк') !== false) return 'epic';
+    if (strpos($r, 'необыч') !== false) return 'rare';
+    if (strpos($r, 'част') !== false) return 'common';
+    $en = array('legendary' => 'legendary', 'epic' => 'epic', 'rare' => 'rare', 'common' => 'common');
+    return isset($en[$r]) ? $en[$r] : $r;
+}
+
+// Получение дополнения (герой-привязка): meta-поле _mmf_hero → ACF
+function bh_get_expansion_taxonomy($post_id) {
+    $hero = get_post_meta($post_id, '_mmf_hero', true);
+    if ($hero && is_string($hero)) {
+        $hero = trim($hero);
+        if ($hero !== '') return $hero;
+    }
+    $acf = bh_get_field_by_label($post_id, array('дополнение', 'expansion', 'set', 'серия', 'привязка', 'герой'));
+    if ($acf) return $acf;
+    foreach (array('card_expansion', 'card_set', 'expansion', 'set', 'card_hero', 'hero') as $fk) {
+        $v = trim((string)get_field($fk, $post_id));
+        if ($v) return $v;
+    }
+    return '';
+}
+
+// Получение редкости: ACF-поле → таксономия → post meta
+function bh_get_rarity($post_id) {
+    $rar = bh_get_field_by_label($post_id, array('редкость', 'редк', 'rarity'));
+    if (!$rar) $rar = trim((string)get_field('card_rarity', $post_id));
+    if (!$rar) $rar = trim((string)get_field('rarity', $post_id));
+    if ($rar) return bh_normalize_rarity($rar);
+
+    static $rar_tax = null;
+    if ($rar_tax === null) {
+        $rar_tax = false;
+        $all_tax = get_taxonomies(array(), 'objects');
+        $use_mb = function_exists('mb_strtolower');
+        foreach ($all_tax as $slug => $obj) {
+            $name = $obj->labels->name ?? '';
+            $singular = $obj->labels->singular_name ?? '';
+            $check = ($use_mb ? mb_strtolower($name . ' ' . $singular . ' ' . $slug) : strtolower($name . ' ' . $singular . ' ' . $slug));
+            if (strpos($check, 'редкост') !== false || strpos($check, 'редк') !== false || strpos($check, 'rarity') !== false) {
+                $tax_obj = get_taxonomy($slug);
+                if ($tax_obj && (in_array('mmf_card', $tax_obj->object_type) || in_array('mm_card', $tax_obj->object_type))) {
+                    $rar_tax = $slug;
+                    break;
                 }
             }
         }
-        res = requests.patch(
-            _gist_api_url(),
-            headers=_gist_headers(),
-            json=payload,
-            timeout=GIST_HTTP_TIMEOUT,
-        )
-        if res.status_code in (200, 201):
-            print(f"[GIST SAVE] Синхронизировано ({snapshot.get('updated_at')})", flush=True)
-            return True
-        print(f"[GIST SAVE] HTTP {res.status_code}: {res.text[:240]}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[GIST SAVE ERROR] {e}", flush=True)
-        return False
-
-def _gist_flusher_loop():
-    """Фоновая отправка в Gist с дебаунсом — не блокирует LongPoll."""
-    global _gist_dirty, _gist_last_push
-    while True:
-        time.sleep(1.0)
-        with _gist_sync_lock:
-            if not _gist_dirty:
-                continue
-            if time.time() - _gist_last_push < GIST_DEBOUNCE_SEC:
-                continue
-            _gist_dirty = False
-        try:
-            with _state_lock:
-                snap = _snapshot_bot_state()
-            ok = _push_state_to_gist(snap)
-            with _gist_sync_lock:
-                _gist_last_push = time.time()
-                if not ok:
-                    # повторим позже
-                    _gist_dirty = True
-        except Exception as e:
-            print(f"[GIST FLUSHER ERROR] {e}", flush=True)
-            with _gist_sync_lock:
-                _gist_dirty = True
-
-def ensure_gist_worker():
-    global _gist_worker_started
-    if _gist_worker_started:
-        return
-    if not (GITHUB_TOKEN and GIST_ID):
-        return
-    t = threading.Thread(target=_gist_flusher_loop, name='gist-flusher', daemon=True)
-    t.start()
-    _gist_worker_started = True
-    print("[GIST] Фоновая синхронизация запущена", flush=True)
-
-def load_bot_state():
-    """
-    Приоритет:
-    1) GitHub Gist (если заданы GITHUB_TOKEN + GIST_ID)
-    2) локальный bot_data.json
-    3) legacy contests.json / отдельные файлы
-    """
-    global _BOT_STATE_SOURCE
-    data = None
-    source = 'empty'
-
-    if GITHUB_TOKEN and GIST_ID:
-        data = _fetch_state_from_gist()
-        if data:
-            source = 'gist'
-
-    if data is None:
-        local = load_json(BOT_DATA_FILE, None)
-        if isinstance(local, dict) and (local.get('scores') is not None or local.get('state') is not None):
-            data = _normalize_bot_state(local)
-            source = 'local_bot_data'
-
-    if data is None:
-        legacy = load_json(CONTESTS_FILE, None)
-        if isinstance(legacy, dict) and ('state' in legacy or 'scores' in legacy or 'meta' in legacy):
-            data = _normalize_bot_state(legacy)
-            source = 'legacy_contests'
-        else:
-            data = _normalize_bot_state({
-                'state': load_json(CONTEST_FILE, {}),
-                'scores': load_json(SCORES_FILE, {}),
-                'meta': {},
-            })
-            source = 'legacy_split'
-
-    _BOT_STATE_SOURCE = source
-    print(
-        f"[BOT STATE] source={source}; scores={len(data['scores'])}, "
-        f"quizzes={len(data['state'])}, meta_keys={list(data['meta'].keys())}",
-        flush=True,
-    )
-    return data
-
-def save_bot_state(sync_gist=True):
-    """
-    Пишет локальный bot_data.json сразу; Gist обновляет в фоне (debounce).
-    Не бросает исключения наружу — сбои сети не роняют LongPoll.
-    """
-    global _gist_dirty
-    try:
-        with _state_lock:
-            snap = _snapshot_bot_state()
-        save_json(BOT_DATA_FILE, snap)
-        # Дублируем в contests.json для обратной совместимости
-        save_json(CONTESTS_FILE, {
-            'state': snap['state'],
-            'scores': snap['scores'],
-            'meta': snap['meta'],
-        })
-        if sync_gist and GITHUB_TOKEN and GIST_ID:
-            ensure_gist_worker()
-            with _gist_sync_lock:
-                _gist_dirty = True
-    except Exception as e:
-        print(f"[BOT STATE SAVE ERROR] {e}", flush=True)
-
-def load_contests():
-    """Совместимость: загружает единое состояние бота."""
-    return load_bot_state()
-
-def save_contests():
-    """Совместимость: любое изменение прогресса → локально + Gist."""
-    save_bot_state(sync_gist=True)
-
-ELEMENT_CACHE  = load_json(ELEMENT_CACHE_FILE, {})
-_contests_data = load_bot_state()
-CHAT_SCORES    = _contests_data['scores']
-CONTEST_STATE  = _contests_data['state']
-CONTEST_META   = _contests_data.get('meta') or {}
-CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
-CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
-# Локальный кэш всегда; в Gist на старте пушим только миграцию legacy → облако
-# (не затираем Gist пустым снимком, если GET временно упал)
-save_bot_state(sync_gist=False)
-if _BOT_STATE_SOURCE.startswith('legacy') or _BOT_STATE_SOURCE == 'local_bot_data':
-    if GITHUB_TOKEN and GIST_ID and (CHAT_SCORES or CONTEST_STATE or CONTEST_META):
-        save_bot_state(sync_gist=True)
-ensure_gist_worker()
-
-# FIX: Белый список из env-переменной — переживает рестарт Render (эфемерный диск).
-# Формат: CONTEST_CHATS=2000000001,2000000002 (через запятую).
-# Команды !конкурс +/- продолжают работать (меняют файл), но при рестарте env переопределяет.
-_env_chats = os.environ.get("CONTEST_CHATS", "")
-if _env_chats:
-    CONTEST_CHATS = [int(c.strip()) for c in _env_chats.split(",") if c.strip().isdigit()]
-    save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
-
-print(f"[CACHE] Стихий: {len(ELEMENT_CACHE)}, Чатов в конкурсе: {len(CONTEST_CHATS)}", flush=True)
-
-# ==================== ИНДЕКС САЙТА ====================
-
-def update_site_files_index():
-    global SITE_FILES_INDEX
-    try:
-        res = requests.get("https://ep-ccg.ru", headers=BROWSER_HEADERS, timeout=10)
-        if res.status_code == 200:
-            links = re.findall(r'(?:href|src|data-src|data-lazy-src)__?="([^"]+\.webp)"', res.text, re.IGNORECASE)
-            found = list(set([l.split('/')[-1] for l in links]))
-            if found:
-                with INDEX_LOCK:
-                    SITE_FILES_INDEX = found
-                print(f"Индекс обновлён! Карт: {len(SITE_FILES_INDEX)}", flush=True)
-    except Exception as e:
-        print(f"Ошибка индекса: {e}", flush=True)
-
-def get_smart_filename(target_filename):
-    if not SITE_FILES_INDEX:
-        return target_filename
-    matches = difflib.get_close_matches(target_filename, SITE_FILES_INDEX, n=1, cutoff=0.75)
-    return matches[0] if matches else target_filename
-
-def to_lat(text):
-    cleaned = text.replace(" ", "-").replace("_", "-")
-    return "".join(RULES.get(c, c) for c in cleaned)
-
-# ==================== API-ПОИСК КАРТЫ ====================
-
-def resolve_card_meta(card_name_ru):
-    key = card_name_ru.strip().lower()
-    with CACHE_LOCK:
-        if key in CARD_META_CACHE:
-            return CARD_META_CACHE[key]
-
-    def _extract_card(card):
-        element_key = 'nejtraly'
-        for cls in card.get('class_list', []):
-            m = re.match(r'mmf_element-(\w+)', cls)
-            if m:
-                element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
-                break
-        slug = card.get('slug', to_lat(key))
-        media_id = card.get('featured_media')
-        return (slug, media_id, element_key)
-
-    # 1. Поиск по slug — точное совпадение (надёжнее для новых карт)
-    slug_candidate = to_lat(key)
-    try:
-        res = requests.get(
-            "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-            params={'slug': slug_candidate, '_fields': 'id,featured_media,title,class_list,slug'},
-            headers=BROWSER_HEADERS, timeout=7
-        )
-        if res.status_code == 200 and res.text.strip():
-            data = res.json()
-            if data and isinstance(data, list) and len(data) > 0:
-                result = _extract_card(data[0])
-                with CACHE_LOCK:
-                    CARD_META_CACHE[key] = result
-                ELEMENT_CACHE[result[0]] = result[2]
-                save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
-                return result
-    except Exception as e:
-        print(f"[META SLUG ERROR] {card_name_ru}: {e}", flush=True)
-
-    # 2. Полнотекстовый поиск с увеличенным лимитом
-    try:
-        res = requests.get(
-            "https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-            params={'search': card_name_ru, 'per_page': 50, '_fields': 'id,featured_media,title,class_list,slug'},
-            headers=BROWSER_HEADERS, timeout=7
-        )
-        if res.status_code != 200 or not res.text.strip():
-            return None
-        data = res.json()
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return None
-        target = key
-        card = None
-        for c in data:
-            if c.get('title', {}).get('rendered', '').strip().lower() == target:
-                card = c
-                break
-        if not card:
-            card = data[0]
-        result = _extract_card(card)
-        with CACHE_LOCK:
-            CARD_META_CACHE[key] = result
-        ELEMENT_CACHE[result[0]] = result[2]
-        save_json(ELEMENT_CACHE_FILE, ELEMENT_CACHE)
-        return result
-    except Exception as e:
-        print(f"[META ERROR] {card_name_ru}: {e}", flush=True)
-    return None
-
-def download_card_image_fast(card_name_ru):
-    key = card_name_ru.strip().lower()
-    with CACHE_LOCK:
-        if key in CARD_IMAGE_CACHE:
-            return CARD_IMAGE_CACHE[key]
-    meta = resolve_card_meta(card_name_ru)
-    if not meta:
-        return None, None
-    slug, media_id, element_key = meta
-    if not media_id:
-        return None, element_key
-    try:
-        media_res = requests.get(f"https://ep-ccg.ru/wp-json/wp/v2/media/{media_id}",
-                                 params={'_fields': 'source_url'}, headers=BROWSER_HEADERS, timeout=7)
-        if media_res.status_code != 200:
-            return None, element_key
-        image_url = media_res.json().get('source_url')
-        if not image_url:
-            return None, element_key
-        img_res = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        if img_res.status_code == 200:
-            result = (img_res.content, element_key)
-            with CACHE_LOCK:
-                CARD_IMAGE_CACHE[key] = result
-            return result
-    except Exception as e:
-        print(f"[IMG DOWNLOAD ERROR] {card_name_ru}: {e}", flush=True)
-    return None, element_key
-
-# ==================== СТИХИЯ КАРТЫ ====================
-
-def get_card_element(card_name_ru):
-    slug = to_lat(card_name_ru.strip().lower())
-    if slug in ELEMENT_CACHE:
-        return ELEMENT_CACHE[slug]
-    meta = resolve_card_meta(card_name_ru)
-    if meta:
-        return meta[2]
-    if slug not in ELEMENT_CACHE:
-        ELEMENT_CACHE[slug] = 'nejtraly'
-    return ELEMENT_CACHE[slug]
-
-# ==================== ЗАГРУЗКА КАРТ (FALLBACK) ====================
-
-POSSIBLE_PATHS = [
-    "wp-content/uploads/2026/08/", "wp-content/uploads/2026/07/",
-    "wp-content/uploads/2026/06/", "wp-content/uploads/2026/05/",
-    "wp-content/uploads/", "wp-content/uploads/2024/06/", "wp-content/uploads/2024/05/",
-]
-
-def fetch_photo(path, full_filename, headers):
-    photo_url = urljoin("https://ep-ccg.ru", f"{path.strip('/')}/{full_filename}")
-    try:
-        res = requests.get(photo_url, headers=headers, timeout=4)
-        if res.status_code == 200:
-            return res.content
-    except:
-        pass
-    return None
-
-def _try_fetch_filename(filename, headers):
-    with ThreadPoolExecutor(max_workers=len(POSSIBLE_PATHS)) as executor:
-        futures = [executor.submit(fetch_photo, path, filename, headers) for path in POSSIBLE_PATHS]
-        for future in as_completed(futures):
-            content = future.result()
-            if content:
-                return content
-    return None
-
-def download_card_image(card_name_ru, prefix="bgo-"):
-    img, elem = download_card_image_fast(card_name_ru)
-    if img:
-        return img
-    cleaned = card_name_ru.strip().lower()
-    lat = to_lat(cleaned)
-    ideal = prefix + lat + ".webp"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    content = _try_fetch_filename(ideal, headers)
-    if content:
-        return content
-    smart = get_smart_filename(ideal)
-    if smart != ideal:
-        content = _try_fetch_filename(smart, headers)
-        if content:
-            return content
-    return None
-
-# ==================== ШРИФТ ====================
-
-def get_font(size):
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]
-    for path in font_paths:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except:
-                pass
-    return ImageFont.load_default()
-
-# ==================== СБОРКА ИЗОБРАЖЕНИЯ КОЛОДЫ ====================
-
-CARD_W, CARD_H = 480, 64
-COST_W, COUNT_W, BORDER_W, PADDING = 44, 64, 8, 5
-HEADER_H = 80
-PANEL_COLOR     = (17, 17, 17)
-HEADER_COLOR    = (241, 196, 15)
-SUBHEADER_COLOR = (85, 85, 85)
-COUNTER_OK      = (39, 174, 96)
-COUNTER_ERR     = (231, 76, 60)
-TEXT_WHITE      = (255, 255, 255)
-TEXT_BLACK      = (0, 0, 0)
-
-ELEMENT_DATA = {
-    'stepi':    {'color': (241, 196,  15), 'text': (0, 0, 0),     'alpha': (180, 150,   0)},
-    'gory':     {'color': ( 41, 128, 185), 'text': (255,255,255), 'alpha': ( 20,  80, 160)},
-    'boloto':   {'color': (168, 213, 162), 'text': (0, 0, 0),     'alpha': (100, 170, 100)},
-    'les':      {'color': ( 39, 174,  96), 'text': (255,255,255), 'alpha': ( 15, 110,  50)},
-    'tma':      {'color': (142,  68, 173), 'text': (255,255,255), 'alpha': ( 80, 20, 120)},
-    'nejtraly': {'color': (205, 127,  50), 'text': (255,255,255), 'alpha': (130,  80,  20)},
-}
-DEFAULT_ELEMENT = ELEMENT_DATA['nejtraly']
-
-def _make_gradient_overlay(width, height, elem_alpha_rgb):
-    grad_line = Image.new("RGBA", (width, 1), (0, 0, 0, 0))
-    for x in range(width):
-        t = x / max(1, width - 1)
-        if t < 0.45:
-            lt = t / 0.45
-            r = int(elem_alpha_rgb[0] * (1 - lt))
-            g = int(elem_alpha_rgb[1] * (1 - lt))
-            b = int(elem_alpha_rgb[2] * (1 - lt))
-            a = int((0.93 * (1 - lt) + 0.55 * lt) * 255)
-        else:
-            lt = (t - 0.45) / 0.55
-            r, g, b = 0, 0, 0
-            a = int((0.55 * (1 - lt) + 0.05 * lt) * 255)
-        grad_line.putpixel((x, 0), (r, g, b, a))
-    return grad_line.resize((width, height))
-
-def build_deck_image(hero_name, total_cards, max_cards, cards):
-    font_hero    = get_font(22)
-    font_counter = get_font(20)
-    font_cost    = get_font(22)
-    font_title   = get_font(18)
-    font_count   = get_font(18)
-
-    img_h = HEADER_H + len(cards) * (CARD_H + PADDING) + PADDING
-    canvas = Image.new("RGB", (CARD_W, img_h), PANEL_COLOR)
-    draw = ImageDraw.Draw(canvas)
-
-    draw.text((14, 12), hero_name, font=font_hero, fill=HEADER_COLOR)
-    counter_text = f"Карт: {total_cards} / {max_cards}"
-    counter_color = COUNTER_ERR if total_cards > max_cards else (COUNTER_OK if total_cards >= 40 else SUBHEADER_COLOR)
-    draw.text((14, 44), counter_text, font=font_counter, fill=counter_color)
-
-    y = HEADER_H
-    for cost, name, count, img_bytes, element_key in cards:
-        row_y = y
-        ed = ELEMENT_DATA.get(element_key, DEFAULT_ELEMENT)
-        elem_color, elem_text = ed['color'], ed['text']
-        elem_alpha_rgb = ed['alpha']
-
-        row_bg = Image.new("RGB", (CARD_W, CARD_H), PANEL_COLOR)
-        if img_bytes:
-            try:
-                card_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                zw, zh = int(card_img.width * 1.6), int(card_img.height * 1.6)
-                card_img = card_img.resize((zw, zh), Image.Resampling.BILINEAR)
-                left = max(0, min(zw // 2 - CARD_W // 2, zw - CARD_W))
-                top  = max(0, min(int(zh * 0.30) - CARD_H // 2, zh - CARD_H))
-                row_bg = card_img.crop((left, top, left + CARD_W, top + CARD_H))
-            except:
-                pass
-
-        overlay = _make_gradient_overlay(CARD_W, CARD_H, elem_alpha_rgb)
-        row_rgba = row_bg.convert("RGBA")
-        row_rgba = Image.alpha_composite(row_rgba, overlay)
-        canvas.paste(row_rgba.convert("RGB"), (0, row_y))
-
-        draw.rectangle([0, row_y, BORDER_W, row_y + CARD_H - 1], fill=elem_color)
-
-        cost_str = str(cost)
-        bbox = draw.textbbox((0, 0), cost_str, font=font_cost)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        cost_x = BORDER_W + (COST_W - tw) // 2 - bbox[0]
-        cost_y = row_y + (CARD_H - th) // 2 - bbox[1] - 1
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]:
-            draw.text((cost_x + dx, cost_y + dy), cost_str, font=font_cost, fill=TEXT_BLACK)
-        draw.text((cost_x, cost_y), cost_str, font=font_cost, fill=TEXT_WHITE)
-
-        title_x = BORDER_W + COST_W + 4
-        title_max_w = CARD_W - title_x - COUNT_W
-        title = name
-        if draw.textlength(title, font=font_title) > title_max_w:
-            ellipsis_w = draw.textlength("…", font=font_title)
-            while len(title) > 1 and draw.textlength(title, font=font_title) + ellipsis_w > title_max_w:
-                title = title[:-1]
-            title = title + "…"
-        bbox_t = draw.textbbox((0, 0), title, font=font_title)
-        title_y = row_y + (CARD_H - (bbox_t[3] - bbox_t[1])) // 2 - bbox_t[1] - 1
-        draw.text((title_x + 1, title_y + 1), title, font=font_title, fill=TEXT_BLACK)
-        draw.text((title_x, title_y), title, font=font_title, fill=TEXT_WHITE)
-
-        count_x = CARD_W - COUNT_W
-        draw.rectangle([count_x, row_y, CARD_W, row_y + CARD_H], fill=elem_color)
-        count_str = f"{count}x"
-        bbox_c = draw.textbbox((0, 0), count_str, font=font_count)
-        cw, ch = bbox_c[2] - bbox_c[0], bbox_c[3] - bbox_c[1]
-        cx = count_x + (COUNT_W - cw) // 2 - bbox_c[0]
-        cy = row_y + (CARD_H - ch) // 2 - bbox_c[1] - 1
-        draw.text((cx, cy), count_str, font=font_count, fill=elem_text)
-
-        y += CARD_H + PADDING
-
-    output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=85)
-    return output.getvalue()
-
-# ==================== ДЕКОДИРОВАНИЕ КОЛОДЫ (BHD1 / Base64) ====================
-
-def _element_from_list(elements):
-    for el in elements or []:
-        key = API_ELEMENT_MAP.get(str(el).strip().lower())
-        if key:
-            return key
-        low = str(el).strip().lower()
-        if low in ELEMENT_DATA:
-            return low
-    return 'nejtraly'
-
-def ensure_game_db(force=False):
-    """Локальная база героев/карт по game_id из /wp-json/berserk/v1/data."""
-    with _GAME_DB_LOCK:
-        age = time.time() - _GAME_DB['loaded_at']
-        if not force and _GAME_DB['heroes'] and age < GAME_DB_TTL:
-            return _GAME_DB
-    try:
-        res = requests.get(BERSERK_DATA_URL, headers=BROWSER_HEADERS, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        heroes, cards, by_title = {}, {}, {}
-        for h in data.get('heroes') or []:
-            gid = str(h.get('game_id') or '').strip().lower()
-            if gid:
-                heroes[gid] = h
-            title = str(h.get('title') or '').strip().lower()
-            if title:
-                by_title[title] = h
-        for c in data.get('cards') or []:
-            gid = str(c.get('game_id') or '').strip().lower()
-            if gid:
-                cards[gid] = c
-            title = str(c.get('title') or '').strip().lower()
-            if title and title not in by_title:
-                by_title[title] = c
-        with _GAME_DB_LOCK:
-            _GAME_DB['heroes'] = heroes
-            _GAME_DB['cards'] = cards
-            _GAME_DB['by_title'] = by_title
-            _GAME_DB['loaded_at'] = time.time()
-            print(f"[GAME DB] героев={len(heroes)}, карт={len(cards)}", flush=True)
-            return {
-                'heroes': heroes,
-                'cards': cards,
-                'by_title': by_title,
-                'loaded_at': _GAME_DB['loaded_at'],
-            }
-    except Exception as e:
-        print(f"[GAME DB ERROR] {e}", flush=True)
-        with _GAME_DB_LOCK:
-            return {
-                'heroes': dict(_GAME_DB['heroes']),
-                'cards': dict(_GAME_DB['cards']),
-                'by_title': dict(_GAME_DB['by_title']),
-                'loaded_at': _GAME_DB['loaded_at'],
-            }
-
-def looks_like_deck_base64(text):
-    """Грубая проверка: одна строка Base64 кода колоды BHD1."""
-    if not text:
-        return False
-    s = text.strip()
-    if '\n' in s or ' ' in s:
-        s = re.sub(r'\s+', '', s)
-    if not (24 <= len(s) <= 1024):
-        return False
-    if not re.fullmatch(r'[A-Za-z0-9+/=]+', s):
-        return False
-    # BHD1 в Base64 почти всегда начинается с QkhEM
-    return s.startswith('QkhEM') or s.startswith('QkhE')
-
-def decode_deck_bhd1(code):
-    """
-    Распаковка официального кода колоды BHD1 (decodeDeck с dekbilder):
-    signature(4) + hero_id(8) + count(1) + N*(card_id(8)+qty(1)) + crc32(4).
-    """
-    trimmed = re.sub(r'\s+', '', str(code or '').strip())
-    if not (24 <= len(trimmed) <= 1024):
-        raise ValueError('Неверная длина кода')
-    try:
-        raw = base64.b64decode(trimmed)
-    except Exception:
-        raise ValueError('Код не является Base64')
-    data = bytearray(raw)
-    if len(data) < 17 or len(data) > 4 + 8 + 1 + 80 * 9 + 4:
-        raise ValueError('Неверный размер данных')
-    crc_pos = len(data) - 4
-    stored_crc = int.from_bytes(data[crc_pos:crc_pos + 4], 'little')
-    calc_crc = zlib.crc32(bytes(data[:crc_pos])) & 0xFFFFFFFF
-    if stored_crc != calc_crc:
-        raise ValueError('Не сходится контрольная сумма')
-    if bytes(data[:4]) != BH_SIGNATURE:
-        raise ValueError('Это не код колоды BHD1')
-
-    def read_id(pos):
-        low = int.from_bytes(data[pos:pos + 4], 'little')
-        high = int.from_bytes(data[pos + 4:pos + 8], 'little')
-        if low == 0 and high == 0:
-            raise ValueError('Пустой ID карты')
-        if high != BH_ID_HIGH:
-            raise ValueError('Неизвестный формат ID карты')
-        return f'{low:08x}', pos + 8
-
-    pos = 4
-    hero_id, pos = read_id(pos)
-    count = data[pos]
-    pos += 1
-    if count > 80:
-        raise ValueError('Слишком много карт')
-    if len(data) != 13 + count * 9 + 4:
-        raise ValueError('Неверный размер данных')
-    entries = []
-    seen = set()
-    for _ in range(count):
-        cid, pos = read_id(pos)
-        n = data[pos]
-        pos += 1
-        if n < 1 or n > 10:
-            raise ValueError(f'Неверное количество карты {cid}')
-        if cid in seen:
-            raise ValueError(f'Карта {cid} указана дважды')
-        seen.add(cid)
-        entries.append((cid, int(n)))
-    return {'hero': hero_id, 'entries': entries, 'code': trimmed}
-
-def download_image_url(url):
-    if not url:
-        return None
-    try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        if res.status_code == 200 and res.content:
-            return res.content
-    except Exception as e:
-        print(f"[IMG URL ERROR] {url}: {e}", flush=True)
-    return None
-
-def _meta_from_game_card(card):
-    title = str((card or {}).get('title') or '???').strip() or '???'
-    cost = (card or {}).get('cost')
-    try:
-        cost = int(cost)
-    except Exception:
-        cost = 0
-    element = _element_from_list((card or {}).get('elements'))
-    image_url = (card or {}).get('image') or ''
-    return title, cost, element, image_url
-
-def deck_entries_to_card_rows(decoded):
-    """game_id + count -> строки для build_deck_image: (cost, name, count, img_bytes, element)."""
-    db = ensure_game_db()
-    hero_meta = db['heroes'].get(decoded['hero']) or {}
-    hero_name = str(hero_meta.get('title') or f"Герой {decoded['hero']}").strip()
-
-    def load_one(item):
-        gid, count = item
-        card = db['cards'].get(gid) or db['heroes'].get(gid) or {}
-        title, cost, element, image_url = _meta_from_game_card(card)
-        img = download_image_url(image_url)
-        if not img and title and title != '???':
-            img, el2 = download_card_image_fast(title)
-            if el2 and (not element or element == 'nejtraly'):
-                element = el2
-            if not img:
-                img = download_card_image(title, prefix="bgo-")
-        if not title or title == '???':
-            title = f"ID {gid}"
-        return cost, title, count, img, element or 'nejtraly'
-
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        rows = list(executor.map(load_one, decoded['entries']))
-    rows.sort(key=lambda x: (x[0], x[1]))
-    total = sum(c for _, _, c, _, _ in rows)
-    return hero_name, total, rows
-
-def render_deck_image_from_base64(code):
-    decoded = decode_deck_bhd1(code)
-    hero_name, total, rows = deck_entries_to_card_rows(decoded)
-    if not rows:
-        raise ValueError('В колоде нет карт')
-    img_bytes = build_deck_image(hero_name, total, 60, rows)
-    return img_bytes, hero_name, total, decoded
-
-def fetch_public_decks(force=False):
-    with _PUBLIC_DECKS_LOCK:
-        age = time.time() - _PUBLIC_DECKS_CACHE['loaded_at']
-        if not force and _PUBLIC_DECKS_CACHE['items'] and age < PUBLIC_DECKS_TTL:
-            return list(_PUBLIC_DECKS_CACHE['items'])
-    res = requests.get(PUBLIC_DECKS_URL, headers=BROWSER_HEADERS, timeout=30)
-    res.raise_for_status()
-    items = res.json()
-    if not isinstance(items, list):
-        raise ValueError('Некорректный ответ API публичных колод')
-    with _PUBLIC_DECKS_LOCK:
-        _PUBLIC_DECKS_CACHE['items'] = items
-        _PUBLIC_DECKS_CACHE['loaded_at'] = time.time()
-    print(f"[PUBLIC DECKS] загружено {len(items)} колод", flush=True)
-    return list(items)
-
-def find_best_public_deck(hero_query):
-    """Фильтр по герою, сортировка: лайки ↓, дата обновления ↓; предпочтение колод с game_code."""
-    q = (hero_query or '').strip().lower()
-    if not q:
-        return None
-    decks = fetch_public_decks()
-    matched = []
-    for d in decks:
-        hero_title = ''
-        dj = d.get('deck_json') or {}
-        if isinstance(dj, dict):
-            hero_title = str(dj.get('heroTitle') or '')
-        if q in hero_title.lower() or hero_title.lower() in q or q == hero_title.lower():
-            matched.append(d)
-    if not matched:
-        # мягкий поиск по вхождению
-        matched = [
-            d for d in decks
-            if q in str(((d.get('deck_json') or {}).get('heroTitle') or '')).lower()
-        ]
-    if not matched:
-        return None
-
-    def sort_key(d):
-        likes = int(d.get('likes') or 0)
-        updated = int(d.get('updated_at') or 0)
-        has_code = 1 if str(d.get('game_code') or '').strip() else 0
-        return (has_code, likes, updated)
-
-    matched.sort(key=sort_key, reverse=True)
-    return matched[0]
-
-def build_rows_from_deck_json(deck_json, hero_fallback=''):
-    """Fallback: группировка карт из deck_json, если game_code пуст."""
-    dj = deck_json or {}
-    hero_name = str(dj.get('heroTitle') or hero_fallback or 'Колода').strip()
-    cards = dj.get('cards') or []
-    grouped = {}
-    for c in cards:
-        key = str(c.get('id') or c.get('title') or '').strip()
-        if not key:
-            continue
-        if key not in grouped:
-            grouped[key] = {
-                'title': str(c.get('title') or '???'),
-                'cost': c.get('cost') or 0,
-                'count': 0,
-                'image': c.get('image') or '',
-                'elements': c.get('elements') or [],
-                'game_id': str(c.get('game_id') or '').strip().lower(),
-            }
-        grouped[key]['count'] += 1
-
-    def load_one(item):
-        meta = item
-        title = meta['title']
-        try:
-            cost = int(meta['cost'])
-        except Exception:
-            cost = 0
-        element = _element_from_list(meta['elements'])
-        img = download_image_url(meta['image'])
-        if not img:
-            img, el2 = download_card_image_fast(title)
-            if el2 and (not element or element == 'nejtraly'):
-                element = el2
-            if not img:
-                img = download_card_image(title, prefix="bgo-")
-        return cost, title, meta['count'], img, element or 'nejtraly'
-
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        rows = list(executor.map(load_one, grouped.values()))
-    rows.sort(key=lambda x: (x[0], x[1]))
-    total = sum(c for _, _, c, _, _ in rows)
-    return hero_name, total, rows
-
-def format_deck_caption(deck_obj, game_code=''):
-    name = str(deck_obj.get('name') or 'Колода').strip()
-    author = str(deck_obj.get('author') or '—').strip()
-    is_pro = bool(deck_obj.get('is_pro') or deck_obj.get('author_is_pro'))
-    pro_mark = " ✅PRO" if is_pro else ""
-    deck_id = deck_obj.get('id')
-    link = DECK_VIEW_URL.format(deck_id) if deck_id else "https://ep-ccg.ru/publichnye-kolody/"
-    hero = str(((deck_obj.get('deck_json') or {}).get('heroTitle')) or '').strip()
-    likes = int(deck_obj.get('likes') or 0)
-    lines = [
-        f"🃏 {name}",
-        f"🐉 Герой: {hero}" if hero else None,
-        f"👤 Автор: {author}{pro_mark}",
-        f"❤️ Лайков: {likes}",
-        f"🔗 {link}",
-    ]
-    code = (game_code or deck_obj.get('game_code') or '').strip()
-    if code:
-        lines.append("")
-        lines.append("📋 Код колоды:")
-        lines.append(code)
-    return "\n".join(x for x in lines if x is not None)
-
-def send_deck_image(vk_session, peer_id, img_bytes, message=' '):
-    attachment = upload_and_get_attachment(vk_session, img_bytes, 'deck.jpg', peer_id)
-    vk_session.method('messages.send', {
-        'peer_id': peer_id,
-        'message': message or ' ',
-        'attachment': attachment,
-        'random_id': rnd_id(),
-    })
-    return attachment
-
-# ==================== ОТПРАВКА КАРТИНОК В ВК ====================
-
-def trim_card_margins(img, padding=10):
-    """Убирает внешнюю пустоту через getbbox(), сохраняя рамку с отступом padding."""
-    img = img.convert("RGBA")
-    w, h = img.size
-    bbox = img.getbbox()
-    if not bbox:
-        return img
-    left = max(0, bbox[0] - padding)
-    top = max(0, bbox[1] - padding)
-    right = min(w, bbox[2] + padding)
-    bottom = min(h, bbox[3] + padding)
-    return img.crop((left, top, right, bottom))
-
-def prepare_card_square_jpeg(photo_content, max_side=800):
-    """Белый квадрат со целой пропорциональной картой по центру (без растягивания)."""
-    img = Image.open(io.BytesIO(photo_content))
-    img = trim_card_margins(img, padding=10)
-    if img.width < 2 or img.height < 2:
-        raise ValueError("Карта пустая после обрезки полей")
-
-    card_w, card_h = img.size
-
-    # Квадратный холст: высота карты + поля, но не больше max_side
-    square_side = card_h + 40
-    if square_side > max_side:
-        square_side = max_side
-    elif square_side < 400:
-        square_side = min(max_side, max(400, square_side))
-
-    # Пропорциональный масштаб под высоту квадрата (без искажений)
-    scale = square_side / card_h
-    new_w = max(1, int(round(card_w * scale)))
-    new_h = square_side
-    # Если после масштаба карта шире квадрата — чуть уменьшаем, чтобы влезла целиком
-    if new_w > square_side:
-        scale = square_side / card_w
-        new_w = square_side
-        new_h = max(1, int(round(card_h * scale)))
-
-    img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-
-    canvas = Image.new("RGB", (square_side, square_side), (255, 255, 255))
-    paste_x = (square_side - new_w) // 2
-    paste_y = (square_side - new_h) // 2
-    if img.mode == "RGBA":
-        canvas.paste(img, (paste_x, paste_y), img)
-    else:
-        canvas.paste(img.convert("RGB"), (paste_x, paste_y))
-
-    output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=90)
-    return output.getvalue()
-
-def upload_and_get_attachment(vk_session, img_bytes, filename, peer_id):
-    last_error = None
-    for attempt in range(5):
-        try:
-            up_srv = vk_session.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
-            upload_url = up_srv['response']['upload_url'] if 'response' in up_srv else up_srv['upload_url']
-            upload_resp = requests.post(upload_url, files={'photo': (filename, img_bytes, 'image/jpeg')}, timeout=30).json()
-            photo_val = upload_resp.get('photo')
-            if not photo_val or photo_val == '[]':
-                last_error = f"empty photo: {upload_resp}"
-                time.sleep(2 + attempt * 2)
-                continue
-            save_resp = vk_session.method('photos.saveMessagesPhoto', {
-                'photo': upload_resp.get('photo', ''), 'server': upload_resp.get('server', ''), 'hash': upload_resp.get('hash', '')
-            })
-            actual_data = save_resp['response'] if 'response' in save_resp else save_resp
-            return f"photo{actual_data[0]['owner_id']}_{actual_data[0]['id']}"
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2 + attempt * 2)
-    raise RuntimeError(f"Upload failed: {last_error}")
-
-# ==================== КОНКУРС «УГАДАЙ КАРТУ» ====================
-
-def get_random_card():
-    try:
-        res = requests.get("https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-                            params={'per_page': 1, '_fields': 'id'},
-                            headers=BROWSER_HEADERS, timeout=10)
-        if res.status_code != 200:
-            return None
-        total = int(res.headers.get('X-WP-Total', '0'))
-        if total == 0:
-            return None
-        offset = random.randint(0, total - 1)
-        res = requests.get("https://ep-ccg.ru/wp-json/wp/v2/mmf_card",
-                           params={'per_page': 1, 'offset': offset,
-                                   '_fields': 'id,title,featured_media,class_list,content,slug'},
-                           headers=BROWSER_HEADERS, timeout=10)
-        if res.status_code == 200 and res.json():
-            return res.json()[0]
-    except Exception as e:
-        print(f"[RANDOM CARD ERROR] {e}", flush=True)
-    return None
-
-def _parse_card_type(class_list):
-    for cls in class_list or []:
-        m = re.match(r'mmf_(?:type|card_type)-(\w+)', str(cls), re.I)
-        if m:
-            t = m.group(1).lower()
-            if t in TYPE_NAMES_RU:
-                return t
-        low = str(cls).lower()
-        for key in TYPE_NAMES_RU:
-            if key in low:
-                return key
-    return ''
-
-def _lookup_game_card_by_title(card_name):
-    try:
-        db = ensure_game_db()
-        return db['by_title'].get((card_name or '').strip().lower()) or {}
-    except Exception:
-        return {}
-
-def make_contest_crop(img_bytes, clue_type, center_rel=None, size_ratio=0.22):
-    """
-    Кроп фрагмента карты.
-    size_ratio — доля min(w,h), старт ~20-25%.
-    center_rel — (cx, cy) в долях [0..1]; если None, выбирается случайно и возвращается.
-    """
-    try:
-        if clue_type == "fragment":
-            base = Image.open(io.BytesIO(img_bytes)).convert("L")
-        else:
-            base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        zw, zh = max(1, int(base.width * 2.5)), max(1, int(base.height * 2.5))
-        img = base.resize((zw, zh), Image.Resampling.BILINEAR)
-        if clue_type == "blur":
-            img = img.filter(ImageFilter.GaussianBlur(radius=18))
-
-        crop_size = max(24, int(min(zw, zh) * float(size_ratio)))
-        crop_size = min(crop_size, zw, zh)
-        half = crop_size / 2.0
-
-        if center_rel is None:
-            cx = random.uniform(half / zw, 1.0 - half / zw)
-            cy_max = min(0.60, 1.0 - half / zh)
-            cy_min = half / zh
-            if cy_max <= cy_min:
-                cy = 0.5
-            else:
-                cy = random.uniform(cy_min, cy_max)
-            center_rel = (round(cx, 5), round(cy, 5))
-        else:
-            cx, cy = float(center_rel[0]), float(center_rel[1])
-
-        left = int(round(cx * zw - half))
-        top = int(round(cy * zh - half))
-        left = max(0, min(left, zw - crop_size))
-        top = max(0, min(top, zh - crop_size))
-        cropped = img.crop((left, top, left + crop_size, top + crop_size))
-        resample = Image.Resampling.NEAREST if clue_type == "fragment" else Image.Resampling.BILINEAR
-        cropped = cropped.resize((400, 400), resample)
-        output = io.BytesIO()
-        cropped.save(output, format="JPEG", quality=85 if clue_type == "blur" else 80)
-        return output.getvalue(), center_rel
-    except Exception as e:
-        print(f"[CONTEST CROP ERROR] {e}", flush=True)
-        return None, center_rel
-
-def make_blur_crop(img_bytes, center_rel=None, size_ratio=0.22):
-    return make_contest_crop(img_bytes, "blur", center_rel=center_rel, size_ratio=size_ratio)
-
-def make_fragment_crop(img_bytes, center_rel=None, size_ratio=0.20):
-    return make_contest_crop(img_bytes, "fragment", center_rel=center_rel, size_ratio=size_ratio)
-
-def mask_ability_text(card_text, card_name, reveal_ratio=0.22):
-    """Урезанный текст способности без имени карты."""
-    text = re.sub(r'\s+', ' ', (card_text or '').strip())
-    if not text:
-        return "███"
-    if card_name:
-        text = re.sub(re.escape(card_name), '???', text, flags=re.IGNORECASE)
-        # маскируем отдельные слова имени
-        for part in re.findall(r'[A-Za-zА-Яа-яЁё]{3,}', card_name):
-            text = re.sub(re.escape(part), '???', text, flags=re.IGNORECASE)
-    words = text.split()
-    if not words:
-        return "███"
-    keep = max(2, int(len(words) * float(reveal_ratio)))
-    keep = min(keep, len(words))
-    shown = []
-    for i, w in enumerate(words[:keep]):
-        if len(w) <= 3 or w in ('???', '—', '-'):
-            shown.append(w)
-        elif i % 3 == 2:
-            shown.append(w[0] + '█' * max(1, len(w) - 1))
-        else:
-            shown.append(w)
-    suffix = " …███" if keep < len(words) else ""
-    return " ".join(shown) + suffix
-
-def build_text_clue_message(state, hint_level=0, is_hourly=False):
-    ratios = TEXT_REVEAL_RATIOS
-    reveal = ratios[min(hint_level, len(ratios) - 1)]
-    element = ELEMENT_NAMES_RU.get(state.get('element'), state.get('element') or '—')
-    card_type = TYPE_NAMES_RU.get(state.get('card_type'), state.get('card_type') or '—')
-    cost = state.get('cost')
-    cost_s = str(cost) if cost is not None and cost != '' else '?'
-    ability = mask_ability_text(state.get('card_text'), state.get('card_name'), reveal)
-    reward = int(state.get('reward') or BASE_CONTEST_REWARD)
-    header = "💡 Подсказка!" if is_hourly else "🎯 Угадай карту по описанию!"
-    reward_line = (
-        f"Награда удвоена: +{reward} баллов."
-        if is_hourly else
-        f"Первый правильный ответ — +{reward} баллов. Ответ будет раскрыт в 23:55."
-    )
-    return (
-        f"{header}\n\n"
-        f"💰 Стоимость: {cost_s}\n"
-        f"🌀 Стихия: {element}\n"
-        f"🏷 Тип: {card_type}\n"
-        f"📜 Способность:\n«{ability}»\n\n"
-        f"{reward_line}"
-    )
-
-def _contest_crop_ratio(clue_type, hint_level):
-    table = BLUR_CROP_RATIOS if clue_type == "blur" else FRAGMENT_CROP_RATIOS
-    return table[min(max(int(hint_level), 0), len(table) - 1)]
-
-def fetch_contest_image(state):
-    url = state.get('image_url')
-    if url:
-        img = download_image_url(url)
-        if img:
-            return img
-    name = state.get('card_name')
-    if name:
-        img, _ = download_card_image_fast(name)
-        if img:
-            return img
-        return download_card_image(name, prefix="bgo-")
-    return None
-
-def start_contest(vk_session):
-    global CONTEST_STATE, CLUE_INDEX
-    if not CONTEST_CHATS:
-        print("[CONTEST] Белый список пуст — конкурс не запущен", flush=True)
-        return
-    card = get_random_card()
-    if not card:
-        print("[CONTEST] Не удалось получить карту", flush=True)
-        return
-    card_name = card.get('title', {}).get('rendered', '').strip()
-    card_slug = card.get('slug', '')
-    if not card_name:
-        return
-    element_key = 'nejtraly'
-    for cls in card.get('class_list', []):
-        m = re.match(r'mmf_element-(\w+)', cls)
-        if m:
-            element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
-            break
-    card_type = _parse_card_type(card.get('class_list'))
-    img_bytes = None
-    image_url = None
-    media_id = card.get('featured_media')
-    if media_id:
-        try:
-            media_res = requests.get(f"https://ep-ccg.ru/wp-json/wp/v2/media/{media_id}",
-                                     params={'_fields': 'source_url'}, headers=BROWSER_HEADERS, timeout=7)
-            if media_res.status_code == 200:
-                image_url = media_res.json().get('source_url')
-                if image_url:
-                    img_res = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-                    if img_res.status_code == 200:
-                        img_bytes = img_res.content
-        except Exception:
-            pass
-    content_html = card.get('content', {}).get('rendered', '')
-    card_text = re.sub(r'<[^>]+>', '', content_html).strip()
-
-    game_card = _lookup_game_card_by_title(card_name)
-    cost = game_card.get('cost')
-    try:
-        cost = int(cost) if cost is not None and cost != '' else None
-    except Exception:
-        cost = None
-    if not card_type:
-        card_type = str(game_card.get('type') or '').strip().lower()
-    if not img_bytes and game_card.get('image'):
-        image_url = game_card.get('image') or image_url
-        img_bytes = download_image_url(image_url)
-
-    idx = CLUE_INDEX.get('index', 0) % len(CLUE_TYPES)
-    clue_type = CLUE_TYPES[idx]
-    CLUE_INDEX['index'] = (idx + 1) % len(CLUE_TYPES)
-    save_json(CLUE_INDEX_FILE, CLUE_INDEX)
-    print(f"[CONTEST] Тип подсказки сегодня: {clue_type} (карта: «{card_name}»)", flush=True)
-
-    started = moscow_now().isoformat()
-    center_rel = None
-    if clue_type in ("blur", "fragment") and img_bytes:
-        ratio0 = _contest_crop_ratio(clue_type, 0)
-        _, center_rel = make_contest_crop(img_bytes, clue_type, center_rel=None, size_ratio=ratio0)
-
-    base_state = {
-        'card_name': card_name,
-        'card_slug': card_slug,
-        'element': element_key,
-        'card_type': card_type or '',
-        'cost': cost,
-        'card_text': card_text,
-        'image_url': image_url or '',
-        'started_at': started,
-        'last_hint_at': started,
-        'guessed': False,
-        'revealed': False,
-        'clue_type': clue_type,
-        'reward': BASE_CONTEST_REWARD,
-        'hint_level': 0,
-        'crop_cx': (center_rel[0] if center_rel else None),
-        'crop_cy': (center_rel[1] if center_rel else None),
     }
-
-    new_state = {str(chat_id): dict(base_state) for chat_id in CONTEST_CHATS}
-    CONTEST_STATE = new_state
-    save_contests()
-
-    for chat_id in CONTEST_CHATS:
-        try:
-            send_contest_clue(vk_session, chat_id, CONTEST_STATE[str(chat_id)], img_bytes)
-        except Exception as e:
-            print(f"[CONTEST SEND ERROR] chat={chat_id}: {e}", flush=True)
-
-def send_contest_clue(vk_session, chat_id, state, img_bytes=None, is_hourly=False):
-    clue_type = state.get('clue_type') or 'text'
-    reward = int(state.get('reward') or BASE_CONTEST_REWARD)
-    hint_level = int(state.get('hint_level') or 0)
-    reward_line = (
-        f"Награда удвоена: +{reward} баллов."
-        if is_hourly else
-        f"Первый правильный ответ — +{reward} баллов. Ответ будет раскрыт в 23:55."
-    )
-
-    if clue_type == "text" or not img_bytes:
-        msg = build_text_clue_message(state, hint_level=hint_level, is_hourly=is_hourly)
-        vk_session.method('messages.send', {
-            'peer_id': chat_id, 'message': msg, 'random_id': rnd_id()
-        })
-        return
-
-    center = None
-    if state.get('crop_cx') is not None and state.get('crop_cy') is not None:
-        center = (float(state['crop_cx']), float(state['crop_cy']))
-    ratio = _contest_crop_ratio(clue_type, hint_level)
-    crop, center = make_contest_crop(img_bytes, clue_type, center_rel=center, size_ratio=ratio)
-    if center:
-        state['crop_cx'], state['crop_cy'] = center[0], center[1]
-    if not crop:
-        msg = build_text_clue_message(state, hint_level=hint_level, is_hourly=is_hourly)
-        vk_session.method('messages.send', {
-            'peer_id': chat_id, 'message': msg, 'random_id': rnd_id()
-        })
-        return
-
-    if clue_type == "blur":
-        lead = "💡 Подсказка: более крупный размытый фрагмент!" if is_hourly else "🎯 Угадай карту!"
-        body = (
-            "На картинке — размытый фрагмент арта (увеличен)."
-            if is_hourly else
-            "На картинке — сильно размытый фрагмент арта (~1/4 карты)."
-        )
-    else:
-        lead = "💡 Подсказка: более крупный ч/б фрагмент!" if is_hourly else "🎯 Угадай карту!"
-        body = (
-            "На картинке — увеличенный чёрно-белый фрагмент арта."
-            if is_hourly else
-            "На картинке — мелкий чёрно-белый фрагмент арта."
-        )
-    attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
-    vk_session.method('messages.send', {
-        'peer_id': chat_id,
-        'message': f"{lead}\n\n{body} Что это за карта?\n{reward_line}",
-        'attachment': attachment,
-        'random_id': rnd_id(),
-    })
-
-def normalize_text(text):
-    return re.sub(r'\s+', ' ', text.strip().lower())
-
-def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
-    state = CONTEST_STATE.get(str(peer_id))
-    if not state or state.get('guessed') or state.get('revealed'):
-        return False
-    if normalize_text(text) == normalize_text(state['card_name']):
-        state['guessed'] = True
-        reward = int(state.get('reward') or BASE_CONTEST_REWARD)
-        save_contests()
-        add_score(peer_id, user_id, user_name, reward)
-        vk_session.method('messages.send', {
-            'peer_id': peer_id,
-            'message': f"🎉 {user_name} угадал(а)! Это «{state['card_name']}».\n+{reward} баллов в рейтинг!",
-            'random_id': rnd_id()
-        })
-        try:
-            img, _ = download_card_image_fast(state['card_name'])
-            if img:
-                card_jpeg = prepare_card_square_jpeg(img)
-                attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', peer_id)
-                vk_session.method('messages.send', {
-                    'peer_id': peer_id, 'message': state['card_name'],
-                    'attachment': attachment, 'random_id': rnd_id()
-                })
-        except Exception:
-            pass
-        return True
-    return False
-
-def _parse_iso(ts):
-    if not ts:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(str(ts))
-    except Exception:
-        return None
-
-def process_hourly_contest_hints(vk_session):
-    """Раз в час без ответа: x2 награда + новая подсказка (больший кроп / больше текста)."""
-    now = moscow_now()
-    changed = False
-    for chat_id_str, state in list(CONTEST_STATE.items()):
-        if not state or state.get('guessed') or state.get('revealed'):
-            continue
-        anchor = _parse_iso(state.get('last_hint_at')) or _parse_iso(state.get('started_at'))
-        if not anchor:
-            continue
-        elapsed = (now - anchor).total_seconds()
-        if elapsed < HINT_INTERVAL_SEC:
-            continue
-
-        state['reward'] = int(state.get('reward') or BASE_CONTEST_REWARD) * 2
-        state['hint_level'] = int(state.get('hint_level') or 0) + 1
-        state['last_hint_at'] = now.isoformat()
-        changed = True
-        chat_id = int(chat_id_str)
-        try:
-            img_bytes = None
-            if state.get('clue_type') in ('blur', 'fragment'):
-                img_bytes = fetch_contest_image(state)
-            send_contest_clue(vk_session, chat_id, state, img_bytes=img_bytes, is_hourly=True)
-            print(
-                f"[CONTEST HINT] chat={chat_id} level={state['hint_level']} "
-                f"reward={state['reward']} type={state.get('clue_type')}",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"[CONTEST HINT ERROR] chat={chat_id}: {e}", flush=True)
-            traceback.print_exc()
-    if changed:
-        save_contests()
-
-def end_contest_timeout(vk_session):
-    global CONTEST_STATE
-    changed = False
-    for chat_id_str, state in CONTEST_STATE.items():
-        if not state.get('guessed') and not state.get('revealed'):
-            chat_id = int(chat_id_str)
-            state['revealed'] = True
-            changed = True
-            try:
-                vk_session.method('messages.send', {
-                    'peer_id': chat_id,
-                    'message': f"⏰ Время вышло! Никто не угадал.\nЭто была карта «{state['card_name']}».",
-                    'random_id': rnd_id()
-                })
-                img, _ = download_card_image_fast(state['card_name'])
-                if img:
-                    card_jpeg = prepare_card_square_jpeg(img)
-                    attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', chat_id)
-                    vk_session.method('messages.send', {
-                        'peer_id': chat_id, 'message': state['card_name'],
-                        'attachment': attachment, 'random_id': rnd_id()
-                    })
-            except Exception as e:
-                print(f"[CONTEST TIMEOUT ERROR] chat={chat_id}: {e}", flush=True)
-    if changed:
-        save_contests()
-        print("[CONTEST] Тайм-аут: ответы раскрыты", flush=True)
-
-# ==================== УПРАВЛЕНИЕ БЕЛЫМ СПИСКОМ ЧАТОВ ====================
-
-def is_owner(user_id):
-    return OWNER_ID and user_id == OWNER_ID
-
-def add_contest_chat(peer_id):
-    if peer_id not in CONTEST_CHATS:
-        CONTEST_CHATS.append(peer_id)
-        save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
-        return True
-    return False
-
-def remove_contest_chat(peer_id):
-    if peer_id in CONTEST_CHATS:
-        CONTEST_CHATS.remove(peer_id)
-        save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
-        CONTEST_STATE.pop(str(peer_id), None)
-        save_contests()
-        return True
-    return False
-
-def show_contest_chats(vk_session, peer_id):
-    if not CONTEST_CHATS:
-        msg = "📋 Белый список пуст.\nНапишите «!конкурс +» в чате, чтобы добавить его."
-    else:
-        lines = [f"📋 Чаты в конкурсе ({len(CONTEST_CHATS)}):"]
-        for i, cid in enumerate(CONTEST_CHATS, 1):
-            tag = " ← этот чат" if cid == peer_id else ""
-            lines.append(f"{i}. {cid}{tag}")
-        msg = "\n".join(lines)
-    vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
-
-# ==================== РЕЙТИНГ ЧАТА (С АВТОСБРОСОМ 1-ГО ЧИСЛА) ====================
-
-def reset_chat_scores(chat_id_str, persist=True):
-    if chat_id_str in CHAT_SCORES:
-        for uid in list(CHAT_SCORES[chat_id_str].keys()):
-            if uid != '_reset_month':
-                if isinstance(CHAT_SCORES[chat_id_str][uid], dict):
-                    CHAT_SCORES[chat_id_str][uid]['score'] = 0
-        CHAT_SCORES[chat_id_str]['_reset_month'] = moscow_now().strftime('%Y-%m')
-        if persist:
-            save_contests()
-        print(f"[SCORES] Рейтинг чата {chat_id_str} сброшен (1-е число)", flush=True)
-
-def reset_all_scores(persist=True):
-    if not CHAT_SCORES:
-        return
-    current_month = moscow_now().strftime('%Y-%m')
-    for chat_id_str in list(CHAT_SCORES.keys()):
-        reset_chat_scores(chat_id_str, persist=False)
-    if persist:
-        save_contests()
-    print(f"[SCORES] Полный сброс всех рейтингов ({current_month})", flush=True)
-
-def check_monthly_reset(chat_id_str):
-    """Ленивый сброс при обращении к рейтингу; дубли месячного отчёта режет CONTEST_META."""
-    current_month = moscow_now().strftime('%Y-%m')
-    if chat_id_str not in CHAT_SCORES:
-        CHAT_SCORES[chat_id_str] = {'_reset_month': current_month}
-        return
-    if CHAT_SCORES[chat_id_str].get('_reset_month') != current_month:
-        # Если плановый отчёт за этот месяц ещё не ушёл — не молча обнуляем
-        if CONTEST_META.get('last_monthly_report') == current_month:
-            reset_chat_scores(chat_id_str)
-
-def format_month_leaders(chat_id_str, month_label=None):
-    scores = CHAT_SCORES.get(chat_id_str, {})
-    entries = [
-        (uid, data) for uid, data in scores.items()
-        if uid != '_reset_month' and isinstance(data, dict) and int(data.get('score') or 0) > 0
-    ]
-    entries.sort(key=lambda x: x[1].get('score', 0), reverse=True)
-    title = month_label or "прошедший месяц"
-    if not entries:
-        return f"📊 Итоги рейтинга за {title}:\n\nНикто не набрал очков."
-    lines = [f"📊 Итоги рейтинга за {title}:\n"]
-    for i, (uid, data) in enumerate(entries[:15], 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        lines.append(f"{medal} {data.get('name', '???')} — {data.get('score', 0)} баллов")
-    lines.append(f"\nВсего игроков с очками: {len(entries)}")
-    lines.append("Рейтинг будет обнулён. Новый месяц — новый сезон!")
-    return "\n".join(lines)
-
-def process_monthly_score_reset(vk_session):
-    """
-    Смена месяца (Europe/Moscow): отчёт лидеров → затем сброс.
-    Флаг CONTEST_META['last_monthly_report'] = 'YYYY-MM' защищает от повторов.
-    """
-    global CONTEST_META
-    now = moscow_now()
-    current_month = now.strftime('%Y-%m')
-    last = CONTEST_META.get('last_monthly_report')
-    if last == current_month:
-        return
-    # Первый запуск в середине месяца — только зафиксировать флаг, без обнуления
-    if not last:
-        CONTEST_META['last_monthly_report'] = current_month
-        save_contests()
-        return
-
-    # Подпись прошедшего месяца
-    prev = (now.replace(day=1) - datetime.timedelta(days=1))
-    prev_label = prev.strftime('%m.%Y')
-
-    chat_ids = set(str(c) for c in CONTEST_CHATS)
-    chat_ids.update(str(k) for k in CHAT_SCORES.keys())
-    sent_ok = True
-    summaries = []
-
-    for chat_id_str in sorted(chat_ids):
-        try:
-            refresh_chat_names(vk_session, chat_id_str)
-        except Exception:
-            pass
-        msg = format_month_leaders(chat_id_str, month_label=prev_label)
-        summaries.append(f"Чат {chat_id_str}:\n{msg}")
-        try:
-            vk_session.method('messages.send', {
-                'peer_id': int(chat_id_str),
-                'message': msg,
-                'random_id': rnd_id(),
-            })
-        except Exception as e:
-            sent_ok = False
-            print(f"[MONTHLY REPORT ERROR] chat={chat_id_str}: {e}", flush=True)
-
-    if ADMIN_VK_ID:
-        admin_msg = "📢 Месячный отчёт рейтингов\n\n" + "\n\n———\n\n".join(summaries[:20])
-        try:
-            vk_session.method('messages.send', {
-                'peer_id': ADMIN_VK_ID,
-                'message': admin_msg[:4000],
-                'random_id': rnd_id(),
-            })
-        except Exception as e:
-            print(f"[MONTHLY REPORT ADMIN ERROR] {e}", flush=True)
-            # ЛС админу не блокирует сброс, если чаты уже получили отчёт
-
-    if not sent_ok and chat_ids:
-        print("[MONTHLY REPORT] Есть ошибки отправки в чаты — сброс отложен", flush=True)
-        return
-
-    reset_all_scores(persist=False)
-    CONTEST_META['last_monthly_report'] = current_month
-    save_contests()
-    print(f"[MONTHLY RESET] Отчёт отправлен, рейтинги сброшены ({current_month})", flush=True)
-
-def add_score(chat_id, user_id, user_name, points):
-    chat_id_str = str(chat_id)
-    user_id_str = str(user_id)
-    check_monthly_reset(chat_id_str)
-    if user_id_str not in CHAT_SCORES[chat_id_str] or not isinstance(CHAT_SCORES[chat_id_str][user_id_str], dict):
-        CHAT_SCORES[chat_id_str][user_id_str] = {'name': user_name, 'score': 0}
-    CHAT_SCORES[chat_id_str][user_id_str]['name'] = user_name
-    CHAT_SCORES[chat_id_str][user_id_str]['score'] += points
-    save_contests()
-
-def fetch_users_names(vk_session, user_ids):
-    if not user_ids:
-        return {}
-    names = {}
-    try:
-        result = vk_session.method('users.get', {'user_ids': ','.join(str(uid) for uid in user_ids)})
-        users = result if isinstance(result, list) else result.get('response', [])
-        for u in users:
-            uid = str(u.get('id', ''))
-            full = f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
-            if uid and full:
-                names[uid] = full
-    except Exception as e:
-        print(f"[NAMES FETCH ERROR] {e}", flush=True)
-    return names
-
-def refresh_chat_names(vk_session, chat_id_str):
-    chat_data = CHAT_SCORES.get(chat_id_str, {})
-    user_ids = [uid for uid in chat_data.keys() if uid != '_reset_month' and uid.isdigit()]
-    if not user_ids:
-        return
-    fresh_names = fetch_users_names(vk_session, user_ids)
-    updated = False
-    for uid in user_ids:
-        new_name = fresh_names.get(uid)
-        if new_name and chat_data[uid].get('name') != new_name:
-            chat_data[uid]['name'] = new_name
-            updated = True
-    if updated:
-        save_contests()
-
-def show_top(vk_session, peer_id):
-    chat_id_str = str(peer_id)
-    check_monthly_reset(chat_id_str)
-    refresh_chat_names(vk_session, chat_id_str)
-    scores = CHAT_SCORES.get(chat_id_str, {})
-    entries = [(uid, data) for uid, data in scores.items() if uid != '_reset_month' and isinstance(data, dict)]
-    entries.sort(key=lambda x: x[1].get('score', 0), reverse=True)
-
-    if not entries:
-        vk_session.method('messages.send', {
-            'peer_id': peer_id,
-            'message': "📊 Рейтинг чата пуст.\nПишите сообщения (+1 балл) и угадывайте карты (+10 баллов)!",
-            'random_id': rnd_id()
-        })
-        return
-
-    lines = ["📊 Рейтинг чата за этот месяц:\n"]
-    for i, (uid, data) in enumerate(entries[:10], 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        name = data.get('name', '???')
-        score = data.get('score', 0)
-        lines.append(f"{medal} {name} — {score} баллов")
-    lines.append(f"\nВсего игроков: {len(entries)}")
-    lines.append(f"\n📅 Сброс рейтинга — 1-го числа каждого месяца")
-    vk_session.method('messages.send', {'peer_id': peer_id, 'message': "\n".join(lines), 'random_id': rnd_id()})
-
-# ==================== ПЛАНИРОВЩИКИ ====================
-
-def contest_scheduler(vk_session):
-    """Старт/финиш викторины, почасовые подсказки и месячный отчёт+сброс."""
-    last_start = None
-    last_end = None
-    last_hint_tick = None
-    while True:
-        try:
-            now = moscow_now()
-            today = now.strftime('%Y-%m-%d')
-            minute_key = now.strftime('%Y-%m-%d %H:%M')
-
-            if now.hour == 20 and now.minute == 0 and last_start != today:
-                last_start = today
-                start_contest(vk_session)
-            if now.hour == 23 and now.minute == 55 and last_end != today:
-                last_end = today
-                end_contest_timeout(vk_session)
-
-            # Раз в минуту: почасовые подсказки и проверка смены месяца
-            if last_hint_tick != minute_key:
-                last_hint_tick = minute_key
-                process_hourly_contest_hints(vk_session)
-                process_monthly_score_reset(vk_session)
-        except Exception as e:
-            print(f"[SCHEDULER ERROR] {e}", flush=True)
-            traceback.print_exc()
-        time.sleep(20)
-
-def monthly_reset_scheduler(vk_session=None):
-    """Совместимость: месячный сброс теперь в contest_scheduler."""
-    if vk_session is None:
-        return
-    while True:
-        try:
-            process_monthly_score_reset(vk_session)
-        except Exception as e:
-            print(f"[MONTHLY RESET ERROR] {e}", flush=True)
-        time.sleep(1800)
-
-# ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
-
-def get_user_name(vk_session, user_id):
-    try:
-        result = vk_session.method('users.get', {'user_ids': user_id})
-        users = result if isinstance(result, list) else result.get('response', [])
-        if users:
-            return f"{users[0].get('first_name', '')} {users[0].get('last_name', '')}".strip()
-    except:
-        pass
-    return "Игрок"
-
-def handle_message(vk_session, message_obj):
-    raw_text = message_obj.get('text', '').strip()
-    peer_id  = message_obj.get('peer_id')
-    user_id  = message_obj.get('from_id')
-
-    text_clean = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
-    text_lower = text_clean.lower()
-
-    if text_lower in ("!конкурс +", "!конкурс+", "!конкурс добавить"):
-        if is_owner(user_id):
-            added = add_contest_chat(peer_id)
-            msg = "✅ Чат добавлен в конкурс! Каждый день в 20:00 — «Угадай карту»." if added else "ℹ️ Этот чат уже в конкурсе."
-        else:
-            msg = "❌ Только владелец бота может управлять конкурсом."
-        vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
-        return
-
-    if text_lower in ("!конкурс -", "!конкурс-", "!конкурс удалить"):
-        if is_owner(user_id):
-            removed = remove_contest_chat(peer_id)
-            msg = "✅ Чат удалён из конкурса." if removed else "ℹ️ Этого чата не было в конкурсе."
-        else:
-            msg = "❌ Только владелец бота может управлять конкурсом."
-        vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
-        return
-
-    if text_lower in ("!конкурс список", "!конкурс"):
-        if is_owner(user_id):
-            show_contest_chats(vk_session, peer_id)
-        else:
-            vk_session.method('messages.send', {
-                'peer_id': peer_id, 'message': "❌ Только владелец бота может смотреть список чатов.",
-                'random_id': rnd_id()
-            })
-        return
-
-    in_contest = peer_id in CONTEST_CHATS
-    if in_contest and user_id and user_id > 0:
-        user_name = get_user_name(vk_session, user_id)
-        add_score(peer_id, user_id, user_name, 1)
-        check_contest_answer(vk_session, peer_id, user_id, user_name, raw_text)
-
-    if text_lower in ("!топ", "!top"):
-        show_top(vk_session, peer_id)
-        return
-
-    # !колода <Герой> — лучшая публичная колода с ep-ccg.ru
-    if text_lower.startswith("!колода"):
-        hero_query = text_clean[len("!колода"):].strip()
-        if not hero_query:
-            vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': "Использование: !колода <имя героя>\nПример: !колода Афари",
-                'random_id': rnd_id(),
-            })
-            return
-        try:
-            vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': f"🔎 Ищу лучшую публичную колоду героя «{hero_query}»…",
-                'random_id': rnd_id(),
-            })
-            best = find_best_public_deck(hero_query)
-            if not best:
-                vk_session.method('messages.send', {
-                    'peer_id': peer_id,
-                    'message': f"Колоды героя «{hero_query}» не найдены на ep-ccg.ru.",
-                    'random_id': rnd_id(),
-                })
-                return
-            game_code = str(best.get('game_code') or '').strip()
-            if game_code:
-                img_bytes, hero_name, total, _ = render_deck_image_from_base64(game_code)
-            else:
-                hero_name, total, rows = build_rows_from_deck_json(best.get('deck_json') or {}, hero_query)
-                if not rows:
-                    raise ValueError('Пустая колода')
-                img_bytes = build_deck_image(hero_name, total, 60, rows)
-            caption = format_deck_caption(best, game_code)
-            send_deck_image(vk_session, peer_id, img_bytes, caption)
-        except Exception as e:
-            print(f"[KOLODA ERROR] {e}", flush=True)
-            traceback.print_exc()
-            vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': f"Не удалось собрать колоду: {e}",
-                'random_id': rnd_id(),
-            })
-        return
-
-    # !deck <Base64> или просто валидный Base64-код колоды BHD1
-    deck_code_candidate = None
-    if text_lower.startswith("!deck"):
-        deck_code_candidate = text_clean[5:].strip()
-        if not deck_code_candidate:
-            vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': "Использование:\n!deck <Base64-код колоды>\nили просто пришлите код колоды BHD1\n\nТакже: !колода <Герой>",
-                'random_id': rnd_id(),
-            })
-            return
-    elif looks_like_deck_base64(text_clean):
-        deck_code_candidate = text_clean.strip()
-
-    if deck_code_candidate is not None:
-        try:
-            img_bytes, _, _, _ = render_deck_image_from_base64(deck_code_candidate)
-            # Код пользователь уже прислал — в ответе только картинка дек-листа
-            send_deck_image(vk_session, peer_id, img_bytes, " ")
-        except Exception as e:
-            print(f"[DECK B64 ERROR] {e}", flush=True)
-            traceback.print_exc()
-            vk_session.method('messages.send', {
-                'peer_id': peer_id,
-                'message': f"Не удалось декодировать колоду: {e}",
-                'random_id': rnd_id(),
-            })
-        return
-
-    chosen_command = None
-    for command in ["!бго", "!бк"]:
-        if text_lower.startswith(command + " "):
-            chosen_command = command
-            break
-    if not chosen_command:
-        return
-
-    card_name_ru = text_clean[len(chosen_command) + 1:].strip().lower()
-    if not card_name_ru:
-        return
-
-    cache_key  = f"{chosen_command}_{card_name_ru}"
-    game_title = "Берсерк Герои" if chosen_command == "!бго" else "Берсерк Классика"
-    response_msg = f"🃏 [{game_title}] Карта: {card_name_ru.capitalize()}\n\nБаза карт: ep-ccg.ru"
-
-    if cache_key in ATTACHMENT_CACHE:
-        vk_session.method('messages.send', {
-            'peer_id': peer_id, 'message': response_msg,
-            'attachment': ATTACHMENT_CACHE[cache_key], 'random_id': rnd_id()
-        })
-        return
-
-    photo_content, _ = download_card_image_fast(card_name_ru)
-    full_filename = "api"
-    if not photo_content:
-        cleaned_text  = card_name_ru.replace(" ", "-").replace("_", "-")
-        card_name_lat = to_lat(cleaned_text)
-        prefix        = "bgo-" if chosen_command == "!бго" else "bk-"
-        ideal_filename = prefix + card_name_lat + ".webp"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        photo_content = _try_fetch_filename(ideal_filename, headers)
-        if not photo_content:
-            smart_filename = get_smart_filename(ideal_filename)
-            if smart_filename != ideal_filename:
-                photo_content = _try_fetch_filename(smart_filename, headers)
-            full_filename = smart_filename
-        else:
-            full_filename = ideal_filename
-
-    if photo_content:
-        try:
-            card_jpeg = prepare_card_square_jpeg(photo_content)
-            attachment = upload_and_get_attachment(vk_session, card_jpeg, 'card.jpg', peer_id)
-            ATTACHMENT_CACHE[cache_key] = attachment
-            vk_session.method('messages.send', {
-                'peer_id': peer_id, 'message': response_msg,
-                'attachment': attachment, 'random_id': rnd_id()
-            })
-        except Exception as e:
-            print(f"[CARD ERROR] {e}", flush=True)
-            traceback.print_exc()
-            vk_session.method('messages.send', {
-                'peer_id': peer_id, 'message': f"Ошибка: {e}", 'random_id': rnd_id()
-            })
-    else:
-        vk_session.method('messages.send', {
-            'peer_id': peer_id, 'message': f"Карта не найдена: {full_filename}", 'random_id': rnd_id()
-        })
-
-def _safe_handle(vk_session, message_obj):
-    try:
-        handle_message(vk_session, message_obj)
-    except Exception as e:
-        print(f"[HANDLE ERROR] {e}", flush=True)
-        traceback.print_exc()
-        try:
-            peer_id = message_obj.get('peer_id')
-            if peer_id:
-                vk_session.method('messages.send', {
-                    'peer_id': peer_id, 'message': f"⚠️ Ошибка: {e}", 'random_id': rnd_id()
-                })
-        except:
-            pass
-
-# ==================== ОСНОВНОЙ БОТ ====================
-
-def run_flask_server():
-    """Фоновый Flask: отвечает на пинги Render, чтобы процесс не убивали за «тишину»."""
-    port = int(os.environ.get('PORT', 5000))
-    print(f"[FLASK] Health-check на 0.0.0.0:{port}", flush=True)
-    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
-
-def run_vk_bot():
-    update_site_files_index()
-    threading.Thread(target=ensure_game_db, daemon=True).start()
-    vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
-    threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
-    threading.Thread(target=watchdog_loop, daemon=True).start()
-    gist_status = "ON" if (GITHUB_TOKEN and GIST_ID) else "OFF"
-    print(
-        f"Планировщики: конкурс/подсказки/месячный отчёт "
-        f"({len(CONTEST_CHATS)} чатов) + watchdog; "
-        f"Gist sync={gist_status}; "
-        f"state={len(CONTEST_STATE)}, scores={len(CHAT_SCORES)}",
-        flush=True,
-    )
-    if not OWNER_ID:
-        print("⚠️ OWNER_ID не задан — управление конкурсом недоступно!", flush=True)
-
-    while True:
-        try:
-            bot_longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
-            print("Бот успешно запущен и слушает ВК...", flush=True)
-            update_heartbeat()
-            while True:
-                try:
-                    events = bot_longpoll.check()
-                    update_heartbeat()
-                    for event in events:
-                        if event.type == VkBotEventType.MESSAGE_NEW:
-                            threading.Thread(
-                                target=_safe_handle,
-                                args=(vk_session, event.obj.message),
-                                daemon=True,
-                            ).start()
-                except (RequestsReadTimeout, Urllib3ReadTimeoutError, requests.exceptions.Timeout) as e:
-                    # Таймаут long poll — НЕ падаем, просто продолжаем цикл
-                    print(f"[LONGPOLL TIMEOUT] {type(e).__name__}: {e} — переподключение через 3 сек", flush=True)
-                    update_heartbeat()
-                    time.sleep(3)
-                    continue
-                except Exception as e:
-                    print(f"[LOOP ERROR] {e} — reconnect через 3 сек", flush=True)
-                    traceback.print_exc()
-                    update_heartbeat()
-                    time.sleep(3)
-                    break  # пересоздаём VkBotLongPoll
-        except (RequestsReadTimeout, Urllib3ReadTimeoutError, requests.exceptions.Timeout) as e:
-            print(f"[BOT TIMEOUT] {type(e).__name__}: {e} — переподключение через 3 сек", flush=True)
-            update_heartbeat()
-            time.sleep(3)
-        except Exception as e:
-            print(f"[BOT ERROR] {e} — рестарт через 5 сек", flush=True)
-            traceback.print_exc()
-            update_heartbeat()
-            time.sleep(5)
-
-if __name__ == '__main__':
-    # Flask в фоне (пинги Render), бот — в главном потоке
-    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
-    flask_thread.start()
-    run_vk_bot()
-
+    if ($rar_tax) {
+        $terms = wp_get_post_terms($post_id, $rar_tax);
+        if (!is_wp_error($terms) && $terms) return bh_normalize_rarity($terms[0]->name);
+    }
+    $meta_val = get_post_meta($post_id, 'редкость', true);
+    if ($meta_val) return bh_normalize_rarity($meta_val);
+    return '';
+}
+
+// Расчёт стоимости колоды в пыли
+function bh_calc_deck_dust($deck_json) {
+    if (!$deck_json || !is_array($deck_json)) return 0;
+    $cards = isset($deck_json['cards']) ? $deck_json['cards'] : array();
+    if (!is_array($cards)) return 0;
+    $total = 0;
+    foreach ($cards as $c) {
+        $rar = isset($c['rarity']) ? $c['rarity'] : '';
+        $map = array('legendary' => BH_DUST_LEGENDARY, 'epic' => BH_DUST_EPIC, 'rare' => BH_DUST_RARE, 'common' => BH_DUST_COMMON);
+        $cost = isset($map[$rar]) ? $map[$rar] : 0;
+        $total += $cost;
+    }
+    return $total;
+}
+
+function bh_debug_acf() {
+    $post_id = 44110;
+    $all_meta = get_post_meta($post_id);
+    $meta_result = array();
+    foreach ($all_meta as $key => $vals) {
+        $meta_result[$key] = isset($vals[0]) ? $vals[0] : '';
+    }
+    $fields = get_field_objects($post_id);
+    $acf_result = array();
+    if ($fields) {
+        foreach ($fields as $key => $f) {
+            $acf_result[$key] = array('label' => $f['label'], 'type' => $f['type'], 'value' => bh_to_string($f['value']));
+        }
+    }
+    $taxonomies = get_object_taxonomies('mmf_card', 'objects');
+    $tax_result = array();
+    foreach ($taxonomies as $slug => $obj) {
+        $terms = wp_get_post_terms($post_id, $slug);
+        $term_names = array();
+        if (!is_wp_error($terms)) { foreach ($terms as $t) $term_names[] = $t->name; }
+        $tax_result[$slug] = array('label' => $obj->labels->name, 'singular' => $obj->labels->singular_name, 'terms' => $term_names);
+    }
+    $all_tax_debug = get_taxonomies(array(), 'objects');
+    $all_tax_list = array();
+    foreach ($all_tax_debug as $slug => $obj) {
+        $tax_obj = get_taxonomy($slug);
+        $all_tax_list[$slug] = array(
+            'label' => $obj->labels->name ?? '',
+            'singular' => $obj->labels->singular_name ?? '',
+            'object_type' => $tax_obj ? $tax_obj->object_type : array(),
+        );
+    }
+    return array(
+        'post_id' => $post_id,
+        'all_meta_including_hidden' => $meta_result,
+        'acf_fields' => $acf_result,
+        'taxonomies' => $tax_result,
+        'all_taxonomies' => $all_tax_list,
+        'rarity_resolved' => bh_get_rarity($post_id),
+        'expansion_resolved' => bh_get_expansion_taxonomy($post_id),
+    );
+}
+
+/**
+ * База декбилдера: штатные CPT «Герои» (mm_hero) и «Карты» (mmf_card).
+ * game_id — поле card_game_id записи; картинка — миниатюра/ACF-поле самой записи.
+ * Файлы в медиатеке не ищутся по имени и не переименовываются.
+ */
+function get_berserk_data() {
+    $heroes_posts = get_posts(array('post_type' => 'mm_hero', 'numberposts' => -1, 'post_status' => 'publish'));
+    $cards_posts  = get_posts(array('post_type' => 'mmf_card', 'numberposts' => -1, 'post_status' => 'publish'));
+    $data = array('heroes' => array(), 'cards' => array());
+    $all_hero_names = array_map(function($h) { return trim($h->post_title); }, $heroes_posts);
+    foreach (array('heroes' => $heroes_posts, 'cards' => $cards_posts) as $key => $posts) {
+        foreach ($posts as $post) {
+            $title = trim($post->post_title);
+            if ($key == 'cards' && in_array($title, $all_hero_names)) continue;
+            $img_url = bh_get_card_image_url($post->ID);
+            $tax = ($key == 'heroes') ? 'hero_element' : 'mmf_element';
+            $terms = wp_get_post_terms($post->ID, $tax);
+            $element_data = array();
+            if (!is_wp_error($terms)) {
+                foreach ($terms as $t) { $element_data[] = $t->slug; $element_data[] = mb_strtolower($t->name); }
+            }
+            $row = array(
+                'id'       => $post->ID,
+                'title'    => $title,
+                'image'    => $img_url ? $img_url : 'https://via.placeholder.com/200x280?text=IMG',
+                'elements' => $element_data,
+                'is_horde' => (mb_stripos($post->post_content, 'Орда') !== false),
+                'cost'     => (int)get_post_meta($post->ID, 'стоимость', true) ? (int)get_post_meta($post->ID, 'стоимость', true) : ((int)get_field('card_cost', $post->ID) ? (int)get_field('card_cost', $post->ID) : 0),
+                'game_id'  => bh_get_card_game_id($post->ID),
+            );
+            if ($key == 'cards') {
+                $row['rarity']      = bh_get_rarity($post->ID);
+                $desc = bh_get_field_by_label($post->ID, array('описание'));
+                $row['description'] = $desc ? $desc : trim($post->post_content);
+                $row['type']        = bh_get_card_type($post->ID);
+                $row['expansion']   = bh_get_expansion_taxonomy($post->ID);
+                $row['faction']     = bh_get_field_by_label($post->ID, array('фракция'));
+            }
+            $data[$key][] = $row;
+        }
+    }
+    return $data;
+}
+
+function bh_get_visitor_ip() {
+    foreach (array('HTTP_CF_CONNECTING_IP','HTTP_X_FORWARDED_FOR','REMOTE_ADDR') as $key) {
+        if (!empty($_SERVER[$key])) return trim(explode(',', $_SERVER[$key])[0]);
+    }
+    return '0.0.0.0';
+}
+
+// Получение одной колоды + флаг is_owner
+function bh_get_deck(WP_REST_Request $request) {
+    global $wpdb;
+    $deck_id = intval($request->get_param('id'));
+    $user = wp_get_current_user();
+    $row = $wpdb->get_row($wpdb->prepare(
+        "SELECT d.*, u.display_name as author,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'win') as wins,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'loss') as losses
+         FROM {$wpdb->prefix}bh_decks d
+         LEFT JOIN {$wpdb->prefix}users u ON d.user_id = u.ID
+         WHERE d.id = %d", $deck_id));
+    if (!$row) return new WP_Error('not_found', 'Колода не найдена', array('status' => 404));
+    // Приватная колода видна только автору
+    if (!$row->is_public && (!$user->ID || $user->ID != $row->user_id)) {
+        return new WP_Error('forbidden', 'Нет доступа', array('status' => 403));
+    }
+    $row->deck_json   = json_decode($row->deck_json, true);
+    $row->is_public   = (int)$row->is_public;
+    $row->likes       = (int)$row->likes;
+    $row->id          = (int)$row->id;
+    $row->hero_wp_id  = (int)$row->hero_wp_id;
+    $row->user_id     = (int)$row->user_id;
+    $row->wins        = (int)$row->wins;
+    $row->losses      = (int)$row->losses;
+    $row->total_games = $row->wins + $row->losses;
+    $row->winrate     = $row->total_games > 0 ? round($row->wins / $row->total_games * 100, 1) : null;
+    $row->updated_at  = $row->updated_at ? strtotime($row->updated_at) : null;
+    $row->created_at  = $row->created_at ? strtotime($row->created_at) : null;
+    $row->is_owner    = ($user->ID && $user->ID == $row->user_id);
+    $row->dust_cost   = bh_calc_deck_dust($row->deck_json);
+    $row->guide_url = isset($row->guide_url) ? (string)$row->guide_url : '';
+    $row->video_guide_url = isset($row->video_guide_url) ? (string)$row->video_guide_url : '';
+    $row->video_url = $row->video_guide_url;
+    $row->author_id = (int)$row->user_id;
+    bh_attach_author_pro($row);
+    // Лайк от текущего юзера
+    $row->liked_by_me = false;
+    if ($user->ID) {
+        $ip = bh_get_visitor_ip();
+        $liked = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_deck_likes WHERE deck_id = %d AND ip = %s", $deck_id, $ip));
+        if ($liked) $row->liked_by_me = true;
+    }
+    return $row;
+}
+
+// Обновление description и/или game_code (только автор)
+function bh_update_deck_meta(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $deck_id = intval($request->get_param('id'));
+    $existing = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_decks WHERE id = %d AND user_id = %d", $deck_id, $user->ID));
+    if (!$existing) return new WP_Error('forbidden', 'Нет доступа', array('status' => 403));
+    $p = $request->get_json_params();
+    $update = array();
+    if (isset($p['description'])) $update['description'] = sanitize_textarea_field($p['description']);
+    if (isset($p['game_code']))  $update['game_code']  = sanitize_text_field($p['game_code']);
+    if (isset($p['guide_url'])) $update['guide_url'] = esc_url_raw($p['guide_url']);
+    if (isset($p['video_guide_url'])) $update['video_guide_url'] = esc_url_raw($p['video_guide_url']);
+    if (isset($p['name'])) $update['name'] = sanitize_text_field($p['name']);
+    if (empty($update)) return array('success' => true);
+    $wpdb->update("{$wpdb->prefix}bh_decks", $update, array('id' => $deck_id, 'user_id' => $user->ID));
+    return array('success' => true);
+}
+
+function bh_get_public_decks() {
+    global $wpdb;
+    $rows = $wpdb->get_results(
+        "SELECT d.*, u.display_name as author,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'win') as wins,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'loss') as losses
+         FROM {$wpdb->prefix}bh_decks d
+         LEFT JOIN {$wpdb->prefix}users u ON d.user_id = u.ID
+         WHERE d.is_public = 1
+         ORDER BY d.likes DESC, d.updated_at DESC"
+    );
+    if (!$rows) return array();
+    foreach ($rows as &$row) {
+        $row->deck_json   = json_decode($row->deck_json, true);
+        $row->is_public   = (int) $row->is_public;
+        $row->likes       = (int) $row->likes;
+        $row->id          = (int) $row->id;
+        $row->hero_wp_id  = (int) $row->hero_wp_id;
+        $row->wins        = (int) $row->wins;
+        $row->losses      = (int) $row->losses;
+        $row->total_games = $row->wins + $row->losses;
+        $row->winrate     = $row->total_games > 0 ? round($row->wins / $row->total_games * 100, 1) : null;
+        $row->updated_at  = $row->updated_at ? strtotime($row->updated_at) : null;
+        $row->created_at  = $row->created_at ? strtotime($row->created_at) : null;
+        $row->liked_by_me = false;
+        $row->dust_cost   = bh_calc_deck_dust($row->deck_json);
+        $row->user_id = (int)$row->user_id;
+        $row->author_id = $row->user_id;
+        $row->guide_url = isset($row->guide_url) ? (string)$row->guide_url : '';
+        $row->video_guide_url = isset($row->video_guide_url) ? (string)$row->video_guide_url : '';
+        $row->video_url = $row->video_guide_url;
+        bh_attach_author_pro($row);
+    }
+    return $rows;
+}
+
+function bh_get_my_decks() {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $decks = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_decks WHERE user_id = %d ORDER BY updated_at DESC", $user->ID));
+    foreach ($decks as &$deck) {
+        $deck->deck_json  = json_decode($deck->deck_json, true);
+        $deck->is_public  = (int) $deck->is_public;
+        $deck->likes      = (int) $deck->likes;
+        $deck->id         = (int) $deck->id;
+        $deck->hero_wp_id = (int) $deck->hero_wp_id;
+        $deck->updated_at = $deck->updated_at ? strtotime($deck->updated_at) : null;
+        $deck->created_at = $deck->created_at ? strtotime($deck->created_at) : null;
+        $deck->dust_cost  = bh_calc_deck_dust($deck->deck_json);
+        $deck->guide_url = isset($deck->guide_url) ? (string)$deck->guide_url : '';
+        $deck->video_guide_url = isset($deck->video_guide_url) ? (string)$deck->video_guide_url : '';
+        $deck->video_url = $deck->video_guide_url;
+        $deck->user_id = (int)$deck->user_id;
+        $deck->author_id = $deck->user_id;
+        bh_attach_author_pro($deck);
+    }
+    return $decks;
+}
+
+function bh_save_deck(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $p = $request->get_json_params();
+    $name      = sanitize_text_field($p['name'] ? $p['name'] : 'Без названия');
+    $hero_id   = intval($p['hero_wp_id'] ? $p['hero_wp_id'] : 0);
+    $deck_json = wp_json_encode($p['deck'] ? $p['deck'] : array());
+    $header_id = sanitize_text_field($p['header_id'] ? $p['header_id'] : '');
+    $hero_le   = sanitize_text_field($p['hero_le'] ? $p['hero_le'] : '');
+    $game_code = isset($p['game_code']) ? sanitize_text_field($p['game_code']) : '';
+    $guide_url = isset($p['guide_url']) ? esc_url_raw($p['guide_url']) : '';
+    $video_guide_url = isset($p['video_guide_url']) ? esc_url_raw($p['video_guide_url']) : '';
+    $is_public = intval($p['is_public'] ? $p['is_public'] : 0);
+    $deck_id   = intval($p['id'] ? $p['id'] : 0);
+    $payload = array(
+        'name' => $name,
+        'hero_wp_id' => $hero_id,
+        'deck_json' => $deck_json,
+        'header_id' => $header_id,
+        'hero_le' => $hero_le,
+        'game_code' => $game_code,
+        'guide_url' => $guide_url,
+        'video_guide_url' => $video_guide_url,
+        'is_public' => $is_public,
+    );
+    if ($deck_id) {
+        $existing = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_decks WHERE id = %d AND user_id = %d", $deck_id, $user->ID));
+        if (!$existing) return new WP_Error('forbidden', 'Нет доступа', array('status' => 403));
+        $wpdb->update("{$wpdb->prefix}bh_decks", $payload, array('id' => $deck_id, 'user_id' => $user->ID));
+        if ($wpdb->last_error) return new WP_Error('update_failed', 'Ошибка БД: ' . $wpdb->last_error, array('status' => 500));
+        return array('success' => true, 'id' => $deck_id);
+    } else {
+        $payload['user_id'] = $user->ID;
+        $wpdb->insert("{$wpdb->prefix}bh_decks", $payload);
+        if ($wpdb->last_error || !$wpdb->insert_id) return new WP_Error('insert_failed', 'Ошибка БД: ' . $wpdb->last_error, array('status' => 500));
+        return array('success' => true, 'id' => $wpdb->insert_id);
+    }
+}
+
+function bh_set_deck_visibility(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $deck_id   = intval($request->get_param('id'));
+    $is_public = intval($request->get_json_params()['is_public'] ? $request->get_json_params()['is_public'] : 0);
+    $existing  = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_decks WHERE id = %d AND user_id = %d", $deck_id, $user->ID));
+    if (!$existing) return new WP_Error('forbidden', 'Нет доступа', array('status' => 403));
+    $result = $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}bh_decks SET is_public = %d, updated_at = NOW() WHERE id = %d AND user_id = %d", $is_public, $deck_id, $user->ID));
+    return array('success' => $result !== false);
+}
+
+function bh_delete_deck(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $deck_id = intval($request->get_param('id'));
+    $existing = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_decks WHERE id = %d AND user_id = %d", $deck_id, $user->ID));
+    if (!$existing) return new WP_Error('not_found', 'Колода не найдена', array('status' => 404));
+    $wpdb->delete("{$wpdb->prefix}bh_decks", array('id' => $deck_id, 'user_id' => $user->ID));
+    return new WP_REST_Response(array('success' => true), 200);
+}
+
+function bh_like_deck(WP_REST_Request $request) {
+    global $wpdb;
+    $deck_id = intval($request->get_param('id'));
+    $ip = bh_get_visitor_ip();
+    $existing = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_deck_likes WHERE deck_id = %d AND ip = %s", $deck_id, $ip));
+    if ($existing) {
+        $wpdb->delete("{$wpdb->prefix}bh_deck_likes", array('deck_id' => $deck_id, 'ip' => $ip));
+        $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}bh_decks SET likes = GREATEST(0, likes - 1) WHERE id = %d", $deck_id));
+        $liked = false;
+    } else {
+        $wpdb->insert("{$wpdb->prefix}bh_deck_likes", array('deck_id' => $deck_id, 'ip' => $ip));
+        $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}bh_decks SET likes = likes + 1 WHERE id = %d", $deck_id));
+        $liked = true;
+    }
+    $deck = $wpdb->get_row($wpdb->prepare("SELECT likes FROM {$wpdb->prefix}bh_decks WHERE id = %d", $deck_id));
+    return array('success' => true, 'liked' => $liked, 'likes' => intval($deck->likes));
+}
+
+function bh_record_deck_result(WP_REST_Request $request) {
+    $user = wp_get_current_user();
+    if (!$user->ID) return new WP_Error('unauthorized', 'Не авторизован', array('status' => 401));
+    global $wpdb;
+    $deck_id = intval($request->get_param('id'));
+    $result  = $request->get_json_params()['result'] ? $request->get_json_params()['result'] : '';
+    if (!in_array($result, array('win', 'loss'))) return new WP_Error('invalid', 'Неверный результат', array('status' => 400));
+    $deck = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$wpdb->prefix}bh_decks WHERE id = %d", $deck_id));
+    if (!$deck) return new WP_Error('not_found', 'Колода не найдена', array('status' => 404));
+    $wpdb->insert("{$wpdb->prefix}bh_deck_stats", array('deck_id' => $deck_id, 'user_id' => $user->ID, 'result' => $result));
+    return array('success' => true);
+}
+
+function bh_get_meta_stats() {
+    global $wpdb;
+    $decks = $wpdb->get_results(
+        "SELECT d.*, u.display_name as author,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'win') as wins,
+            (SELECT COUNT(*) FROM {$wpdb->prefix}bh_deck_stats WHERE deck_id = d.id AND result = 'loss') as losses
+         FROM {$wpdb->prefix}bh_decks d
+         LEFT JOIN {$wpdb->prefix}users u ON d.user_id = u.ID
+         WHERE d.is_public = 1
+         ORDER BY d.likes DESC, d.updated_at DESC"
+    );
+    $cardCounts = array();
+    $totalDecks = 0;
+    foreach ($decks as $deck) {
+        $totalDecks++;
+        $deckData = json_decode($deck->deck_json, true);
+        $cards = $deckData['cards'] ? $deckData['cards'] : array();
+        $seen = array();
+        foreach ($cards as $c) {
+            if (!in_array($c['id'], $seen)) { $seen[] = $c['id']; $cardCounts[$c['id']] = (isset($cardCounts[$c['id']]) ? $cardCounts[$c['id']] : 0) + 1; }
+        }
+    }
+    arsort($cardCounts);
+    $topCards = array_slice($cardCounts, 0, 30, true);
+    foreach ($decks as &$row) {
+        $row->deck_json   = json_decode($row->deck_json, true);
+        $row->is_public   = (int)$row->is_public;
+        $row->likes       = (int)$row->likes;
+        $row->id          = (int)$row->id;
+        $row->hero_wp_id  = (int)$row->hero_wp_id;
+        $row->wins        = (int)$row->wins;
+        $row->losses      = (int)$row->losses;
+        $row->total_games = $row->wins + $row->losses;
+        $row->winrate     = $row->total_games > 0 ? round($row->wins / $row->total_games * 100, 1) : null;
+        $row->updated_at  = $row->updated_at ? strtotime($row->updated_at) : null;
+        $row->created_at  = $row->created_at ? strtotime($row->created_at) : null;
+        $row->liked_by_me = false;
+        $row->dust_cost   = bh_calc_deck_dust($row->deck_json);
+    }
+    return array('decks' => $decks, 'top_cards' => $topCards, 'total_decks' => $totalDecks);
+}
+
+function bh_submit_mapping(WP_REST_Request $request) {
+    global $wpdb;
+    $mappings = $request->get_json_params()['mappings'] ? $request->get_json_params()['mappings'] : array();
+    foreach ($mappings as $m) {
+        $game_id_be = strtolower(sanitize_text_field($m['game_id_be'] ? $m['game_id_be'] : ''));
+        $card_name  = sanitize_text_field($m['card_name'] ? $m['card_name'] : '');
+        if (!$game_id_be || !preg_match('/^[a-f0-9]{8}$/', $game_id_be)) continue;
+        $wp_post_id = 0;
+        if ($card_name) {
+            $post = get_page_by_title($card_name, OBJECT, 'mmf_card');
+            if (!$post) $post = get_page_by_title($card_name, OBJECT, 'mm_hero');
+            if ($post) $wp_post_id = $post->ID;
+        }
+        if ($wp_post_id) {
+            $approved = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_card_mappings WHERE game_id_be = %s AND status = 'approved'", $game_id_be));
+            if ($approved && $approved->wp_post_id != $wp_post_id) continue;
+        }
+        $existing = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_card_mappings WHERE game_id_be = %s AND wp_post_id = %d", $game_id_be, $wp_post_id));
+        if ($existing) {
+            $wpdb->update("{$wpdb->prefix}bh_card_mappings", array('votes' => $existing->votes + 1, 'card_name' => $card_name), array('id' => $existing->id));
+        } else {
+            $wpdb->insert("{$wpdb->prefix}bh_card_mappings", array('game_id_be' => $game_id_be, 'wp_post_id' => $wp_post_id, 'card_name' => $card_name, 'votes' => 1));
+        }
+    }
+    return array('success' => true);
+}
+
+function bh_get_mappings() {
+    global $wpdb;
+    $rows = $wpdb->get_results("SELECT game_id_be, wp_post_id FROM {$wpdb->prefix}bh_card_mappings WHERE status = 'approved'");
+    $result = array();
+    foreach ($rows as $r) { $result[$r->game_id_be] = intval($r->wp_post_id); }
+    return $result;
+}
+
+
+add_action('admin_menu', function() {
+    add_menu_page('BH Маппинги', 'BH Маппинги', 'manage_options', 'bh-mappings', 'bh_mappings_admin_page', 'dashicons-admin-generic', 30);
+    add_management_page('BH Маппинги', 'BH Маппинги', 'manage_options', 'bh-mappings-tools', 'bh_mappings_admin_page');
+});
+add_action('admin_post_bh_approve_mapping', function() {
+    if (!current_user_can('manage_options')) wp_die('Нет доступа');
+    global $wpdb;
+    $id  = intval($_POST['mapping_id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_card_mappings WHERE id = %d", $id));
+    if ($row && $row->wp_post_id) {
+        $wpdb->update("{$wpdb->prefix}bh_card_mappings", array('status' => 'approved'), array('id' => $id));
+        update_field('card_game_id', $row->game_id_be, $row->wp_post_id);
+        update_post_meta($row->wp_post_id, 'card_game_id', $row->game_id_be);
+    }
+    wp_redirect(admin_url('admin.php?page=bh-mappings&approved=1')); exit;
+});
+add_action('admin_post_bh_reject_mapping', function() {
+    if (!current_user_can('manage_options')) wp_die('Нет доступа');
+    global $wpdb;
+    $wpdb->delete("{$wpdb->prefix}bh_card_mappings", array('id' => intval($_POST['mapping_id'])));
+    wp_redirect(admin_url('admin.php?page=bh-mappings&rejected=1')); exit;
+});
+add_action('admin_post_bh_bulk_approve', function() {
+    if (!current_user_can('manage_options')) wp_die('Нет доступа');
+    global $wpdb;
+    $min_votes = intval($_POST['min_votes'] ? $_POST['min_votes'] : 3);
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}bh_card_mappings WHERE status = 'pending' AND votes >= %d AND wp_post_id > 0", $min_votes));
+    $count = 0;
+    foreach ($rows as $row) {
+        $wpdb->update("{$wpdb->prefix}bh_card_mappings", array('status' => 'approved'), array('id' => $row->id));
+        update_field('card_game_id', $row->game_id_be, $row->wp_post_id);
+        update_post_meta($row->wp_post_id, 'card_game_id', $row->game_id_be);
+        $count++;
+    }
+    wp_redirect(admin_url('admin.php?page=bh-mappings&bulk_approved=' . $count)); exit;
+});
+
+function bh_mappings_admin_page() {
+    global $wpdb;
+    $filter   = sanitize_text_field($_GET['filter'] ? $_GET['filter'] : 'all');
+    $where    = $filter === 'pending' ? "WHERE m.status = 'pending'" : ($filter === 'approved' ? "WHERE m.status = 'approved'" : '');
+    $mappings = $wpdb->get_results("SELECT m.*, p.post_title as wp_card_name FROM {$wpdb->prefix}bh_card_mappings m LEFT JOIN {$wpdb->posts} p ON m.wp_post_id = p.ID $where ORDER BY m.votes DESC, m.status ASC");
+    echo '<div class="wrap"><h1>BH Маппинги игровых ID</h1>';
+    if (isset($_GET['approved'])) echo '<div class="notice notice-success"><p>Маппинг подтверждён.</p></div>';
+    if (isset($_GET['rejected'])) echo '<div class="notice notice-warning"><p>Маппинг удалён.</p></div>';
+    if (isset($_GET['bulk_approved'])) echo '<div class="notice notice-success"><p>Подтверждено: ' . intval($_GET['bulk_approved']) . '.</p></div>';
+    echo '<div style="display:flex;gap:15px;align-items:center;margin-bottom:20px;flex-wrap:wrap">';
+    echo '<form method="post" action="' . admin_url('admin-post.php') . '" style="display:flex;gap:8px;align-items:center">';
+    echo '<input type="hidden" name="action" value="bh_bulk_approve">';
+    wp_nonce_field('bh_mapping_action');
+    echo '<label style="font-weight:bold">Массово подтвердить с голосами ≥</label>';
+    echo '<input type="number" name="min_votes" value="3" min="1" style="width:60px">';
+    echo '<button type="submit" class="button button-primary">Применить</button>';
+    echo '</form><div style="margin-left:auto">';
+    echo '<a href__="' . admin_url('admin.php?page=bh-mappings&filter=all') . '" class="button ' . ($filter==='all'?'button-primary':'') . '">Все</a> ';
+    echo '<a href__="' . admin_url('admin.php?page=bh-mappings&filter=pending') . '" class="button ' . ($filter==='pending'?'button-primary':'') . '">Ожидают</a> ';
+    echo '<a href__="' . admin_url('admin.php?page=bh-mappings&filter=approved') . '" class="button ' . ($filter==='approved'?'button-primary':'') . '">Подтверждённые</a>';
+    echo '</div></div>';
+    echo '<table class="widefat striped"><thead><tr><th>Game ID</th><th>Название</th><th>WP карта</th><th>WP ID</th><th>Голосов</th><th>Статус</th><th>Действия</th></tr></thead><tbody>';
+    foreach ($mappings as $m) {
+        echo '<tr><td><code>' . esc_html($m->game_id_be) . '</code></td>';
+        echo '<td>' . esc_html($m->card_name) . '</td>';
+        echo '<td>' . esc_html($m->wp_card_name ? $m->wp_card_name : '—') . '</td>';
+        echo '<td>' . ($m->wp_post_id ? esc_html($m->wp_post_id) : '<span style="color:#e74c3c">не найдена</span>') . '</td>';
+        echo '<td><strong>' . esc_html($m->votes) . '</strong></td>';
+        echo '<td>' . ($m->status === 'approved' ? '<span style="color:green">✓</span>' : '<span style="color:orange">⏳</span>') . '</td><td>';
+        if ($m->status === 'pending' && $m->wp_post_id) {
+            echo '<form method="post" action="' . admin_url('admin-post.php') . '" style="display:inline">';
+            echo '<input type="hidden" name="action" value="bh_approve_mapping">';
+            echo '<input type="hidden" name="mapping_id" value="' . $m->id . '">';
+            wp_nonce_field('bh_mapping_action');
+            echo '<button type="submit" class="button button-primary">Подтвердить</button></form> ';
+        }
+        echo '<form method="post" action="' . admin_url('admin-post.php') . '" style="display:inline">';
+        echo '<input type="hidden" name="action" value="bh_reject_mapping">';
+        echo '<input type="hidden" name="mapping_id" value="' . $m->id . '">';
+        wp_nonce_field('bh_mapping_action');
+        echo '<button type="submit" class="button">Удалить</button></form>';
+        echo '</td></tr>';
+    }
+    echo '</tbody></table></div>';
+}
+
+// ============================================================
+// ШОРТКОД: Декбилдер [berserk_deckbuilder]
+// ============================================================
+add_shortcode('berserk_deckbuilder', function() {
+    ob_start(); ?>
+<div id="berserk-app" class="db-v41">
+  <div v-if="loading" class="db-loading">Загрузка базы карт...</div>
+  <div v-else>
+    <div v-if="!selectedHero">
+      <h1 class="db-main-title">ВЫБЕРИТЕ ГЕРОЯ</h1>
+      <div v-for="group in heroGroups" :key="group.key" style="margin-bottom:28px">
+        <h3 :style="{color:group.color,marginBottom:'10px',letterSpacing:'1px',borderBottom:'1px solid '+group.color,paddingBottom:'5px',fontSize:'14px'}">{{ group.label }}</h3>
+        <div class="db-heroes-grid">
+          <div v-for="h in group.heroes" :key="h.id" @click="selectedHero = h; hoveredHero = null" @mouseenter="onHeroHover(h)" @mouseleave="onHeroLeave()" class="db-hero-item">
+            <div class="db-hero-img-wrap"><img :src="h.image"></div>
+            <div class="db-label">{{ h.title }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div v-else>
+      <div class="db-toolbar">
+        <button @click="selectedHero = null; deck = []; resetImport()" class="db-btn-back">← Герои</button>
+        <input v-model="search" placeholder="Поиск по названию или тексту карты..." class="db-search">
+        <div class="db-hero-tag">{{ selectedHero.title }}</div>
+      </div>
+      <div class="db-filters">
+        <div class="db-filter-group"><span class="db-filter-label">Редкость:</span>
+          <button v-for="r in rarityOptions" :key="r.key" @click="filterRarity = filterRarity===r.key ? '' : r.key" :class="['db-filter-btn', filterRarity===r.key ? 'db-filter-active' : '']">{{ r.label }}</button>
+        </div>
+        <div class="db-filter-group"><span class="db-filter-label">Дополнение:</span>
+          <select v-model="filterExpansion" class="db-filter-select"><option value="">Все</option><option v-for="exp in expansionOptions" :key="exp" :value="exp">{{ exp }}</option></select>
+        </div>
+        <div class="db-filter-group"><span class="db-filter-label">Стоимость:</span>
+          <button v-for="c in costOptions" :key="c.key" @click="filterCost = filterCost===c.key ? '' : c.key" :class="['db-filter-btn', filterCost===c.key ? 'db-filter-active' : '']">{{ c.label }}</button>
+        </div>
+        <button v-if="filterRarity || filterExpansion || filterCost || search" @click="filterRarity=''; filterExpansion=''; filterCost=''; search=''" class="db-filter-clear">Сбросить</button>
+      </div>
+      <div class="db-mobile-header">
+        <div class="db-counter" :class="{ok:deck.length>=40,err:deck.length>60}">{{ deck.length }}/60 · 💎{{ dustCost }}</div>
+        <div style="display:flex;gap:6px">
+          <button @click="showImportModal = true" class="db-btn-import-sm">📥 Импорт</button>
+          <button v-if="currentUser" @click="saveDeck(0)" class="db-btn-save-sm">💾</button>
+          <button v-if="currentUser" @click="saveDeck(1)" class="db-btn-save-sm db-btn-save-pub-sm">🌐</button>
+        </div>
+      </div>
+      <div class="db-mobile-tabs">
+        <button @click="mobileTab='cards'" :class="['db-tab', mobileTab==='cards' ? 'db-tab-active' : '']">🃏 Карты</button>
+        <button @click="mobileTab='deck'" :class="['db-tab', mobileTab==='deck' ? 'db-tab-active' : '']">📋 Колода ({{ deck.length }})</button>
+      </div>
+      <div class="db-builder-layout">
+        <div class="db-left-side" :class="{'db-hidden-mobile': mobileTab !== 'cards'}">
+          <div class="db-cards-grid">
+            <div v-for="c in filteredCards" :key="c.id" @click="addToDeck(c)" class="db-card-small" :class="{maxed: isMaxed(c)}"
+                 @mouseenter="onCardHover(c)" @mouseleave="onCardLeave()">
+              <img :src="c.image">
+              <div v-if="getCount(c.id) > 0" class="db-badge">{{ getCount(c.id) }}</div>
+              <div v-if="c.is_horde" class="db-horde-tag">ОРДА</div>
+            </div>
+          </div>
+        </div>
+        <div class="db-right-side" :class="{'db-hidden-mobile': mobileTab !== 'deck'}">
+          <div class="db-sidebar-card">
+            <h3 style="color:#f1c40f;margin:0 0 4px;font-size:14px">{{ selectedHero.title }}</h3>
+            <div v-if="currentDeckId" style="font-size:10px;color:#7ec8e3;margin-bottom:4px">✏️ Редактирование #{{ currentDeckId }}</div>
+            <div class="db-counter db-counter-desktop" :class="{ok:deck.length>=40,err:deck.length>60}">Карт: {{ deck.length }} / 60</div>
+            <div class="db-dust-cost">💎 Пыль на крафт: {{ dustCost }}</div>
+            <div class="db-type-row">
+              <div class="db-type-col"><div class="db-type-icon">🐉</div><div class="db-type-count">{{ typeCounts.creature }}</div><div class="db-type-label">Существа</div></div>
+              <div class="db-type-col"><div class="db-type-icon">🔥</div><div class="db-type-count">{{ typeCounts.spell }}</div><div class="db-type-label">Заклинания</div></div>
+              <div class="db-type-col"><div class="db-type-icon">🛡️</div><div class="db-type-count">{{ typeCounts.equipment }}</div><div class="db-type-label">Экипировка</div></div>
+            </div>
+            <div class="db-deck-list">
+              <div v-for="item in groupedDeck" :key="item.id" @click="removeFromDeckById(item.id)" class="db-deck-strip" :style="{backgroundImage:'url('+item.image+')',borderLeftColor:getElemColor(item.elements)}"
+                   @mouseenter="onCardHover(item)" @mouseleave="onCardLeave()">
+                <div class="strip-overlay" :style="{background:'linear-gradient(90deg,'+getElemAlpha(item.elements)+' 0%,rgba(0,0,0,0.55) 45%,rgba(0,0,0,0.05) 100%)'}"></div>
+                <span class="strip-cost">{{ item.cost }}</span><span class="strip-title">{{ item.title }}</span><span class="strip-count" :style="{background:getElemColor(item.elements),color:getElemText(item.elements)}">{{ item.count }}x</span>
+              </div>
+            </div>
+            <div class="db-footer">
+              <div v-if="currentUser" style="font-size:10px;color:#4caf50;margin-bottom:5px">👤 {{ currentUser.name }}</div>
+              <div v-if="headerIdHex" class="db-account-badge">✓ Код колоды готов к экспорту</div>
+              <div class="db-guide-fields">
+                <input v-model="guideUrl" class="db-guide-input" type="url" placeholder="Ссылка на текстовый гайд (необяз.)">
+                <input v-model="videoGuideUrl" class="db-guide-input" type="url" placeholder="Ссылка на YouTube-видеогайд (необяз.)">
+              </div>
+              <div v-if="currentUser" class="db-pro-box">
+                <div class="db-pro-head">
+                  <strong>Статус PRO</strong>
+                  <span v-if="proInfo.is_pro || proInfo.request_status==='approved'" class="bh-pro-badge">У вас активен статус PRO</span>
+                </div>
+                <div v-if="!proInfo.is_pro && proInfo.request_status==='pending'" class="db-pro-pending">Заявка на статус PRO отправлена и ожидает проверки администратора</div>
+                <button v-else-if="!proInfo.is_pro && proInfo.request_status!=='approved' && !showProForm" @click="showProForm=true" class="db-btn-import" style="margin-top:6px">Запросить статус PRO</button>
+                <div v-if="showProForm && !proInfo.is_pro && proInfo.request_status!=='pending' && proInfo.request_status!=='approved'" style="margin-top:6px">
+                  <textarea v-model="proAchievements" rows="3" class="db-guide-input" placeholder="Турниры, ладдер, достижения..."></textarea>
+                  <div style="display:flex;gap:5px;margin-top:5px">
+                    <button @click="submitProRequest" :disabled="proSubmitting" class="db-btn-save db-btn-save-pub" style="flex:1">{{ proSubmitting ? '...' : 'Отправить' }}</button>
+                    <button @click="showProForm=false" class="db-btn-save" style="flex:1">Отмена</button>
+                  </div>
+                </div>
+              </div>
+              <button @click="copyGeneratedCode" class="db-btn-copy" :disabled="deck.length < 40">{{ codeCopied ? '✓ Скопировано' : 'Скопировать код колоды' }}</button>
+              <button @click="showImportModal = true" class="db-btn-import">ИМПОРТ КОДА ИЗ ИГРЫ</button>
+              <div v-if="currentUser" style="display:flex;gap:5px;margin-top:8px">
+                <button @click="saveDeck(0)" class="db-btn-save">💾 Приватно</button>
+                <button @click="saveDeck(1)" class="db-btn-save db-btn-save-pub">🌐 Публично</button>
+              </div>
+              <div v-else style="font-size:10px;color:#888;text-align:center;margin-top:8px"><a :href__="loginUrl" style="color:#7ec8e3;text-decoration:underline;cursor:pointer">Войдите</a> чтобы сохранять колоды</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="hoveredCard" class="db-card-popup" :style="{ backgroundImage: 'url(' + hoveredCard.image + ')' }"></div>
+
+  <div v-if="hoveredHero" class="db-hero-popup" :style="{ backgroundImage: 'url(' + hoveredHero.image + ')' }">
+    <div class="db-popup-info">
+      <span class="db-popup-title">{{ hoveredHero.title }}</span>
+    </div>
+  </div>
+
+  <div v-if="showImportModal" class="db-modal-overlay" @click.self="showImportModal = false">
+    <div class="db-modal">
+      <h3 style="color:#f1c40f;margin:0 0 8px;font-size:14px">Импорт кода колоды</h3>
+      <p style="color:#aaa;font-size:11px;margin:0 0 10px">Вставьте одну Base64-строку кода колоды (как из «Скопировать код колоды» / импорт в игре).</p>
+      <textarea v-model="importText" rows="4" class="db-import-textarea" placeholder="QkhEMa..."></textarea>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button @click="doFullImport" style="flex:1;padding:10px;background:#f1c40f;color:#000;border:none;border-radius:6px;cursor:pointer;font-weight:bold">Импортировать</button>
+        <button @click="showImportModal = false" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Отмена</button>
+      </div>
+      <div v-if="importStatus" style="margin-top:10px;padding:8px;border-radius:6px;font-size:11px" :style="{background:importStatus.ok?'#1a3d1a':'#3d1a1a',color:importStatus.ok?'#4caf50':'#e74c3c'}">{{ importStatus.msg }}</div>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+.db-v41{background:#070707;color:#eee;padding:14px;border-radius:15px;font-family:sans-serif;position:relative}
+.db-main-title{text-align:center;color:#f1c40f;letter-spacing:2px;margin-bottom:24px;font-size:clamp(16px,5vw,24px);text-transform:uppercase}
+.db-loading{text-align:center;padding:80px;color:#f1c40f;font-size:16px}
+.db-label{text-align:center;font-size:10px;margin-top:4px;color:#ccc}
+.db-heroes-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:12px}
+.db-hero-item{cursor:pointer;transition:0.2s;display:flex;flex-direction:column;align-items:center}
+.db-hero-item:hover{transform:translateY(-3px)}
+.db-hero-img-wrap{width:100%;aspect-ratio:5/7;overflow:hidden;border-radius:8px;border:1px solid #444;background:#111}
+.db-hero-img-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.db-toolbar{display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
+.db-search{padding:8px;background:#111;border:1px solid #333;color:#fff;border-radius:6px;flex:1;min-width:100px;font-size:13px}
+.db-btn-back{background:#222;color:#fff;border:1px solid #333;padding:8px 10px;cursor:pointer;border-radius:6px;font-size:11px;white-space:nowrap}
+.db-hero-tag{font-size:11px;color:#f1c40f;border:1px solid #f1c40f;padding:5px 8px;border-radius:5px;font-weight:bold;white-space:nowrap}
+.db-filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;align-items:center;padding:8px;background:#0d0d0d;border:1px solid #222;border-radius:8px}
+.db-filter-group{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.db-filter-label{font-size:10px;color:#666;font-weight:bold;white-space:nowrap}
+.db-filter-btn{background:#1a1a1a;color:#888;border:1px solid #333;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:10px;font-weight:bold;transition:0.15s}
+.db-filter-btn:hover{border-color:#555;color:#ccc}
+.db-filter-active{background:#f1c40f!important;color:#000!important;border-color:#f1c40f!important}
+.db-filter-select{background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:3px 6px;font-size:10px;cursor:pointer}
+.db-filter-select:focus{outline:none;border-color:#f1c40f}
+.db-filter-clear{background:#3d1a1a;color:#e74c3c;border:1px solid #7d2d2d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:10px;font-weight:bold;margin-left:auto}
+.db-dust-cost{font-size:12px;font-weight:bold;color:#7ec8e3;margin:4px 0}
+.db-type-row{display:flex;gap:6px;margin:0 0 10px;padding:8px;background:#0a0a0a;border:1px solid #222;border-radius:8px}
+.db-type-col{flex:1;text-align:center}
+.db-type-icon{font-size:14px;line-height:1}
+.db-type-count{font-size:16px;font-weight:bold;color:#fff;margin-top:2px}
+.db-type-label{font-size:9px;color:#888;text-transform:uppercase;margin-top:2px}
+.db-guide-fields{display:flex;flex-direction:column;gap:5px;margin-bottom:8px}
+.db-guide-input{width:100%;box-sizing:border-box;background:#0a0a0a;border:1px solid #333;color:#ccc;border-radius:6px;padding:7px 8px;font-size:11px}
+.db-pro-box{margin:8px 0;padding:8px;background:#0d0d0d;border:1px solid #333;border-radius:8px}
+.db-pro-head{display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;color:#f1c40f;margin-bottom:4px}
+.db-pro-pending{font-size:11px;line-height:1.35;color:#ffa726;background:rgba(255,167,38,.08);border:1px solid rgba(255,167,38,.35);border-radius:6px;padding:6px 8px}
+.db-v41 .bh-pro-badge{display:inline-block;background:linear-gradient(135deg,#f1c40f,#e67e22);color:#111;font-size:9px;font-weight:900;padding:1px 6px;border-radius:4px}
+.db-mobile-header{display:none;align-items:center;justify-content:space-between;margin-bottom:8px}
+.db-mobile-tabs{display:none;gap:0;margin-bottom:10px;border-radius:8px;overflow:hidden;border:1px solid #333}
+.db-tab{flex:1;padding:10px;background:#111;color:#888;border:none;cursor:pointer;font-size:12px;font-weight:bold;transition:0.2s}
+.db-tab-active{background:#222;color:#f1c40f}
+.db-btn-import-sm{background:#1a3a5c;color:#7ec8e3;border:1px solid #2a5a8c;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:11px;font-weight:bold}
+.db-btn-save-sm{background:#1a3d1a;color:#4caf50;border:1px solid #2e7d32;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px}
+.db-btn-save-pub-sm{background:#1a3a5c;color:#7ec8e3;border-color:#2a5a8c}
+.db-builder-layout{display:flex;gap:16px}
+.db-left-side{flex:3;min-width:0}
+.db-right-side{flex:1;min-width:240px}
+.db-cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;max-height:800px;overflow-y:auto;padding-right:4px}
+.db-card-small{cursor:pointer;position:relative;transition:0.2s}
+.db-card-small:hover{transform:translateY(-3px)}
+.db-card-small img{width:100%;aspect-ratio:5/7;object-fit:cover;border-radius:6px;border:1px solid #333;display:block}
+.db-card-small.maxed img{filter:brightness(0.15) grayscale(1)}
+.db-badge{position:absolute;top:-7px;right:-7px;background:#e74c3c;width:22px;height:22px;border-radius:50%;text-align:center;line-height:22px;font-weight:bold;font-size:11px;border:2px solid #000;z-index:5}
+.db-horde-tag{position:absolute;bottom:4px;right:4px;background:#f1c40f;color:#000;font-size:8px;font-weight:bold;padding:2px 4px;border-radius:3px;z-index:3}
+.db-sidebar-card{background:#111;border:1px solid #333;border-radius:12px;padding:14px;position:sticky;top:16px}
+.db-deck-list{max-height:400px;overflow-y:auto;margin:8px 0}
+.db-deck-strip{height:38px;margin-bottom:3px;border-radius:4px;position:relative;display:flex;align-items:center;cursor:pointer;background-size:160%;background-position:center 30%;border-left:4px solid #888;overflow:hidden;transition:0.15s}
+.db-deck-strip:hover{filter:brightness(1.18)}
+.strip-overlay{position:absolute;top:0;left:0;width:100%;height:100%}
+.strip-cost{position:relative;width:26px;text-align:center;font-weight:bold;color:#fff;z-index:2;font-size:13px;text-shadow:0 0 5px #000;flex-shrink:0}
+.strip-title{position:relative;flex:1;font-size:11px;font-weight:bold;color:#fff;z-index:2;padding-left:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:1px 1px 3px #000}
+.strip-count{position:relative;font-weight:bold;padding:0 8px;height:100%;display:flex;align-items:center;z-index:2;font-size:11px;flex-shrink:0}
+.db-counter{margin:6px 0;font-size:13px;font-weight:bold;color:#555}
+.db-counter.ok{color:#27ae60}
+.db-counter.err{color:#e74c3c}
+.db-btn-copy{width:100%;padding:11px 12px;margin-top:8px;border:none;border-radius:8px;font-weight:bold;font-size:12px;letter-spacing:.3px;color:#1a1200;cursor:pointer;background:linear-gradient(180deg,#ffe082,#f1c40f 45%,#d4a017);box-shadow:0 2px 10px rgba(241,196,15,.35)}
+.db-btn-copy:hover:not(:disabled){filter:brightness(1.08)}
+.db-btn-copy:disabled{background:#333;color:#888;cursor:not-allowed;opacity:.55;box-shadow:none}
+.db-btn-import{width:100%;margin-top:6px;padding:9px;background:#1a3a5c;color:#7ec8e3;border:1px solid #2a5a8c;border-radius:6px;cursor:pointer;font-size:11px;font-weight:bold}
+.db-btn-save{flex:1;padding:7px;background:#1a3d1a;color:#4caf50;border:1px solid #2e7d32;border-radius:6px;cursor:pointer;font-size:11px;font-weight:bold;transition:0.2s}
+.db-btn-save:hover{background:#2e7d32;color:#fff}
+.db-btn-save-pub{background:#1a3a5c;color:#7ec8e3;border-color:#2a5a8c}
+.db-btn-save-pub:hover{background:#2a5a8c;color:#fff}
+.db-account-badge{background:#1a3d1a;color:#4caf50;border:1px solid #2e7d32;border-radius:6px;padding:5px 8px;font-size:10px;font-weight:bold;margin-bottom:7px;text-align:center}
+.db-account-warning{background:#3d2a00;color:#ffa726;border:1px solid #7d5000;border-radius:6px;padding:5px 8px;font-size:10px;margin-bottom:7px;text-align:center}
+.db-footer{padding-top:8px;border-top:1px solid #222}
+.db-modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.92);z-index:9999;display:flex;align-items:flex-end;justify-content:center}
+.db-modal{background:#111;border:1px solid #444;border-radius:12px 12px 0 0;padding:16px;width:100%;max-width:520px;max-height:92vh;overflow-y:auto}
+.db-import-textarea{width:100%;background:#0a0a0a;border:1px solid #333;color:#ccc;padding:10px;border-radius:6px;font-family:monospace;font-size:11px;resize:vertical;box-sizing:border-box}
+.db-card-popup{position:fixed;width:220px;height:308px;background-size:cover;background-position:center top;z-index:10000;pointer-events:none;box-shadow:0 8px 40px rgba(0,0,0,0.9);display:flex;align-items:flex-end;transition:opacity 0.1s}
+.db-hero-popup{position:fixed;width:220px;height:308px;background-size:cover;background-position:center top;z-index:10000;pointer-events:none;box-shadow:0 8px 40px rgba(0,0,0,0.9);display:flex;align-items:flex-end;transition:opacity 0.1s}
+.db-popup-info{width:100%;background:linear-gradient(transparent,rgba(0,0,0,0.85));padding:8px 10px}
+.db-popup-cost{display:inline-block;background:#f1c40f;color:#000;font-weight:bold;font-size:15px;padding:2px 10px;border-radius:4px;margin-bottom:5px}
+.db-popup-title{display:block;color:#fff;font-size:13px;font-weight:bold;text-shadow:1px 1px 3px #000}
+@media(max-width:640px){
+  .db-v41{padding:10px;border-radius:10px}
+  .db-mobile-header{display:flex}
+  .db-mobile-tabs{display:flex}
+  .db-builder-layout{display:block}
+  .db-right-side{min-width:0;margin-top:0}
+  .db-hidden-mobile{display:none!important}
+  .db-counter-desktop{display:none}
+  .db-sidebar-card{position:static;border-radius:8px}
+  .db-deck-list{max-height:none}
+  .db-cards-grid{grid-template-columns:repeat(auto-fill,minmax(85px,1fr));max-height:none}
+  .db-heroes-grid{grid-template-columns:repeat(auto-fill,minmax(85px,1fr))}
+  .db-filters{gap:5px;padding:6px}
+  .db-filter-btn{padding:2px 6px;font-size:9px}
+  .db-filter-clear{margin-left:0}
+  .db-card-popup{width:160px;height:224px}
+  .db-hero-popup{width:160px;height:224px}
+}
+@media (hover: none) {
+  .db-card-popup,.db-hero-popup{display:none!important}
+}
+</style>
+<script>
+(function(){
+const {createApp,ref,computed,onMounted} = Vue;
+const ELEM_GROUPS = [
+  {key:'степи',label:'🌾 Степи',color:'#f1c40f',textColor:'#000',alpha:'rgba(180,150,0,0.93)',slugs:['stepi','степи']},
+  {key:'горы',label:'⛰ Горы',color:'#2980b9',textColor:'#fff',alpha:'rgba(20,80,160,0.93)',slugs:['gory','горы']},
+  {key:'болото',label:'🌿 Болото',color:'#a8d5a2',textColor:'#000',alpha:'rgba(100,170,100,0.93)',slugs:['boloto','болото']},
+  {key:'лес',label:'🌲 Лес',color:'#27ae60',textColor:'#fff',alpha:'rgba(15,110,50,0.93)',slugs:['les','лес']},
+  {key:'тьма',label:'🌑 Тьма',color:'#8e44ad',textColor:'#fff',alpha:'rgba(80,20,120,0.93)',slugs:['tma','тьма']},
+  {key:'нейтралы',label:'⚪ Нейтралы',color:'#cd7f32',textColor:'#fff',alpha:'rgba(130,80,20,0.93)',slugs:['nejtraly','neutral','нейтралы']}
+];
+const getElemGroup = (elems) => { if (!elems || !elems.length) return ELEM_GROUPS[5]; for (const g of ELEM_GROUPS) { if (elems.some(e => g.slugs.some(s => e.includes(s)))) return g; } return ELEM_GROUPS[5]; };
+const getElemColor = (elems) => getElemGroup(elems).color;
+const getElemAlpha = (elems) => getElemGroup(elems).alpha;
+const getElemText = (elems) => getElemGroup(elems).textColor;
+const isNeutral = (elems) => getElemGroup(elems).key === 'нейтралы';
+const toLE = (hex8) => hex8.match(/.{2}/g).reverse().join('');
+const normalizeRarity = (r) => { if (!r) return ''; const s = r.toLowerCase(); if (s.includes('ультра')||s.includes('legend')) return 'legendary'; if (s.includes('редк')||s.includes('epic')) return 'epic'; if (s.includes('необыч')||s.includes('uncommon')||s.includes('rare')) return 'rare'; if (s.includes('част')||s.includes('common')) return 'common'; return s; };
+
+// Официальный формат BHD1 (как в razrab/deckcode.js).
+const BH_SIGNATURE = [0x42, 0x48, 0x44, 0x31];
+const BH_ID_HIGH = 0x08005000;
+const BH_CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function bhCrc32(bytes, length) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < length; i++) crc = BH_CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function bhParseId(id) {
+  if (typeof id !== 'string' || !/^[0-9A-Fa-f]{8}$/.test(id)) throw new Error('Некорректный ID карты: ' + id);
+  const value = parseInt(id, 16) >>> 0;
+  if (value === 0) throw new Error('ID карты не может быть 00000000');
+  return value;
+}
+function bhFormatId(value) {
+  return value.toString(16).toUpperCase().padStart(8, '0');
+}
+function decodeDeck(code) {
+  const trimmed = String(code || '').trim();
+  if (trimmed.length < 24 || trimmed.length > 1024) throw new Error('Неверная длина кода');
+  let bytes;
+  try {
+    const bin = atob(trimmed);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch (e) { throw new Error('Код не является Base64'); }
+  if (bytes.length < 17 || bytes.length > 4 + 8 + 1 + 80 * 9 + 4) throw new Error('Неверный размер данных');
+  const view = new DataView(bytes.buffer);
+  const crcPos = bytes.length - 4;
+  if (view.getUint32(crcPos, true) !== bhCrc32(bytes, crcPos)) throw new Error('Не сходится контрольная сумма');
+  for (let i = 0; i < 4; i++) if (bytes[i] !== BH_SIGNATURE[i]) throw new Error('Это не код колоды BHD1');
+  let p = 4;
+  const readId = () => {
+    const low = view.getUint32(p, true);
+    const high = view.getUint32(p + 4, true);
+    p += 8;
+    if (low === 0 && high === 0) throw new Error('Пустой ID карты');
+    if (high !== BH_ID_HIGH) throw new Error('Неизвестный формат ID карты');
+    return bhFormatId(low);
+  };
+  const hero = readId();
+  const count = bytes[p++];
+  if (count > 80) throw new Error('Слишком много карт');
+  if (bytes.length !== 13 + count * 9 + 4) throw new Error('Неверный размер данных');
+  const entries = [];
+  const seen = new Set();
+  for (let i = 0; i < count; i++) {
+    const id = readId();
+    const n = bytes[p++];
+    if (n < 1 || n > 10) throw new Error('Неверное количество карты ' + id);
+    if (seen.has(id)) throw new Error('Карта ' + id + ' указана дважды');
+    seen.add(id);
+    entries.push({ game_id_be: id.toLowerCase(), count: n, prefix: '00500008' });
+  }
+  return {
+    hero: hero.toLowerCase(),
+    heroId: hero.toLowerCase(),
+    heroIdLE: toLE(hero.toLowerCase()),
+    headerId: 'bhd1',
+    entries,
+    cards: entries.map(e => ({ id: e.game_id_be.toUpperCase(), count: e.count }))
+  };
+}
+function encodeDeck(cardsOrList, templateCode, heroGameId) {
+  let heroHex = '';
+  let records = [];
+  if (Array.isArray(cardsOrList) && cardsOrList.length && cardsOrList[0] && Object.prototype.hasOwnProperty.call(cardsOrList[0], 'count') && Object.prototype.hasOwnProperty.call(cardsOrList[0], 'id') && typeof cardsOrList[0].title === 'undefined') {
+    heroHex = String(templateCode || heroGameId || '').trim();
+    records = cardsOrList.map(c => ({ id: bhParseId(String(c.id)), count: c.count|0 }));
+  } else {
+    heroHex = String(heroGameId || '').trim();
+    if (!heroHex && templateCode) {
+      try { heroHex = decodeDeck(templateCode).hero; } catch (e) {}
+    }
+    const grouped = new Map();
+    (cardsOrList || []).forEach(card => {
+      const id = String(card.game_id || '').trim();
+      if (!/^[a-f0-9]{8}$/i.test(id)) throw new Error('Нет игрового ID у карты «' + (card.title || id) + '»');
+      const key = id.toUpperCase();
+      grouped.set(key, (grouped.get(key) || 0) + 1);
+    });
+    records = [...grouped.entries()].map(([id, count]) => ({ id: bhParseId(id), count }));
+  }
+  if (!/^[a-f0-9]{8}$/i.test(heroHex)) throw new Error('У выбранного героя нет игрового ID');
+  if (records.length > 80) throw new Error('Слишком много разных карт');
+  records.sort((a, b) => a.id - b.id);
+  for (let i = 1; i < records.length; i++) if (records[i].id === records[i - 1].id) throw new Error('Карта указана дважды');
+  for (const r of records) if (!Number.isInteger(r.count) || r.count < 1 || r.count > 10) throw new Error('Неверное количество копии карты');
+  const length = 13 + records.length * 9 + 4;
+  const bytes = new Uint8Array(length);
+  const view = new DataView(bytes.buffer);
+  let p = 0;
+  bytes.set(BH_SIGNATURE, p); p += 4;
+  view.setUint32(p, bhParseId(heroHex), true); view.setUint32(p + 4, BH_ID_HIGH, true); p += 8;
+  view.setUint8(p, records.length); p += 1;
+  for (const r of records) {
+    view.setUint32(p, r.id, true); view.setUint32(p + 4, BH_ID_HIGH, true); p += 8;
+    view.setUint8(p, r.count); p += 1;
+  }
+  view.setUint32(p, bhCrc32(bytes, p), true);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+createApp({
+  setup() {
+    const loading = ref(true);
+    const heroes = ref([]);
+    const cards = ref([]);
+    const selectedHero = ref(null);
+    const deck = ref([]);
+    const search = ref('');
+    const headerIdHex = ref('');
+    const heroIdLEHex = ref('');
+    const gameCode = ref('');
+    const codeCopied = ref(false);
+    const originalOrder = ref([]);
+    const currentUser = ref(null);
+    const approvedMaps = ref({});
+    const currentDeckId = ref(null);
+    const showImportModal = ref(false);
+    const importText = ref('');
+    const importStatus = ref(null);
+    const mobileTab = ref('cards');
+    const filterRarity = ref('');
+    const filterExpansion = ref('');
+    const filterCost = ref('');
+    const hoveredCard = ref(null);
+    const hoveredHero = ref(null);
+    const guideUrl = ref('');
+    const videoGuideUrl = ref('');
+    const showProForm = ref(false);
+    const proSubmitting = ref(false);
+    const proAchievements = ref('');
+    const proInfo = ref({is_pro:false, request_status:'', achievements:''});
+    const canHover = window.matchMedia('(hover: hover)').matches;
+    const loginUrl = '/login/?redirect_to=' + encodeURIComponent(window.location.pathname);
+    const RARITY_DUST = {legendary:2000, epic:400, rare:120, common:60};
+    const rarityOptions = [{key:'',label:'Все'},{key:'common',label:'Частая'},{key:'rare',label:'Необычная'},{key:'epic',label:'Редкая'},{key:'legendary',label:'Ультраредкая'}];
+    const costOptions = [{key:'0',label:'0'},{key:'1-2',label:'1-2'},{key:'3-4',label:'3-4'},{key:'5-6',label:'5-6'},{key:'7+',label:'7+'}];
+    const expansionOptions = computed(() => { const s = new Set(); cards.value.forEach(c => { if (c.expansion) s.add(c.expansion); }); return [...s].sort(); });
+    const dustCost = computed(() => { const g = {}; deck.value.forEach(c => { if (!g[c.id]) g[c.id] = Object.assign({},c,{count:0}); g[c.id].count++; }); return Object.values(g).reduce((sum,item) => sum + (RARITY_DUST[item.rarity]||0) * item.count, 0); });
+    const normalizeType = (t) => {
+      if (t === null || t === undefined || t === '') return '';
+      const s = String(t).toLowerCase().trim();
+      if (s === 'creature' || s === 'spell' || s === 'equipment' || s === 'hero') return s;
+      if (s === '1' || s === '01') return 'creature';
+      if (s === '2' || s === '02') return 'spell';
+      if (s === '3' || s === '03') return 'equipment';
+      if (s.includes('закл')||s.includes('spell')||s.includes('магия')||s.includes('magic')||s === 's'||s === 'sp') return 'spell';
+      if (s.includes('экип')||s.includes('equip')||s.includes('предм')||s.includes('оруж')||s.includes('weapon')||s.includes('доспех')||s.includes('armor')||s.includes('armour')||s.includes('амулет')||s.includes('amulet')||s.includes('артеф')||s.includes('artifact')||s.includes('item')||s.includes('gear')||s === 'e'||s === 'eq') return 'equipment';
+      if (s.includes('герой')||s.includes('hero')) return 'hero';
+      if (s.includes('сущ')||s.includes('creat')||s.includes('unit')||s.includes('minion')||s.includes('monster')||s.includes('монстр')||s.includes('юнит')||s.includes('воин')||s.includes('fighter')||s.includes('warrior')||s.includes('troop')||s.includes('отряд')||s.includes('боец')||s.includes('персонаж')||s === 'c'||s === 'cr'||s === 'u') return 'creature';
+      return '';
+    };
+    const resolveCardType = (c) => {
+      let t = normalizeType(c && c.type);
+      if (t === 'hero') return 'hero';
+      if (t === 'spell' || t === 'equipment' || t === 'creature') return t;
+      const full = cards.value.find(x => String(x.id) === String(c && c.id));
+      if (full) {
+        t = normalizeType(full.type);
+        if (t === 'spell' || t === 'equipment' || t === 'creature') return t;
+      }
+      // Не герой / не заклинание / не экипировка → существо
+      return 'creature';
+    };
+    const typeCounts = computed(() => {
+      let creature = 0, spell = 0, equipment = 0;
+      deck.value.forEach(c => {
+        const t = resolveCardType(c);
+        if (t === 'creature') creature++;
+        else if (t === 'spell') spell++;
+        else if (t === 'equipment') equipment++;
+      });
+      return { creature, spell, equipment };
+    });
+    const matchCost = (cost, filter) => { if (!filter) return true; const c = parseInt(cost)||0; if (filter==='0') return c===0; if (filter==='1-2') return c>=1&&c<=2; if (filter==='3-4') return c>=3&&c<=4; if (filter==='5-6') return c>=5&&c<=6; if (filter==='7+') return c>=7; return true; };
+    const resetImport = () => { headerIdHex.value=''; heroIdLEHex.value=''; gameCode.value=''; originalOrder.value=[]; currentDeckId.value=null; guideUrl.value=''; videoGuideUrl.value=''; };
+    const onCardHover = (c) => { if (canHover) hoveredCard.value = c; };
+    const onCardLeave = () => { hoveredCard.value = null; };
+    const onHeroHover = (h) => { if (canHover) hoveredHero.value = h; };
+    const onHeroLeave = () => { hoveredHero.value = null; };
+    const clearPopups = () => { hoveredCard.value = null; hoveredHero.value = null; };
+    const heroGroups = computed(() => ELEM_GROUPS.map(g => Object.assign({},g,{heroes:heroes.value.filter(h => getElemGroup(h.elements||[]).key===g.key)})).filter(g => g.heroes.length>0));
+    const groupedDeck = computed(() => { const g = {}; deck.value.forEach(c => { if (!g[c.id]) g[c.id] = Object.assign({},c,{count:0}); g[c.id].count++; }); return Object.values(g).sort((a,b) => (a.cost-b.cost) || a.title.localeCompare(b.title)); });
+    const filteredCards = computed(() => {
+      if (!selectedHero.value) return [];
+      const s = search.value.toLowerCase();
+      const isHigart = selectedHero.value.title === 'Хигарт';
+      const heroKey = getElemGroup(selectedHero.value.elements||[]).key;
+      return cards.value.filter(c => {
+        if (s) { const inTitle = c.title.toLowerCase().includes(s); const inDesc = (c.description||'').toLowerCase().includes(s); if (!inTitle && !inDesc) return false; }
+        if (filterRarity.value && normalizeRarity(c.rarity) !== filterRarity.value) return false;
+        if (filterExpansion.value && (c.expansion || '').trim().toLowerCase() !== filterExpansion.value.trim().toLowerCase()) return false;
+        if (filterCost.value && !matchCost(c.cost, filterCost.value)) return false;
+        if (isHigart) return true;
+        const key = getElemGroup(c.elements||[]).key;
+        return key === heroKey || key === 'нейтралы';
+      }).sort((a,b) => {
+        const ai = isHigart ? ELEM_GROUPS.findIndex(g => g.key===getElemGroup(a.elements||[]).key) : (isNeutral(a.elements||[]) ? 1 : 0);
+        const bi = isHigart ? ELEM_GROUPS.findIndex(g => g.key===getElemGroup(b.elements||[]).key) : (isNeutral(b.elements||[]) ? 1 : 0);
+        if (ai !== bi) return ai - bi;
+        if ((a.cost||0) !== (b.cost||0)) return (a.cost||0) - (b.cost||0);
+        return a.title.localeCompare(b.title);
+      });
+    });
+    const getCount = (id) => deck.value.filter(i => i.id === id).length;
+    const isMaxed = (c) => getCount(c.id) >= (c.is_horde ? 5 : 3);
+    const withResolvedType = (c) => {
+      if (!c) return c;
+      const t = resolveCardType(c);
+      if (c.type === t) return c;
+      return Object.assign({}, c, { type: t });
+    };
+    const addToDeck = (c) => { if (!isMaxed(c) && deck.value.length < 60) deck.value.push(withResolvedType(c)); };
+    const removeFromDeckById = (id) => { const i = deck.value.map(c => c.id).lastIndexOf(id); if (i !== -1) deck.value.splice(i, 1); };
+    const doFullImport = async () => {
+      importStatus.value = null;
+      let fullCode = (importText.value || '').trim();
+      if (!fullCode) { importStatus.value = {ok:false,msg:'Вставьте код колоды'}; return; }
+      // Если вставили текст с мусором — вытащим Base64-строку
+      const b64Match = fullCode.match(/[A-Za-z0-9+/]{20,}={0,2}/);
+      if (b64Match) fullCode = b64Match[0].trim();
+      let decoded;
+      try { decoded = decodeDeck(fullCode); }
+      catch(e) { importStatus.value = {ok:false,msg:'Ошибка декодирования: ' + e.message}; return; }
+      gameCode.value = fullCode;
+      heroIdLEHex.value = decoded.heroIdLE || toLE(decoded.hero || '');
+      headerIdHex.value = decoded.headerId || 'bhd1';
+      originalOrder.value = (decoded.entries || []).map(e => e.game_id_be);
+
+      const heroGid = String(decoded.hero || '').toLowerCase();
+      const hero = heroes.value.find(h => String(h.game_id || '').toLowerCase() === heroGid)
+        || heroes.value.find(h => String((approvedMaps.value||{})[heroGid] || '') === String(h.id));
+      if (!hero) {
+        importStatus.value = {ok:false,msg:'Герой с game_id ' + heroGid + ' не найден в базе сайта'};
+        return;
+      }
+      selectedHero.value = hero;
+
+      const restored = [];
+      const missing = [];
+      (decoded.entries || []).forEach(entry => {
+        const gid = String(entry.game_id_be || '').toLowerCase();
+        let card = cards.value.find(c => String(c.game_id || '').toLowerCase() === gid);
+        if (!card && approvedMaps.value && approvedMaps.value[gid]) {
+          const mappedId = approvedMaps.value[gid];
+          card = cards.value.find(c => String(c.id) === String(mappedId));
+        }
+        if (!card) { missing.push(gid); return; }
+        const typed = withResolvedType(card);
+        for (let k = 0; k < (entry.count || 0); k++) restored.push(typed);
+      });
+      deck.value = restored;
+      showImportModal.value = false;
+      importText.value = '';
+      mobileTab.value = 'deck';
+      importStatus.value = {ok:true,msg:'Импорт успешен'};
+      if (missing.length) {
+        alert('Импорт выполнен. Карт: ' + deck.value.length + '. Не найдено по card_game_id: ' + missing.length + '\n' + missing.slice(0,20).join(', '));
+      } else {
+        alert('Импорт успешен! Карт: ' + deck.value.length + '.');
+      }
+    };
+    const copyGeneratedCode = async () => {
+      try {
+        gameCode.value = encodeDeck(deck.value, null, selectedHero.value && selectedHero.value.game_id);
+        try { await navigator.clipboard.writeText(gameCode.value); }
+        catch(e) { const ta = document.createElement('textarea'); ta.value = gameCode.value; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
+        codeCopied.value = true;
+        setTimeout(() => codeCopied.value = false, 2000);
+      } catch(e) { alert(e.message || 'Не удалось создать код колоды'); }
+    };
+    const loadPro = async () => {
+      try {
+        const r = await fetch('/wp-json/berserk/v1/pro/me', {credentials:'include',headers:{'X-WP-Nonce':window.bhNonce||''}});
+        if (r.ok) {
+          proInfo.value = await r.json();
+          proAchievements.value = proInfo.value.request || proInfo.value.achievements || '';
+        }
+      } catch(e) {}
+    };
+    const submitProRequest = async () => {
+      if (proInfo.value.is_pro || proInfo.value.request_status === 'pending') {
+        alert('Ваша заявка уже находится на рассмотрении');
+        showProForm.value = false;
+        return;
+      }
+      if (!(proAchievements.value || '').trim()) { alert('Укажите достижения'); return; }
+      if (proSubmitting.value) return;
+      proSubmitting.value = true;
+      try {
+        const r = await fetch('/wp-json/berserk/v1/pro/request', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({achievements:proAchievements.value})});
+        const res = await r.json();
+        if (res.success) {
+          proInfo.value.request_status = 'pending';
+          showProForm.value = false;
+          alert(res.message || 'Заявка отправлена');
+        } else {
+          if (res.status === 'pending') proInfo.value.request_status = 'pending';
+          if (res.status === 'approved') { proInfo.value.request_status = 'approved'; proInfo.value.is_pro = true; }
+          showProForm.value = false;
+          alert(res.message || 'Ошибка отправки заявки');
+        }
+      } catch(e) {
+        alert('Ошибка отправки заявки');
+      } finally {
+        proSubmitting.value = false;
+      }
+    };
+    const saveDeck = async (isPublic) => {
+      if (!currentUser.value) { if (confirm('Нужно войти. Перейти?')) window.location.href = loginUrl; return; }
+      const name = prompt('Название колоды:', (selectedHero.value ? selectedHero.value.title : '') + ' колода');
+      if (!name) return;
+      const cardsToSave = deck.value.map(c => withResolvedType(c));
+      const r = await fetch('/wp-json/berserk/v1/decks/save', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({id:currentDeckId.value||0,name,hero_wp_id:selectedHero.value?selectedHero.value.id:0,deck:{heroTitle:selectedHero.value?selectedHero.value.title:'',cards:cardsToSave},header_id:headerIdHex.value,hero_le:heroIdLEHex.value,game_code:gameCode.value,guide_url:guideUrl.value,video_guide_url:videoGuideUrl.value,is_public:isPublic})});
+      const text = await r.text();
+      try { const res = JSON.parse(text); if (res.success) { currentDeckId.value = res.id; alert('Колода сохранена! ID: ' + res.id); } else alert('Ошибка сохранения: '+(res.message||JSON.stringify(res))); }
+      catch(e) { alert('Ошибка сохранения: HTTP '+r.status+'\n'+text.substring(0,300)); }
+    };
+    onMounted(async () => {
+      const [dataRes, mapsRes] = await Promise.all([fetch('/wp-json/berserk/v1/data',{credentials:'include'}), fetch('/wp-json/berserk/v1/mappings',{credentials:'include'})]);
+      const d = await dataRes.json();
+      heroes.value = d.heroes || [];
+      cards.value = (d.cards || []).map(c => {
+        const t = normalizeType(c.type);
+        return Object.assign({}, c, { type: (t === 'spell' || t === 'equipment') ? t : (t === 'hero' ? 'hero' : 'creature') });
+      });
+      approvedMaps.value = await mapsRes.json();
+      const me = window.bhCurrentUser || {logged_in:false};
+      if (me.logged_in) { currentUser.value = me; await loadPro(); }
+      const editData = localStorage.getItem('bh_edit_deck');
+      if (editData) {
+        try {
+          const ed = JSON.parse(editData);
+          localStorage.removeItem('bh_edit_deck');
+          currentDeckId.value = ed.id;
+          const h = heroes.value.find(hr => String(hr.id) === String(ed.hero_wp_id));
+          if (h) {
+            selectedHero.value = h;
+            const restoredDeck = [];
+            (ed.deck_json.cards||[]).forEach(savedCard => {
+              const found = cards.value.find(c => c.id === savedCard.id);
+              if (found) restoredDeck.push(withResolvedType(found));
+              else if (savedCard) restoredDeck.push(withResolvedType(savedCard));
+            });
+            deck.value = restoredDeck;
+            headerIdHex.value = ed.header_id || '';
+            heroIdLEHex.value = ed.hero_le || '';
+            gameCode.value = ed.game_code || '';
+            guideUrl.value = ed.guide_url || '';
+            videoGuideUrl.value = ed.video_guide_url || '';
+            mobileTab.value = 'deck';
+          }
+        } catch(e) { localStorage.removeItem('bh_edit_deck'); }
+      }
+      loading.value = false;
+      document.addEventListener('mousemove', (e) => {
+        if (!canHover) return;
+        const popup = document.querySelector('.db-card-popup');
+        if (popup && hoveredCard.value) {
+          let x = e.clientX + 20;
+          let y = e.clientY - 150;
+          if (x + 220 > window.innerWidth) x = e.clientX - 240;
+          if (y < 0) y = 10;
+          popup.style.left = x + 'px';
+          popup.style.top = y + 'px';
+        }
+        const heroPopup = document.querySelector('.db-hero-popup');
+        if (heroPopup && hoveredHero.value) {
+          let hx = e.clientX + 20;
+          let hy = e.clientY - 150;
+          if (hx + 220 > window.innerWidth) hx = e.clientX - 240;
+          if (hy < 0) hy = 10;
+          heroPopup.style.left = hx + 'px';
+          heroPopup.style.top = hy + 'px';
+        }
+      });
+      document.addEventListener('touchstart', (e) => {
+        if (!e.target.closest || !e.target.closest('.db-card-small,.db-deck-strip,.db-hero-item,.db-card-popup,.db-hero-popup')) {
+          clearPopups();
+        }
+      }, {passive:true});
+    });
+    return {loading,heroes,cards,heroGroups,selectedHero,deck,groupedDeck,search,filteredCards,headerIdHex,currentUser,loginUrl,showImportModal,importText,importStatus,currentDeckId,mobileTab,filterRarity,filterExpansion,filterCost,hoveredCard,hoveredHero,guideUrl,videoGuideUrl,showProForm,proSubmitting,proAchievements,proInfo,submitProRequest,typeCounts,rarityOptions,costOptions,expansionOptions,dustCost,addToDeck,removeFromDeckById,getCount,isMaxed,getElemColor,getElemAlpha,getElemText,resetImport,saveDeck,doFullImport,copyGeneratedCode,codeCopied,onCardHover,onCardLeave,onHeroHover,onHeroLeave};
+  }
+}).mount('#berserk-app');
+})();
+</script>
+<?php return ob_get_clean();
+});
+// ============================================================
+// ШОРТКОД: Публичные колоды [berserk_decks]
+// ============================================================
+add_shortcode('berserk_decks', function() {
+    ob_start(); ?>
+<div id="bh-decks-page">
+  <div v-if="loading" class="bh-loading">Загрузка колод...</div>
+  <div v-else>
+    <h2 class="bh-page-title">МЕТА-КОЛОДЫ</h2>
+    <div class="bh-filter-bar">
+      <div v-if="filterAuthorId" class="bh-author-filter">
+        <span>Колоды автора: <strong>{{ filterAuthorName || ('#' + filterAuthorId) }}</strong></span>
+        <button @click="clearAuthorFilter" class="bh-pill-sm">Сбросить фильтр автора</button>
+      </div>
+      <div class="bh-filter-pills">
+        <button @click="filterElem=''; filterHero=''" :class="['bh-pill', !filterElem && !filterHero ? 'bh-pill-active' : '']">Все ({{ decks.length }})</button>
+        <button v-for="eg in ELEM_GROUPS" :key="eg.key" @click="filterElem = filterElem===eg.key ? '' : eg.key; filterHero=''" :class="['bh-pill', filterElem===eg.key ? 'bh-pill-active' : '']" :style="filterElem===eg.key ? { background: eg.color, color: eg.textColor, borderColor: eg.color } : {}">{{ eg.label }} ({{ decksByElem(eg.key).length }})</button>
+      </div>
+      <div v-if="filterElem" class="bh-hero-pills">
+        <button v-for="hero in heroesInElem(filterElem)" :key="hero" @click="filterHero = filterHero===hero ? '' : hero" :class="['bh-pill-sm', filterHero===hero ? 'bh-pill-sm-active' : '']">{{ hero }} ({{ decksByHero(hero).length }})</button>
+      </div>
+      <div class="bh-sort-bar">
+        <span class="bh-sort-label">Сортировка:</span>
+        <button @click="sortBy='likes'" :class="['bh-sort-btn', sortBy==='likes' ? 'bh-sort-active' : '']">По популярности</button>
+        <button @click="sortBy='date'" :class="['bh-sort-btn', sortBy==='date' ? 'bh-sort-active' : '']">По дате обновления</button>
+      </div>
+    </div>
+    <div v-if="filteredDecks.length === 0" class="bh-empty">Колод не найдено</div>
+    <div class="bh-deck-list">
+      <div v-for="(deck, idx) in filteredDecks" :key="deck.id" class="bh-deck-row" @click="openDeck(deck.id)">
+        <div class="bh-row-bg" :style="{ backgroundImage: 'url(' + (getHeroImage(deck) || '') + ')' }"></div>
+        <div class="bh-row-overlay"></div>
+        <div class="bh-row-content">
+          <div class="bh-col-rank">{{ idx + 1 }}</div>
+          <div class="bh-col-info">
+            <div class="bh-deck-name">{{ deck.name }} <span v-if="deck.is_pro || deck.author_is_pro" class="bh-pro-badge" :title="(deck.pro_achievements || deck.author_pro_achievements) || 'PRO автор'" @click.stop="toggleProTip(deck)">PRO</span></div>
+            <div class="bh-deck-hero"><span class="bh-elem-dot" :style="{ background: getHeroElemColor(deck) }"></span>{{ deck.deck_json.heroTitle || '—' }}</div>
+            <div class="bh-deck-author">{{ deck.author }} · {{ (deck.deck_json.cards || []).length }} карт · {{ formatDate(deck.updated_at) }}</div>
+            <div class="bh-deck-actions-inline" @click.stop>
+              <a v-if="deck.guide_url" :href="deck.guide_url" target="_blank" rel="noopener" class="bh-mini-btn">Гайд</a>
+              <button v-if="deck.video_url || deck.video_guide_url" @click="openVideo(deck.video_url || deck.video_guide_url)" class="bh-mini-btn">Видеогайд</button>
+              <button @click="followAuthor(deck)" class="bh-mini-btn">Отслеживать автора</button>
+            </div>
+            <div v-if="proTipDeckId===deck.id && (deck.pro_achievements || deck.author_pro_achievements)" class="bh-pro-tip">{{ deck.pro_achievements || deck.author_pro_achievements }}</div>
+          </div>
+          <div class="bh-col-cards">
+            <div class="bh-card-thumbs">
+              <div v-for="(item, ci) in topGroupedCards(deck.deck_json.cards, 8)" :key="ci" class="bh-thumb-wrap">
+                <img :src="item.image" :alt="item.title" class="bh-card-thumb" :style="{ borderLeft: '2px solid ' + getElemColor(item.elements) }">
+              </div>
+            </div>
+          </div>
+          <div class="bh-col-stats">
+            <div class="bh-stat-label">Игры</div>
+            <div v-if="deck.total_games > 0" class="bh-stat-val">{{ deck.total_games }}</div>
+            <div v-else class="bh-stat-muted">—</div>
+          </div>
+          <div class="bh-col-stats">
+            <div class="bh-stat-label">Винрейт</div>
+            <div v-if="deck.winrate !== null" class="bh-stat-val" :class="{ 'bh-wr-good': deck.winrate >= 55, 'bh-wr-bad': deck.winrate < 45 }">{{ deck.winrate }}%</div>
+            <div v-else class="bh-stat-muted">—</div>
+          </div>
+          <div class="bh-col-stats">
+            <div class="bh-stat-label">Пыль</div>
+            <div class="bh-stat-val">💎{{ deck.dust_cost }}</div>
+          </div>
+          <div class="bh-col-likes" @click.stop="likeDeck(deck)">
+            <button class="bh-like-btn" :class="{ 'bh-liked': deck.liked_by_me }">{{ deck.liked_by_me ? '❤️' : '🤍' }} {{ deck.likes }}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script>
+Vue.createApp({
+  setup() {
+    const loading = Vue.ref(true);
+    const decks = Vue.ref([]);
+    const allCards = Vue.ref([]);
+    const allHeroes = Vue.ref([]);
+    const filterElem = Vue.ref('');
+    const filterHero = Vue.ref('');
+    const filterAuthorId = Vue.ref('');
+    const filterAuthorName = Vue.ref('');
+    const proTipDeckId = Vue.ref(null);
+    const sortBy = Vue.ref('likes');
+    const deckViewUrl = '<?php echo esc_js(BH_DECKVIEW_URL); ?>';
+    const ELEM_GROUPS = [
+      {key:'степи',label:'🌾 Степи',color:'#f1c40f',textColor:'#000',alpha:'rgba(180,150,0,0.93)',slugs:['stepi','степи']},
+      {key:'горы',label:'⛰ Горы',color:'#2980b9',textColor:'#fff',alpha:'rgba(20,80,160,0.93)',slugs:['gory','горы']},
+      {key:'болото',label:'🌿 Болото',color:'#a8d5a2',textColor:'#000',alpha:'rgba(100,170,100,0.93)',slugs:['boloto','болото']},
+      {key:'лес',label:'🌲 Лес',color:'#27ae60',textColor:'#fff',alpha:'rgba(15,110,50,0.93)',slugs:['les','лес']},
+      {key:'тьма',label:'🌑 Тьма',color:'#8e44ad',textColor:'#fff',alpha:'rgba(80,20,120,0.93)',slugs:['tma','тьма']},
+      {key:'нейтралы',label:'⚪ Нейт.',color:'#cd7f32',textColor:'#fff',alpha:'rgba(130,80,20,0.93)',slugs:['nejtraly','neutral','нейтралы']}
+    ];
+    const getElemGroup = (elems) => { if (!elems || !elems.length) return ELEM_GROUPS[5]; for (const g of ELEM_GROUPS) { if (elems.some(e => g.slugs.some(s => e.includes(s)))) return g; } return ELEM_GROUPS[5]; };
+    const getElemColor = (elems) => getElemGroup(elems).color;
+    const getHeroElemKey = (deck) => { const hero = allHeroes.value.find(h => h.title === deck.deck_json.heroTitle); return hero ? getElemGroup(hero.elements || []).key : 'нейтралы'; };
+    const getHeroElemColor = (deck) => getElemGroup(allHeroes.value.find(h => h.title === deck.deck_json.heroTitle)?.elements || []).color;
+    const getHeroImage = (deck) => { const hero = allHeroes.value.find(h => h.title === deck.deck_json.heroTitle); return hero ? hero.image : null; };
+    const getCardData = (c) => allCards.value.find(x => x.id === c.id) || c;
+    const topGroupedCards = (cards, limit) => { if (!cards) return []; const g = {}; cards.forEach(c => { const f = getCardData(c); if (!g[c.id]) g[c.id] = Object.assign({}, f, {count:0}); g[c.id].count++; }); return Object.values(g).sort((a,b) => (a.cost||0)-(b.cost||0) || a.title.localeCompare(b.title)).slice(0, limit); };
+    const decksByElem = (key) => decks.value.filter(d => getHeroElemKey(d) === key);
+    const heroesInElem = (key) => [...new Set(decksByElem(key).map(d => d.deck_json ? d.deck_json.heroTitle : null).filter(Boolean))].sort();
+    const decksByHero = (hero) => decks.value.filter(d => d.deck_json && d.deck_json.heroTitle === hero);
+    const formatDate = (ts) => { if (!ts) return ''; const d = new Date(ts * 1000); return d.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric'}); };
+    const openDeck = (id) => { window.location.href = deckViewUrl + '?deck_id=' + id; };
+    const openVideo = (url) => { if (window.bhOpenYoutubeModal) window.bhOpenYoutubeModal(url); else window.open(url, '_blank'); };
+    const deckAuthorId = (deck) => String(deck.author_id || deck.user_id || '');
+    const followAuthor = (deck) => {
+      filterAuthorId.value = deckAuthorId(deck);
+      filterAuthorName.value = deck.author || '';
+      const url = new URL(window.location.href);
+      url.searchParams.set('author_id', filterAuthorId.value);
+      window.history.replaceState({}, '', url);
+    };
+    const clearAuthorFilter = () => {
+      filterAuthorId.value = '';
+      filterAuthorName.value = '';
+      const url = new URL(window.location.href);
+      url.searchParams.delete('author_id');
+      window.history.replaceState({}, '', url);
+    };
+    const toggleProTip = (deck) => { proTipDeckId.value = proTipDeckId.value === deck.id ? null : deck.id; };
+    const filteredDecks = Vue.computed(() => {
+      let list = decks.value;
+      if (filterAuthorId.value) list = list.filter(d => deckAuthorId(d) === String(filterAuthorId.value));
+      if (filterElem.value) list = list.filter(d => getHeroElemKey(d) === filterElem.value);
+      if (filterHero.value) list = list.filter(d => d.deck_json && d.deck_json.heroTitle === filterHero.value);
+      if (sortBy.value === 'date') list = [...list].sort((a,b) => (b.updated_at||0) - (a.updated_at||0));
+      else list = [...list].sort((a,b) => b.likes - a.likes);
+      return list;
+    });
+    const likeDeck = async (deck) => { const r = await fetch('/wp-json/berserk/v1/decks/' + deck.id + '/like', {method:'POST',credentials:'include',headers:{'X-WP-Nonce':window.bhNonce||''}}); const res = await r.json(); if (res.success) { deck.liked_by_me = res.liked; deck.likes = res.likes; } };
+    Vue.onMounted(async () => {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('author_id')) filterAuthorId.value = params.get('author_id');
+      const [decksRes, dataRes] = await Promise.all([fetch('/wp-json/berserk/v1/decks/public',{credentials:'include'}), fetch('/wp-json/berserk/v1/data',{credentials:'include'})]);
+      decks.value = await decksRes.json();
+      const data = await dataRes.json();
+      allCards.value = data.cards || []; allHeroes.value = data.heroes || [];
+      if (filterAuthorId.value) {
+        const hit = decks.value.find(d => deckAuthorId(d) === String(filterAuthorId.value));
+        if (hit) filterAuthorName.value = hit.author || '';
+      }
+      loading.value = false;
+    });
+    return { loading, decks, filteredDecks, filterElem, filterHero, filterAuthorId, filterAuthorName, proTipDeckId, sortBy, ELEM_GROUPS, topGroupedCards, likeDeck, getElemColor, getHeroImage, getHeroElemColor, decksByElem, heroesInElem, decksByHero, formatDate, openDeck, openVideo, followAuthor, clearAuthorFilter, toggleProTip };
+  }
+}).mount('#bh-decks-page');
+</script>
+<style>
+#bh-decks-page{background:#0d0d0d;color:#eee;padding:16px;border-radius:12px;font-family:system-ui,sans-serif;position:relative}
+.bh-loading{text-align:center;padding:60px;color:#f1c40f}
+.bh-page-title{color:#f1c40f;text-align:center;letter-spacing:2px;margin:0 0 16px;font-size:clamp(16px,4vw,22px);text-transform:uppercase}
+.bh-empty{text-align:center;color:#888;padding:40px}
+.bh-author-filter{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;padding:8px 10px;background:#151515;border:1px solid #333;border-radius:8px;font-size:12px}
+.bh-pro-badge{display:inline-block;margin-left:6px;background:linear-gradient(135deg,#f1c40f,#e67e22);color:#111;font-size:9px;font-weight:900;padding:1px 6px;border-radius:4px;vertical-align:middle;cursor:help}
+.bh-pro-tip{margin-top:6px;padding:6px 8px;background:rgba(0,0,0,.75);border:1px solid #665200;border-radius:6px;font-size:11px;color:#f8e7a1;white-space:pre-wrap}
+.bh-deck-actions-inline{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+.bh-mini-btn{background:#1a1a1a;color:#ddd;border:1px solid #444;border-radius:6px;padding:3px 8px;font-size:10px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block}
+.bh-mini-btn:hover{border-color:#777;color:#fff}
+.bh-filter-bar{margin-bottom:16px}
+.bh-filter-pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.bh-hero-pills{display:flex;flex-wrap:wrap;gap:4px;padding-top:8px;border-top:1px solid #222}
+.bh-pill{background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:20px;padding:5px 12px;cursor:pointer;font-size:12px;font-weight:bold;transition:0.15s}
+.bh-pill:hover{border-color:#555;color:#fff}
+.bh-pill-active{background:#f1c40f;color:#000;border-color:#f1c40f}
+.bh-pill-sm{background:#111;color:#888;border:1px solid #333;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px}
+.bh-pill-sm:hover{color:#ccc}
+.bh-pill-sm-active{background:#333;color:#f1c40f;border-color:#f1c40f}
+.bh-sort-bar{display:flex;align-items:center;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #222;flex-wrap:wrap}
+.bh-sort-label{font-size:11px;color:#888;font-weight:bold}
+.bh-sort-btn{background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-weight:bold;transition:0.15s}
+.bh-sort-btn:hover{border-color:#555;color:#fff}
+.bh-sort-active{background:#f1c40f;color:#000;border-color:#f1c40f}
+.bh-deck-list{display:flex;flex-direction:column;gap:6px}
+.bh-deck-row{position:relative;border-radius:10px;overflow:hidden;cursor:pointer;min-height:72px;border:1px solid #222;transition:border-color 0.2s}
+.bh-deck-row:hover{border-color:#444}
+.bh-row-bg{position:absolute;inset:0;background-size:cover;background-position:center 20%;filter:brightness(0.5) saturate(1.3);transform:scale(1.5)}
+.bh-row-overlay{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,0.88) 0%,rgba(0,0,0,0.6) 35%,rgba(0,0,0,0.3) 100%)}
+.bh-row-content{position:relative;display:flex;align-items:center;padding:10px 14px;gap:12px;z-index:2}
+.bh-col-rank{width:32px;text-align:center;flex-shrink:0;font-size:18px;font-weight:bold;color:#f1c40f}
+.bh-col-info{flex:1;min-width:0}
+.bh-deck-name{color:#fff;font-weight:bold;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:1px 1px 4px #000}
+.bh-deck-hero{font-size:12px;color:#ddd;margin-top:2px;display:flex;align-items:center;gap:5px;text-shadow:1px 1px 3px #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bh-elem-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.bh-deck-author{font-size:10px;color:#aaa;margin-top:1px;text-shadow:1px 1px 2px #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bh-col-cards{flex-shrink:0}
+.bh-card-thumbs{display:flex;gap:3px}
+.bh-thumb-wrap{position:relative}
+.bh-card-thumb{width:36px;height:50px;object-fit:cover;border-radius:4px;flex-shrink:0}
+.bh-col-stats{width:64px;text-align:center;flex-shrink:0}
+.bh-stat-label{font-size:9px;color:#999;text-transform:uppercase;margin-bottom:2px}
+.bh-stat-val{font-weight:bold;font-size:14px;color:#fff;text-shadow:1px 1px 2px #000}
+.bh-stat-muted{color:#666;font-size:14px}
+.bh-wr-good{color:#4caf50}
+.bh-wr-bad{color:#e74c3c}
+.bh-col-likes{width:64px;text-align:center;flex-shrink:0}
+.bh-like-btn{background:rgba(20,20,20,0.8);color:#aaa;border:1px solid #444;border-radius:20px;padding:5px 10px;cursor:pointer;font-size:11px;transition:0.15s}
+.bh-like-btn:hover{border-color:#666}
+.bh-liked{background:rgba(60,20,20,0.9);color:#e74c3c;border-color:#7d2d2d}
+@media(max-width:768px){.bh-col-cards{display:none}.bh-col-stats{width:42px}.bh-col-likes{width:42px}.bh-deck-name{font-size:13px}.bh-row-content{padding:8px 10px;gap:6px}.bh-col-rank{width:24px;font-size:14px}.bh-stat-label{font-size:8px}.bh-stat-val{font-size:12px}.bh-like-btn{padding:4px 7px;font-size:10px}}
+</style>
+<?php return ob_get_clean();
+});
+
+// ============================================================
+// ШОРТКОД: Мои колоды [berserk_mydecks]
+// ============================================================
+add_shortcode('berserk_mydecks', function() {
+    ob_start(); ?>
+<div id="bh-mydecks-app">
+  <div v-if="loading" style="text-align:center;padding:60px;color:#f1c40f">Загрузка...</div>
+  <div v-else-if="!currentUser" style="text-align:center;padding:60px;color:#aaa"><p>Войдите на сайт, чтобы видеть свои колоды.</p><a :href__="loginUrl" style="color:#7ec8e3;text-decoration:underline">Войти</a></div>
+  <div v-else>
+    <h2 style="color:#f1c40f;letter-spacing:2px;margin-bottom:20px;font-size:clamp(14px,4vw,20px)">МОИ КОЛОДЫ</h2>
+    <div class="bh-pro-box" @click.stop>
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <strong style="color:#f1c40f">Статус PRO</strong>
+        <span v-if="proInfo.is_pro || proInfo.request_status==='approved'" class="bh-pro-badge">У вас активен статус PRO</span>
+      </div>
+      <div v-if="!proInfo.is_pro && proInfo.request_status==='pending'" class="bh-pro-status-msg">Заявка на статус PRO отправлена и ожидает проверки администратора</div>
+      <button v-else-if="!proInfo.is_pro && proInfo.request_status!=='approved' && !showProForm" @click="showProForm=true" class="bh-btn bh-btn-public" style="width:100%;margin-bottom:8px">Запросить статус PRO</button>
+      <div v-if="showProForm && !proInfo.is_pro && proInfo.request_status!=='pending' && proInfo.request_status!=='approved'">
+        <textarea v-model="proAchievements" rows="4" class="bh-pro-textarea" placeholder="Турниры, ладдер, достижения..."></textarea>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button @click="submitProRequest" :disabled="proSubmitting" class="bh-btn bh-btn-public" style="flex:1">{{ proSubmitting ? 'Отправка...' : 'Отправить заявку' }}</button>
+          <button @click="showProForm=false" class="bh-btn bh-btn-private" style="flex:1">Отмена</button>
+        </div>
+      </div>
+    </div>
+    <div v-if="decks.length === 0" style="color:#888;text-align:center;padding:40px">У вас пока нет сохранённых колод</div>
+    <div class="bh-mydecks-grid">
+      <div v-for="deck in decks" :key="deck.id" @click="openDeck(deck.id)" class="bh-mydeck-card" @mouseover="$event.currentTarget.style.borderColor='#f1c40f'" @mouseleave="$event.currentTarget.style.borderColor='#333'">
+        <div class="bh-mydeck-bg" :style="{ backgroundImage: 'url(' + (getHeroImage(deck) || '') + ')' }"></div>
+        <div class="bh-mydeck-overlay"></div>
+        <div class="bh-mydeck-content">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:6px">
+          <strong style="color:#f1c40f;font-size:13px;line-height:1.3">{{ deck.name }}</strong>
+          <span :style="{ fontSize:'10px', padding:'2px 7px', borderRadius:'10px', background: deck.is_public ? '#1a3a5c' : '#222', color: deck.is_public ? '#7ec8e3' : '#888', whiteSpace:'nowrap', flexShrink:'0' }">{{ deck.is_public ? '🌐 Публ.' : '🔒 Прив.' }}</span>
+        </div>
+        <div style="font-size:11px;color:#aaa;margin-bottom:3px">Герой: {{ deck.deck_json.heroTitle || '—' }}</div>
+        <div style="font-size:11px;color:#aaa;margin-bottom:8px">{{ (deck.deck_json.cards || []).length }} карт · 💎 {{ deck.dust_cost }} · ❤️ {{ deck.likes }} · 📅 {{ formatDate(deck.updated_at) }}</div>
+        <div class="bh-guide-edit" @click.stop>
+          <input v-model="deck.guide_url" class="bh-guide-input" type="url" placeholder="Ссылка на гайд" @change="saveGuides(deck)">
+          <input v-model="deck.video_guide_url" class="bh-guide-input" type="url" placeholder="Ссылка на видеогайд YouTube" @change="saveGuides(deck)">
+        </div>
+        <div class="bh-deck-actions" @click.stop>
+          <button @click.stop="togglePublic(deck, 1)" class="bh-btn bh-btn-public">🌐 Публ.</button>
+          <button @click.stop="togglePublic(deck, 0)" class="bh-btn bh-btn-private">🔒 Прив.</button>
+        </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script>
+(function(){
+const {createApp,ref,onMounted} = Vue;
+createApp({
+  setup() {
+    const loading = ref(true);
+    const currentUser = ref(null);
+    const decks = ref([]);
+    const allHeroes = ref([]);
+    const showProForm = ref(false);
+    const proSubmitting = ref(false);
+    const proAchievements = ref('');
+    const proInfo = ref({is_pro:false, request_status:'', achievements:''});
+    const loginUrl = '/login/?redirect_to=' + encodeURIComponent(window.location.pathname);
+    const deckViewUrl = '<?php echo esc_js(BH_DECKVIEW_URL); ?>';
+    const getHeroImage = (deck) => { const hero = allHeroes.value.find(h => h.title === (deck.deck_json ? deck.deck_json.heroTitle : '')); return hero ? hero.image : null; };
+    const formatDate = (ts) => { if (!ts) return ''; const d = new Date(ts * 1000); return d.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric'}); };
+    const openDeck = (id) => { window.location.href = deckViewUrl + '?deck_id=' + id; };
+    const loadDecks = async () => { const r = await fetch('/wp-json/berserk/v1/decks/my', {credentials:'include',headers:{'X-WP-Nonce':window.bhNonce||''}}); if (r.ok) decks.value = await r.json(); };
+    const loadPro = async () => { try { const r = await fetch('/wp-json/berserk/v1/pro/me', {credentials:'include',headers:{'X-WP-Nonce':window.bhNonce||''}}); if (r.ok) { proInfo.value = await r.json(); proAchievements.value = proInfo.value.request || proInfo.value.achievements || ''; } } catch(e){} };
+    const submitProRequest = async () => {
+      if (proInfo.value.is_pro || proInfo.value.request_status === 'pending') {
+        alert('Ваша заявка уже находится на рассмотрении');
+        showProForm.value = false;
+        return;
+      }
+      if (!(proAchievements.value || '').trim()) { alert('Укажите достижения'); return; }
+      if (proSubmitting.value) return;
+      proSubmitting.value = true;
+      try {
+        const r = await fetch('/wp-json/berserk/v1/pro/request', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({achievements:proAchievements.value})});
+        const res = await r.json();
+        if (res.success) {
+          proInfo.value.request_status = 'pending';
+          showProForm.value = false;
+          alert(res.message || 'Заявка отправлена');
+        } else {
+          if (res.status === 'pending') proInfo.value.request_status = 'pending';
+          if (res.status === 'approved') { proInfo.value.request_status = 'approved'; proInfo.value.is_pro = true; }
+          showProForm.value = false;
+          alert(res.message || 'Ошибка отправки заявки');
+        }
+      } catch(e) {
+        alert('Ошибка отправки заявки');
+      } finally {
+        proSubmitting.value = false;
+      }
+    };
+    const saveGuides = async (deck) => {
+      const r = await fetch('/wp-json/berserk/v1/decks/'+deck.id+'/update-meta', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({guide_url:deck.guide_url||'', video_guide_url:deck.video_guide_url||''})});
+      const res = await r.json();
+      if (!res.success) alert('Не удалось сохранить ссылки');
+    };
+    const togglePublic = async (deck, val) => { const r = await fetch('/wp-json/berserk/v1/decks/'+deck.id+'/visibility', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({is_public:val})}); const res = await r.json(); if (res.success) deck.is_public = val; else alert('Ошибка: '+(res.message||'неизвестная ошибка')); };
+    onMounted(() => { const init = async () => { const me = window.bhCurrentUser || {logged_in:false}; if (me.logged_in) { currentUser.value = me; await Promise.all([loadDecks(), loadPro()]); try { const dataRes = await fetch('/wp-json/berserk/v1/data', {credentials:'include'}); const data = await dataRes.json(); allHeroes.value = data.heroes || []; } catch(e){} } loading.value = false; }; if (document.readyState === 'complete') init(); else window.addEventListener('load', init, {once:true}); });
+    return {loading,currentUser,decks,loginUrl,togglePublic,getHeroImage,formatDate,openDeck,showProForm,proSubmitting,proAchievements,proInfo,submitProRequest,saveGuides};
+  }
+}).mount('#bh-mydecks-app');
+})();
+</script>
+<style>
+#bh-mydecks-app{background:#070707;color:#eee;padding:16px;border-radius:15px;font-family:sans-serif}
+.bh-pro-box{background:#111;border:1px solid #333;border-radius:10px;padding:12px;margin-bottom:16px}
+.bh-pro-textarea,.bh-guide-input{width:100%;box-sizing:border-box;background:#0a0a0a;border:1px solid #333;color:#ccc;border-radius:6px;padding:8px;font-size:12px}
+.bh-guide-edit{display:flex;flex-direction:column;gap:5px;margin-bottom:8px}
+.bh-pro-badge{display:inline-block;background:linear-gradient(135deg,#f1c40f,#e67e22);color:#111;font-size:10px;font-weight:900;padding:2px 7px;border-radius:4px}
+.bh-pro-status-msg{font-size:12px;line-height:1.4;color:#ffa726;background:rgba(255,167,38,.08);border:1px solid rgba(255,167,38,.35);border-radius:8px;padding:8px 10px;margin-bottom:4px}
+.bh-mydecks-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.bh-mydeck-card{position:relative;border:1px solid #333;border-radius:12px;padding:14px;cursor:pointer;transition:border-color 0.2s;overflow:hidden}
+.bh-mydeck-bg{position:absolute;inset:0;background-size:cover;background-position:center 20%;filter:brightness(0.4) saturate(1.3);transform:scale(1.5);z-index:0}
+.bh-mydeck-overlay{position:absolute;inset:0;background:linear-gradient(135deg,rgba(0,0,0,0.9) 0%,rgba(0,0,0,0.72) 100%);z-index:1}
+.bh-mydeck-content{position:relative;z-index:2}
+.bh-deck-actions{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}
+.bh-btn{border-radius:6px;padding:7px 4px;cursor:pointer;font-size:11px;font-weight:bold;border:1px solid}
+.bh-btn-public{background:#1a3a5c;color:#7ec8e3;border-color:#2a5a8c}
+.bh-btn-private{background:#222;color:#aaa;border-color:#444}
+@media(max-width:480px){.bh-mydecks-grid{grid-template-columns:1fr}}
+</style>
+<?php return ob_get_clean();
+});
+
+// ============================================================
+// ШОРТКОД: Страница колоды [berserk_deck_view]
+// ============================================================
+add_shortcode('berserk_deck_view', function() {
+    ob_start(); ?>
+<div id="bh-deckview-app">
+  <div v-if="loading" class="dv-loading">Загрузка колоды...</div>
+  <div v-else-if="error" class="dv-error">{{ error }}</div>
+  <div v-else>
+    <div class="dv-header">
+      <img v-if="heroImage" :src="heroImage" class="dv-hero-img">
+      <div class="dv-header-info">
+        <h1 class="dv-title">{{ deck.name }} <span v-if="deck.is_pro || deck.author_is_pro" class="bh-pro-badge" :title="(deck.pro_achievements || deck.author_pro_achievements) || 'PRO автор'" @click="showProTip=!showProTip">PRO</span></h1>
+        <div class="dv-sub">{{ deck.author }} · {{ deck.deck_json.heroTitle || '—' }} · 📅 {{ formatDate(deck.updated_at) }}</div>
+        <div v-if="showProTip && (deck.pro_achievements || deck.author_pro_achievements)" class="bh-pro-tip">{{ deck.pro_achievements || deck.author_pro_achievements }}</div>
+        <div class="dv-stats-row">
+          <span>🃏 {{ (deck.deck_json.cards || []).length }} карт</span>
+          <span>💎 {{ deck.dust_cost }}</span>
+          <span>❤️ {{ deck.likes }}</span>
+          <span v-if="deck.winrate !== null">🏆 {{ deck.winrate }}% ({{ deck.wins }}-{{ deck.losses }})</span>
+        </div>
+        <div class="dv-guide-row">
+          <a v-if="deck.guide_url" :href="deck.guide_url" target="_blank" rel="noopener" class="dv-btn dv-btn-guide">Гайд</a>
+          <button v-if="deck.video_url || deck.video_guide_url" @click="openVideo(deck.video_url || deck.video_guide_url)" class="dv-btn dv-btn-guide">Видеогайд</button>
+          <button @click="followAuthor" class="dv-btn dv-btn-guide">Отслеживать автора</button>
+        </div>
+      </div>
+      <div class="dv-header-actions">
+        <button @click="likeDeck" class="dv-like-btn" :class="{ 'dv-liked': deck.liked_by_me }">{{ deck.liked_by_me ? '❤️' : '🤍' }} {{ deck.likes }}</button>
+        <button @click="goBack" class="dv-btn-back">← Назад</button>
+      </div>
+    </div>
+    <div class="dv-main-layout">
+      <div class="dv-deck-col">
+        <h2 class="dv-section-title">🃏 Карты ({{ (deck.deck_json.cards || []).length }})</h2>
+        <div class="dv-card-list">
+          <div v-for="item in groupedCards" :key="item.id" class="dv-card-strip" :style="{backgroundImage:'url('+item.image+')',borderLeftColor:getElemColor(item.elements)}">
+            <div class="dv-strip-overlay" :style="{background:'linear-gradient(90deg,'+getElemAlpha(item.elements)+' 0%,rgba(0,0,0,0.55) 45%,rgba(0,0,0,0.05) 100%)'}"></div>
+            <span class="dv-strip-cost">{{ item.cost }}</span>
+            <span class="dv-strip-title">{{ item.title }}</span>
+            <span class="dv-strip-count" :style="{background:getElemColor(item.elements),color:getElemText(item.elements)}">{{ item.count }}x</span>
+          </div>
+        </div>
+      </div>
+      <div class="dv-side-col">
+        <div class="dv-stats-panel">
+          <h2 class="dv-section-title dv-chart-title">📊 Кривая маны</h2>
+          <div class="dv-cost-chart">
+            <div v-for="(bucket, i) in costBuckets" :key="i" class="dv-cost-col">
+              <div class="dv-cost-label">x{{ costCounts[i] }}</div>
+              <div class="dv-cost-bar-bg">
+                <div class="dv-cost-bar" :style="{ height: (costCounts[i] / maxCost * 100) + '%' }"></div>
+              </div>
+              <div class="dv-cost-hex">{{ bucket }}</div>
+            </div>
+          </div>
+          <div class="dv-type-row">
+            <div class="dv-type-col"><div class="dv-type-icon">🐉</div><div class="dv-type-count">{{ typeCounts.creature }}</div><div class="dv-type-label">Существо</div></div>
+            <div class="dv-type-divider"></div>
+            <div class="dv-type-col"><div class="dv-type-icon">🔥</div><div class="dv-type-count">{{ typeCounts.spell }}</div><div class="dv-type-label">Заклинание</div></div>
+            <div class="dv-type-divider"></div>
+            <div class="dv-type-col"><div class="dv-type-icon">🛡️</div><div class="dv-type-count">{{ typeCounts.equipment }}</div><div class="dv-type-label">Экипировка</div></div>
+          </div>
+        </div>
+        <div v-if="!isAuthenticated" class="dv-auth-side">
+          <button @click="goLogin" class="dv-btn dv-btn-auth">🔑 Авторизоваться</button>
+        </div>
+        <div v-else-if="deck.is_owner" class="dv-owner-side">
+          <button @click="editDeck" class="dv-btn dv-btn-edit-deck">✏️ Редактировать колоду</button>
+          <div class="dv-owner-mini">
+            <button v-if="!deck.is_public" @click="togglePublic(1)" class="dv-btn dv-btn-public">🌐 Опубл.</button>
+            <button v-else @click="togglePublic(0)" class="dv-btn dv-btn-private">🔒 Скрыть</button>
+            <button @click="deleteDeck" class="dv-btn dv-btn-delete">🗑 Удалить</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div v-if="isAuthenticated" class="dv-section dv-copy-section">
+      <h2 class="dv-section-title">🎮 Код колоды</h2>
+      <div v-if="deck.game_code" class="dv-code-block">
+        <code class="dv-code-text">{{ deck.game_code }}</code>
+        <button @click="copyCode" class="dv-btn dv-btn-copy">{{ copied ? '✓ Скопировано!' : '📋 Скопировать колоду' }}</button>
+      </div>
+      <div v-else class="dv-code-empty">
+        <span v-if="deck.is_owner">Код не импортирован. Используйте импорт в декбилдере.</span>
+        <span v-else>Автор не добавил код колоды.</span>
+      </div>
+    </div>
+    <div class="dv-section">
+      <h2 class="dv-section-title">📝 Описание колоды</h2>
+      <div v-if="deck.is_owner && editingDesc" class="dv-desc-edit">
+        <textarea v-model="descText" rows="8" class="dv-desc-textarea" placeholder="Муллиган, геймплей, советы по игре..."></textarea>
+        <input v-model="guideText" class="dv-desc-textarea" style="min-height:auto;margin-top:8px" type="url" placeholder="Ссылка на текстовый гайд">
+        <input v-model="videoGuideText" class="dv-desc-textarea" style="min-height:auto;margin-top:8px" type="url" placeholder="Ссылка на YouTube-видеогайд">
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button @click="saveDesc" class="dv-btn dv-btn-save">💾 Сохранить</button>
+          <button @click="editingDesc = false" class="dv-btn dv-btn-cancel">Отмена</button>
+        </div>
+      </div>
+      <div v-else class="dv-desc-view">
+        <div v-if="deck.description" class="dv-desc-text" style="white-space:pre-wrap">{{ deck.description }}</div>
+        <div v-else class="dv-desc-empty">{{ deck.is_owner ? 'Нет описания. Нажмите «Редактировать» чтобы добавить.' : 'Автор не добавил описание.' }}</div>
+        <button v-if="deck.is_owner" @click="startEditDesc" class="dv-btn dv-btn-edit">✏️ Редактировать описание</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script>
+(function(){
+const {createApp,ref,computed,onMounted} = Vue;
+const ELEM_GROUPS = [
+  {key:'степи',color:'#f1c40f',textColor:'#000',alpha:'rgba(180,150,0,0.93)',slugs:['stepi','степи']},
+  {key:'горы',color:'#2980b9',textColor:'#fff',alpha:'rgba(20,80,160,0.93)',slugs:['gory','горы']},
+  {key:'болото',color:'#a8d5a2',textColor:'#000',alpha:'rgba(100,170,100,0.93)',slugs:['boloto','болото']},
+  {key:'лес',color:'#27ae60',textColor:'#fff',alpha:'rgba(15,110,50,0.93)',slugs:['les','лес']},
+  {key:'тьма',color:'#8e44ad',textColor:'#fff',alpha:'rgba(80,20,120,0.93)',slugs:['tma','тьма']},
+  {key:'нейтралы',color:'#cd7f32',textColor:'#fff',alpha:'rgba(130,80,20,0.93)',slugs:['nejtraly','neutral','нейтралы']}
+];
+const getElemGroup = (elems) => { if (!elems || !elems.length) return ELEM_GROUPS[5]; for (const g of ELEM_GROUPS) { if (elems.some(e => g.slugs.some(s => e.includes(s)))) return g; } return ELEM_GROUPS[5]; };
+const getElemColor = (elems) => getElemGroup(elems).color;
+const getElemAlpha = (elems) => getElemGroup(elems).alpha;
+const getElemText = (elems) => getElemGroup(elems).textColor;
+const normalizeType = (t) => {
+  if (t === null || t === undefined || t === '') return '';
+  const s = String(t).toLowerCase().trim();
+  if (s === 'creature' || s === 'spell' || s === 'equipment' || s === 'hero') return s;
+  if (s === '1' || s === '01') return 'creature';
+  if (s === '2' || s === '02') return 'spell';
+  if (s === '3' || s === '03') return 'equipment';
+  if (s.includes('закл')||s.includes('spell')||s.includes('магия')||s.includes('magic')||s === 's'||s === 'sp') return 'spell';
+  if (s.includes('экип')||s.includes('equip')||s.includes('предм')||s.includes('оруж')||s.includes('weapon')||s.includes('доспех')||s.includes('armor')||s.includes('armour')||s.includes('амулет')||s.includes('amulet')||s.includes('артеф')||s.includes('artifact')||s.includes('item')||s.includes('gear')||s === 'e'||s === 'eq') return 'equipment';
+  if (s.includes('герой')||s.includes('hero')) return 'hero';
+  if (s.includes('сущ')||s.includes('creat')||s.includes('unit')||s.includes('minion')||s.includes('monster')||s.includes('монстр')||s.includes('юнит')||s.includes('воин')||s.includes('fighter')||s.includes('warrior')||s.includes('troop')||s.includes('отряд')||s.includes('боец')||s.includes('персонаж')||s === 'c'||s === 'cr'||s === 'u') return 'creature';
+  return '';
+};
+const resolveCardType = (c, catalog) => {
+  let t = normalizeType(c && c.type);
+  if (t === 'spell' || t === 'equipment' || t === 'creature') return t;
+  if (t === 'hero') return 'hero';
+  const full = (catalog || []).find(x => String(x.id) === String(c && c.id));
+  if (full) {
+    t = normalizeType(full.type);
+    if (t === 'spell' || t === 'equipment' || t === 'creature') return t;
+  }
+  return 'creature';
+};
+
+createApp({
+  setup() {
+    const loading = ref(true);
+    const error = ref('');
+    const deck = ref(null);
+    const allCards = ref([]);
+    const allHeroes = ref([]);
+    const editingDesc = ref(false);
+    const descText = ref('');
+    const guideText = ref('');
+    const videoGuideText = ref('');
+    const showProTip = ref(false);
+    const copied = ref(false);
+    const isAuthenticated = ref(false);
+    const deckbuilderUrl = '<?php echo esc_js(BH_DECKBUILDER_URL); ?>';
+    const publicDecksUrl = '<?php echo esc_js(BH_PUBLIC_DECKS_URL); ?>';
+    const loginUrl = '/login/?redirect_to=' + encodeURIComponent(window.location.pathname + window.location.search);
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const deckId = urlParams.get('deck_id');
+
+    const heroImage = computed(() => { if (!deck.value) return null; const hero = allHeroes.value.find(h => h.title === deck.value.deck_json.heroTitle); return hero ? hero.image : null; });
+
+    const enrichedCards = computed(() => {
+      if (!deck.value) return [];
+      const cards = deck.value.deck_json.cards || [];
+      return cards.map(c => { const full = allCards.value.find(x => x.id === c.id); return full || c; });
+    });
+
+    const costBuckets = [0,1,2,3,4,5,6,'7+'];
+    const costCounts = computed(() => {
+      const counts = [0,0,0,0,0,0,0,0];
+      enrichedCards.value.forEach(c => { const cost = parseInt(c.cost)||0; if (cost >= 7) counts[7]++; else counts[cost]++; });
+      return counts;
+    });
+    const maxCost = computed(() => Math.max(...costCounts.value, 1));
+
+    const typeCounts = computed(() => {
+      let creature = 0, spell = 0, equipment = 0;
+      enrichedCards.value.forEach(c => {
+        const t = resolveCardType(c, allCards.value);
+        if (t === 'creature') creature++;
+        else if (t === 'spell') spell++;
+        else if (t === 'equipment') equipment++;
+      });
+      return { creature, spell, equipment };
+    });
+
+    const groupedCards = computed(() => {
+      const g = {};
+      enrichedCards.value.forEach(c => { if (!g[c.id]) g[c.id] = Object.assign({},c,{count:0}); g[c.id].count++; });
+      return Object.values(g).sort((a,b) => (a.cost||0)-(b.cost||0) || a.title.localeCompare(b.title));
+    });
+
+    const formatDate = (ts) => { if (!ts) return ''; const d = new Date(ts * 1000); return d.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric'}); };
+    const goBack = () => { window.history.back(); };
+    const goLogin = () => { window.location.href = loginUrl; };
+
+    const likeDeck = async () => {
+      const r = await fetch('/wp-json/berserk/v1/decks/' + deck.value.id + '/like', {
+        method:'POST', credentials:'include', headers:{'X-WP-Nonce': window.bhNonce || ''}
+      });
+      const res = await r.json();
+      if (res.success) { deck.value.liked_by_me = res.liked; deck.value.likes = res.likes; }
+    };
+
+    const copyCode = async () => {
+      if (!deck.value.game_code) return;
+      try { await navigator.clipboard.writeText(deck.value.game_code); copied.value = true; setTimeout(() => copied.value = false, 2000); }
+      catch(e) { const ta = document.createElement('textarea'); ta.value = deck.value.game_code; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); copied.value = true; setTimeout(() => copied.value = false, 2000); }
+    };
+
+    const startEditDesc = () => {
+      descText.value = deck.value.description || '';
+      guideText.value = deck.value.guide_url || '';
+      videoGuideText.value = deck.value.video_guide_url || '';
+      editingDesc.value = true;
+    };
+    const saveDesc = async () => {
+      const r = await fetch('/wp-json/berserk/v1/decks/' + deck.value.id + '/update-meta', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({description:descText.value, guide_url:guideText.value, video_guide_url:videoGuideText.value})});
+      const res = await r.json();
+      if (res.success) {
+        deck.value.description = descText.value;
+        deck.value.guide_url = guideText.value;
+        deck.value.video_guide_url = videoGuideText.value;
+        editingDesc.value = false;
+      }
+      else alert('Ошибка: '+(res.message||'неизвестная ошибка'));
+    };
+    const openVideo = (url) => { if (window.bhOpenYoutubeModal) window.bhOpenYoutubeModal(url); else window.open(url, '_blank'); };
+    const followAuthor = () => {
+      const authorId = deck.value.author_id || deck.value.user_id;
+      const base = publicDecksUrl.endsWith('/') ? publicDecksUrl : (publicDecksUrl + '/');
+      window.location.href = base + '?author_id=' + encodeURIComponent(authorId);
+    };
+
+    const editDeck = () => {
+      localStorage.setItem('bh_edit_deck', JSON.stringify({
+        id: deck.value.id, name: deck.value.name, hero_wp_id: deck.value.hero_wp_id,
+        deck_json: deck.value.deck_json, header_id: deck.value.header_id, hero_le: deck.value.hero_le,
+        game_code: deck.value.game_code, is_public: deck.value.is_public,
+        guide_url: deck.value.guide_url || '', video_guide_url: deck.value.video_guide_url || ''
+      }));
+      window.location.href = deckbuilderUrl;
+    };
+
+    const deleteDeck = async () => {
+      if (!confirm('Удалить колоду?')) return;
+      const r = await fetch('/wp-json/berserk/v1/decks/delete/'+deck.value.id, {method:'POST',credentials:'include',headers:{'X-WP-Nonce':window.bhNonce||''}});
+      if (r.ok) { alert('Колода удалена'); window.history.back(); }
+      else alert('Ошибка удаления');
+    };
+
+    const togglePublic = async (val) => {
+      const r = await fetch('/wp-json/berserk/v1/decks/'+deck.value.id+'/visibility', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json','X-WP-Nonce':window.bhNonce||''},body:JSON.stringify({is_public:val})});
+      const res = await r.json();
+      if (res.success) deck.value.is_public = val;
+      else alert('Ошибка: '+(res.message||'неизвестная ошибка'));
+    };
+
+    onMounted(async () => {
+      const me = window.bhCurrentUser || {logged_in:false};
+      isAuthenticated.value = !!me.logged_in;
+      if (!deckId) { error.value = 'Не указан ID колоды'; loading.value = false; return; }
+      try {
+        const headers = {'X-WP-Nonce': window.bhNonce || ''};
+        const [deckRes, dataRes] = await Promise.all([
+          fetch('/wp-json/berserk/v1/decks/'+deckId, {credentials:'include', headers}),
+          fetch('/wp-json/berserk/v1/data', {credentials:'include'})
+        ]);
+        if (!deckRes.ok) { error.value = 'Колода не найдена или нет доступа'; loading.value = false; return; }
+        deck.value = await deckRes.json();
+        const data = await dataRes.json();
+        allCards.value = data.cards || [];
+        allHeroes.value = data.heroes || [];
+      } catch(e) { error.value = 'Ошибка загрузки'; }
+      loading.value = false;
+    });
+
+    return { loading, error, deck, heroImage, isAuthenticated, costBuckets, costCounts, maxCost, typeCounts, groupedCards, editingDesc, descText, guideText, videoGuideText, showProTip, copied, formatDate, goBack, goLogin, likeDeck, copyCode, startEditDesc, saveDesc, editDeck, deleteDeck, togglePublic, openVideo, followAuthor, getElemColor, getElemAlpha, getElemText };
+  }
+}).mount('#bh-deckview-app');
+})();
+</script>
+<style>
+#bh-deckview-app{background:#070707;color:#eee;padding:16px;border-radius:15px;font-family:system-ui,sans-serif;max-width:900px;margin:0 auto}
+.dv-guide-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.dv-btn-guide{background:#1a1a1a;color:#ddd;border:1px solid #444;border-radius:6px;padding:6px 10px;font-size:11px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block}
+.bh-pro-badge{display:inline-block;margin-left:6px;background:linear-gradient(135deg,#f1c40f,#e67e22);color:#111;font-size:10px;font-weight:900;padding:2px 7px;border-radius:4px;cursor:help;vertical-align:middle}
+.bh-pro-tip{margin:8px 0;padding:8px 10px;background:rgba(0,0,0,.75);border:1px solid #665200;border-radius:6px;font-size:12px;color:#f8e7a1;white-space:pre-wrap}
+.dv-loading,.dv-error{text-align:center;padding:80px;color:#f1c40f;font-size:16px}
+.dv-error{color:#e74c3c}
+.dv-header{display:flex;gap:16px;align-items:flex-start;margin-bottom:20px;flex-wrap:wrap}
+.dv-hero-img{width:80px;height:112px;object-fit:cover;border-radius:8px;border:1px solid #555;flex-shrink:0}
+.dv-header-info{flex:1;min-width:200px}
+.dv-title{color:#f1c40f;margin:0 0 6px;font-size:clamp(18px,4vw,24px)}
+.dv-sub{font-size:12px;color:#aaa;margin-bottom:8px}
+.dv-stats-row{display:flex;gap:12px;font-size:12px;color:#ccc;flex-wrap:wrap}
+.dv-header-actions{display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.dv-like-btn{background:rgba(20,20,20,0.8);color:#aaa;border:1px solid #444;border-radius:20px;padding:6px 14px;cursor:pointer;font-size:13px;transition:0.15s}
+.dv-like-btn:hover{border-color:#666}
+.dv-liked{background:rgba(60,20,20,0.9);color:#e74c3c;border-color:#7d2d2d}
+.dv-btn-back{background:#222;color:#fff;border:1px solid #333;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px}
+.dv-main-layout{display:flex;gap:16px;align-items:flex-start;margin-bottom:20px}
+.dv-deck-col{flex:1;min-width:0}
+.dv-side-col{flex:0 0 280px;width:280px}
+.dv-section-title{color:#f1c40f;font-size:15px;margin:0 0 10px;letter-spacing:1px}
+.dv-chart-title{margin-bottom:14px;text-align:center}
+.dv-stats-panel{background:radial-gradient(circle at 50% 30%,#0e1a30 0%,#070707 100%);border:1px solid #1a2a4a;border-radius:12px;padding:16px}
+.dv-cost-chart{display:flex;justify-content:space-around;align-items:flex-end;gap:4px;margin-bottom:16px;min-height:120px}
+.dv-cost-col{display:flex;flex-direction:column;align-items:center;flex:1;max-width:32px}
+.dv-cost-label{font-size:10px;color:#ccc;font-weight:bold;margin-bottom:3px}
+.dv-cost-bar-bg{width:100%;max-width:28px;height:70px;background:#0e1a30;border-radius:6px 6px 0 0;display:flex;align-items:flex-end;overflow:hidden;border:1px solid #1a2a4a}
+.dv-cost-bar{width:100%;background:#7ba5f2;border-radius:4px 4px 0 0;transition:height 0.3s ease;min-height:2px}
+.dv-cost-hex{margin-top:5px;width:24px;height:24px;background:#c8a66a;color:#000;font-weight:bold;font-size:10px;display:flex;align-items:center;justify-content:center;clip-path:polygon(25% 0%,75% 0%,100% 50%,75% 100%,25% 100%,0% 50%)}
+.dv-type-row{display:flex;justify-content:space-around;align-items:center;border-top:1px solid #1a2a4a;padding-top:12px}
+.dv-type-col{display:flex;flex-direction:column;align-items:center;gap:2px;flex:1}
+.dv-type-icon{font-size:22px}
+.dv-type-count{font-size:20px;font-weight:bold;color:#fff}
+.dv-type-label{font-size:10px;color:#ccc}
+.dv-type-divider{width:1px;height:40px;background:#1a2a4a}
+.dv-auth-side{margin-top:12px}
+.dv-btn-auth{width:100%;background:#1a3a5c;color:#7ec8e3;border:1px solid #2a5a8c;border-radius:6px;padding:10px;cursor:pointer;font-size:13px;font-weight:bold;transition:0.15s}
+.dv-btn-auth:hover{background:#2a5a8c;color:#fff}
+.dv-owner-side{margin-top:12px;display:flex;flex-direction:column;gap:8px}
+.dv-owner-mini{display:flex;gap:6px}
+.dv-owner-mini .dv-btn{flex:1;font-size:10px;padding:6px 4px}
+.dv-card-list{display:flex;flex-direction:column;gap:3px}
+.dv-card-strip{height:38px;border-radius:4px;position:relative;display:flex;align-items:center;background-size:160%;background-position:center 30%;border-left:4px solid #888;overflow:hidden}
+.dv-strip-overlay{position:absolute;top:0;left:0;width:100%;height:100%}
+.dv-strip-cost{position:relative;width:26px;text-align:center;font-weight:bold;color:#fff;z-index:2;font-size:13px;text-shadow:0 0 5px #000;flex-shrink:0}
+.dv-strip-title{position:relative;flex:1;font-size:11px;font-weight:bold;color:#fff;z-index:2;padding-left:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:1px 1px 3px #000}
+.dv-strip-count{position:relative;font-weight:bold;padding:0 8px;height:100%;display:flex;align-items:center;z-index:2;font-size:11px;flex-shrink:0}
+.dv-section{margin-bottom:20px}
+.dv-copy-section{padding-top:16px;border-top:1px solid #222}
+.dv-code-block{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.dv-code-text{flex:1;min-width:200px;background:#0a0a0a;border:1px solid #333;border-radius:6px;padding:10px;color:#7ec8e3;font-size:11px;font-family:monospace;word-break:break-all;display:block}
+.dv-code-empty{color:#666;font-size:13px;font-style:italic}
+.dv-desc-text{background:#111;border:1px solid #333;border-radius:8px;padding:14px;color:#ddd;font-size:13px;line-height:1.6}
+.dv-desc-empty{color:#666;font-size:13px;font-style:italic;margin-bottom:10px}
+.dv-desc-textarea{width:100%;background:#0a0a0a;border:1px solid #333;color:#ddd;padding:12px;border-radius:8px;font-size:13px;line-height:1.6;resize:vertical;box-sizing:border-box;font-family:inherit}
+.dv-desc-textarea:focus{outline:none;border-color:#f1c40f}
+.dv-btn{border-radius:6px;padding:8px 14px;cursor:pointer;font-size:12px;font-weight:bold;border:1px solid;transition:0.15s}
+.dv-btn:hover{filter:brightness(1.15)}
+.dv-btn-save{background:#1a3d1a;color:#4caf50;border-color:#2e7d32}
+.dv-btn-cancel{background:#222;color:#aaa;border-color:#444}
+.dv-btn-edit{background:#2a1a3a;color:#c39bd3;border-color:#5a2d7a}
+.dv-btn-copy{background:#1a3a5c;color:#7ec8e3;border-color:#2a5a8c}
+.dv-btn-edit-deck{width:100%;background:#2a1a3a;color:#c39bd3;border-color:#5a2d7a}
+.dv-btn-delete{background:#3d1a1a;color:#e74c3c;border-color:#7d2d2d}
+.dv-btn-public{background:#1a3a5c;color:#7ec8e3;border-color:#2a5a8c}
+.dv-btn-private{background:#222;color:#aaa;border-color:#444}
+@media(max-width:640px){
+  #bh-deckview-app{padding:10px;border-radius:10px}
+  .dv-header{flex-direction:column;align-items:center;text-align:center}
+  .dv-header-actions{flex-direction:row;align-items:center}
+  .dv-main-layout{flex-direction:column}
+  .dv-side-col{flex:1;width:100%}
+  .dv-cost-bar-bg{height:60px}
+  .dv-cost-hex{width:22px;height:22px;font-size:10px}
+  .dv-type-icon{font-size:20px}
+  .dv-type-count{font-size:18px}
+}
+</style>
+<?php return ob_get_clean();
+});
+add_action('wp_head', function() {
+    $user = wp_get_current_user();
+    $user_data = $user->ID ? array('logged_in' => true, 'id' => $user->ID, 'name' => $user->display_name) : array('logged_in' => false);
+    echo '<script>';
+    echo 'window.bhNonce = ' . json_encode(wp_create_nonce('wp_rest')) . ';';
+    echo 'window.bhCurrentUser = ' . json_encode($user_data) . ';';
+    echo <<<'JS'
+window.bhExtractYoutubeId = function(url) {
+  if (!url) return '';
+  var m = String(url).match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/)|youtube-nocookie\.com\/embed\/)([A-Za-z0-9_-]{6,})/);
+  return m ? m[1] : '';
+};
+window.bhOpenYoutubeModal = function(url) {
+  var id = window.bhExtractYoutubeId(url);
+  if (!id) { window.open(url, '_blank'); return; }
+  if (typeof window.openYoutubeModal === 'function') { window.openYoutubeModal(url, id); return; }
+  if (typeof window.openVideoModal === 'function') { window.openVideoModal(url, id); return; }
+  var existing = document.querySelector('[data-bh-yt-modal], #youtube-modal, .youtube-modal, .yt-modal, #yt-modal');
+  if (existing) {
+    var iframe = existing.querySelector('iframe');
+    if (iframe) iframe.src = 'https://www.youtube.com/embed/' + id + '?autoplay=1';
+    existing.classList.add('open', 'active', 'is-open', 'show');
+    existing.style.display = 'flex';
+    return;
+  }
+  var modal = document.getElementById('bh-yt-fallback-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'bh-yt-fallback-modal';
+    modal.setAttribute('data-bh-yt-modal', '1');
+    modal.innerHTML = '<div class="bh-yt-backdrop"></div><div class="bh-yt-box"><button type="button" class="bh-yt-close" aria-label="Закрыть">×</button><div class="bh-yt-frame-wrap"><iframe allow="autoplay; encrypted-media" allowfullscreen></iframe></div></div>';
+    document.body.appendChild(modal);
+    var style = document.createElement('style');
+    style.textContent = '#bh-yt-fallback-modal{position:fixed;inset:0;z-index:100000;display:none;align-items:center;justify-content:center}#bh-yt-fallback-modal.open{display:flex}.bh-yt-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.85)}.bh-yt-box{position:relative;width:min(920px,94vw);z-index:1}.bh-yt-frame-wrap{position:relative;padding-top:56.25%;background:#000;border-radius:10px;overflow:hidden}.bh-yt-frame-wrap iframe{position:absolute;inset:0;width:100%;height:100%;border:0}.bh-yt-close{position:absolute;right:-6px;top:-38px;background:transparent;border:0;color:#fff;font-size:32px;cursor:pointer;line-height:1}';
+    document.head.appendChild(style);
+    modal.querySelector('.bh-yt-backdrop').onclick = function(){ window.bhCloseYoutubeModal(); };
+    modal.querySelector('.bh-yt-close').onclick = function(){ window.bhCloseYoutubeModal(); };
+  }
+  modal.querySelector('iframe').src = 'https://www.youtube.com/embed/' + id + '?autoplay=1';
+  modal.classList.add('open');
+};
+window.bhCloseYoutubeModal = function() {
+  var modal = document.getElementById('bh-yt-fallback-modal');
+  if (!modal) return;
+  var iframe = modal.querySelector('iframe');
+  if (iframe) iframe.src = '';
+  modal.classList.remove('open');
+};
+JS;
+    echo '</script>';
+});
