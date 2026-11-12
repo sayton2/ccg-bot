@@ -38,9 +38,10 @@ def healthcheck(path):
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", 202318207))
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+ADMIN_VK_ID = int(os.environ.get("ADMIN_VK_ID", OWNER_ID or 0))
 
 ELEMENT_CACHE_FILE   = "element_cache.json"
-CONTESTS_FILE        = "contests.json"          # state + scores (переживает рестарт процесса)
+CONTESTS_FILE        = "contests.json"          # state + scores + meta
 SCORES_FILE          = "chat_scores.json"       # legacy (миграция)
 CONTEST_FILE         = "contest_state.json"     # legacy (миграция)
 CONTEST_CHATS_FILE   = "contest_chats.json"
@@ -48,6 +49,21 @@ CLUE_INDEX_FILE      = "clue_index.json"
 MOSCOW_OFFSET = datetime.timedelta(hours=3)
 
 CLUE_TYPES = ["blur", "text", "fragment"]
+BASE_CONTEST_REWARD = 10
+HINT_INTERVAL_SEC = 3600
+# Доля стороны карты для кропа: старт → почасовые подсказки
+BLUR_CROP_RATIOS = [0.22, 0.34, 0.48, 0.62, 0.78]
+FRAGMENT_CROP_RATIOS = [0.20, 0.32, 0.45, 0.60, 0.75]
+TEXT_REVEAL_RATIOS = [0.22, 0.40, 0.58, 0.75, 0.92]
+
+ELEMENT_NAMES_RU = {
+    'les': 'Лес', 'stepi': 'Степи', 'gory': 'Горы',
+    'boloto': 'Болото', 'tma': 'Тьма', 'nejtraly': 'Нейтралы',
+}
+TYPE_NAMES_RU = {
+    'creature': 'Существо', 'spell': 'Заклинание',
+    'equipment': 'Экипировка', 'hero': 'Герой',
+}
 
 # Watchdog: мягкий контроль зависания long poll (без убийства на обычных ReadTimeout)
 HEARTBEAT_TIMEOUT = 300  # секунд без heartbeat = рестарт
@@ -138,30 +154,33 @@ def save_json(filename, data):
         print(f"[SAVE ERROR] {filename}: {e}", flush=True)
 
 def load_contests():
-    """Загружает состояние конкурсов и баллы из contests.json (с миграцией со старых файлов)."""
+    """Загружает состояние конкурсов, баллы и meta из contests.json."""
     data = load_json(CONTESTS_FILE, None)
-    if isinstance(data, dict) and ('state' in data or 'scores' in data):
+    if isinstance(data, dict) and ('state' in data or 'scores' in data or 'meta' in data):
         return {
             'state': data.get('state') or {},
             'scores': data.get('scores') or {},
+            'meta': data.get('meta') or {},
         }
-    # Миграция со старых отдельных файлов
     return {
         'state': load_json(CONTEST_FILE, {}),
         'scores': load_json(SCORES_FILE, {}),
+        'meta': {},
     }
 
 def save_contests():
-    """Сохраняет конкурсы и баллы в contests.json — переживает рестарт процесса."""
+    """Сохраняет конкурсы, баллы и meta в contests.json."""
     save_json(CONTESTS_FILE, {
         'state': CONTEST_STATE,
         'scores': CHAT_SCORES,
+        'meta': CONTEST_META,
     })
 
 ELEMENT_CACHE  = load_json(ELEMENT_CACHE_FILE, {})
 _contests_data = load_contests()
 CHAT_SCORES    = _contests_data['scores']
 CONTEST_STATE  = _contests_data['state']
+CONTEST_META   = _contests_data.get('meta') or {}
 CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
 CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
 save_contests()  # сразу зафиксировать актуальный снимок / миграцию
@@ -903,39 +922,145 @@ def get_random_card():
         print(f"[RANDOM CARD ERROR] {e}", flush=True)
     return None
 
-def make_blur_crop(img_bytes):
-    try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        zw, zh = int(img.width * 2.5), int(img.height * 2.5)
-        img = img.resize((zw, zh), Image.Resampling.BILINEAR)
-        img = img.filter(ImageFilter.GaussianBlur(radius=18))
-        crop_size = 400
-        left = random.randint(0, max(0, zw - crop_size))
-        top  = random.randint(0, max(0, int(zh * 0.60) - crop_size))
-        cropped = img.crop((left, top, left + crop_size, top + crop_size))
-        output = io.BytesIO()
-        cropped.save(output, format="JPEG", quality=85)
-        return output.getvalue()
-    except Exception as e:
-        print(f"[BLUR CROP ERROR] {e}", flush=True)
-        return None
+def _parse_card_type(class_list):
+    for cls in class_list or []:
+        m = re.match(r'mmf_(?:type|card_type)-(\w+)', str(cls), re.I)
+        if m:
+            t = m.group(1).lower()
+            if t in TYPE_NAMES_RU:
+                return t
+        low = str(cls).lower()
+        for key in TYPE_NAMES_RU:
+            if key in low:
+                return key
+    return ''
 
-def make_fragment_crop(img_bytes):
+def _lookup_game_card_by_title(card_name):
     try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("L")
-        zw, zh = int(img.width * 2.5), int(img.height * 2.5)
-        img = img.resize((zw, zh), Image.Resampling.BILINEAR)
-        frag_size = 80
-        left = random.randint(0, max(0, zw - frag_size))
-        top  = random.randint(0, max(0, int(zh * 0.60) - frag_size))
-        cropped = img.crop((left, top, left + frag_size, top + frag_size))
-        cropped = cropped.resize((400, 400), Image.Resampling.NEAREST)
+        db = ensure_game_db()
+        return db['by_title'].get((card_name or '').strip().lower()) or {}
+    except Exception:
+        return {}
+
+def make_contest_crop(img_bytes, clue_type, center_rel=None, size_ratio=0.22):
+    """
+    Кроп фрагмента карты.
+    size_ratio — доля min(w,h), старт ~20-25%.
+    center_rel — (cx, cy) в долях [0..1]; если None, выбирается случайно и возвращается.
+    """
+    try:
+        if clue_type == "fragment":
+            base = Image.open(io.BytesIO(img_bytes)).convert("L")
+        else:
+            base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        zw, zh = max(1, int(base.width * 2.5)), max(1, int(base.height * 2.5))
+        img = base.resize((zw, zh), Image.Resampling.BILINEAR)
+        if clue_type == "blur":
+            img = img.filter(ImageFilter.GaussianBlur(radius=18))
+
+        crop_size = max(24, int(min(zw, zh) * float(size_ratio)))
+        crop_size = min(crop_size, zw, zh)
+        half = crop_size / 2.0
+
+        if center_rel is None:
+            cx = random.uniform(half / zw, 1.0 - half / zw)
+            cy_max = min(0.60, 1.0 - half / zh)
+            cy_min = half / zh
+            if cy_max <= cy_min:
+                cy = 0.5
+            else:
+                cy = random.uniform(cy_min, cy_max)
+            center_rel = (round(cx, 5), round(cy, 5))
+        else:
+            cx, cy = float(center_rel[0]), float(center_rel[1])
+
+        left = int(round(cx * zw - half))
+        top = int(round(cy * zh - half))
+        left = max(0, min(left, zw - crop_size))
+        top = max(0, min(top, zh - crop_size))
+        cropped = img.crop((left, top, left + crop_size, top + crop_size))
+        resample = Image.Resampling.NEAREST if clue_type == "fragment" else Image.Resampling.BILINEAR
+        cropped = cropped.resize((400, 400), resample)
         output = io.BytesIO()
-        cropped.save(output, format="JPEG", quality=80)
-        return output.getvalue()
+        cropped.save(output, format="JPEG", quality=85 if clue_type == "blur" else 80)
+        return output.getvalue(), center_rel
     except Exception as e:
-        print(f"[FRAGMENT CROP ERROR] {e}", flush=True)
-        return None
+        print(f"[CONTEST CROP ERROR] {e}", flush=True)
+        return None, center_rel
+
+def make_blur_crop(img_bytes, center_rel=None, size_ratio=0.22):
+    return make_contest_crop(img_bytes, "blur", center_rel=center_rel, size_ratio=size_ratio)
+
+def make_fragment_crop(img_bytes, center_rel=None, size_ratio=0.20):
+    return make_contest_crop(img_bytes, "fragment", center_rel=center_rel, size_ratio=size_ratio)
+
+def mask_ability_text(card_text, card_name, reveal_ratio=0.22):
+    """Урезанный текст способности без имени карты."""
+    text = re.sub(r'\s+', ' ', (card_text or '').strip())
+    if not text:
+        return "███"
+    if card_name:
+        text = re.sub(re.escape(card_name), '???', text, flags=re.IGNORECASE)
+        # маскируем отдельные слова имени
+        for part in re.findall(r'[A-Za-zА-Яа-яЁё]{3,}', card_name):
+            text = re.sub(re.escape(part), '???', text, flags=re.IGNORECASE)
+    words = text.split()
+    if not words:
+        return "███"
+    keep = max(2, int(len(words) * float(reveal_ratio)))
+    keep = min(keep, len(words))
+    shown = []
+    for i, w in enumerate(words[:keep]):
+        if len(w) <= 3 or w in ('???', '—', '-'):
+            shown.append(w)
+        elif i % 3 == 2:
+            shown.append(w[0] + '█' * max(1, len(w) - 1))
+        else:
+            shown.append(w)
+    suffix = " …███" if keep < len(words) else ""
+    return " ".join(shown) + suffix
+
+def build_text_clue_message(state, hint_level=0, is_hourly=False):
+    ratios = TEXT_REVEAL_RATIOS
+    reveal = ratios[min(hint_level, len(ratios) - 1)]
+    element = ELEMENT_NAMES_RU.get(state.get('element'), state.get('element') or '—')
+    card_type = TYPE_NAMES_RU.get(state.get('card_type'), state.get('card_type') or '—')
+    cost = state.get('cost')
+    cost_s = str(cost) if cost is not None and cost != '' else '?'
+    ability = mask_ability_text(state.get('card_text'), state.get('card_name'), reveal)
+    reward = int(state.get('reward') or BASE_CONTEST_REWARD)
+    header = "💡 Подсказка!" if is_hourly else "🎯 Угадай карту по описанию!"
+    reward_line = (
+        f"Награда удвоена: +{reward} баллов."
+        if is_hourly else
+        f"Первый правильный ответ — +{reward} баллов. Ответ будет раскрыт в 23:55."
+    )
+    return (
+        f"{header}\n\n"
+        f"💰 Стоимость: {cost_s}\n"
+        f"🌀 Стихия: {element}\n"
+        f"🏷 Тип: {card_type}\n"
+        f"📜 Способность:\n«{ability}»\n\n"
+        f"{reward_line}"
+    )
+
+def _contest_crop_ratio(clue_type, hint_level):
+    table = BLUR_CROP_RATIOS if clue_type == "blur" else FRAGMENT_CROP_RATIOS
+    return table[min(max(int(hint_level), 0), len(table) - 1)]
+
+def fetch_contest_image(state):
+    url = state.get('image_url')
+    if url:
+        img = download_image_url(url)
+        if img:
+            return img
+    name = state.get('card_name')
+    if name:
+        img, _ = download_card_image_fast(name)
+        if img:
+            return img
+        return download_card_image(name, prefix="bgo-")
+    return None
 
 def start_contest(vk_session):
     global CONTEST_STATE, CLUE_INDEX
@@ -956,7 +1081,9 @@ def start_contest(vk_session):
         if m:
             element_key = API_ELEMENT_MAP.get(m.group(1), 'nejtraly')
             break
+    card_type = _parse_card_type(card.get('class_list'))
     img_bytes = None
+    image_url = None
     media_id = card.get('featured_media')
     if media_id:
         try:
@@ -968,10 +1095,22 @@ def start_contest(vk_session):
                     img_res = requests.get(image_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
                     if img_res.status_code == 200:
                         img_bytes = img_res.content
-        except:
+        except Exception:
             pass
     content_html = card.get('content', {}).get('rendered', '')
     card_text = re.sub(r'<[^>]+>', '', content_html).strip()
+
+    game_card = _lookup_game_card_by_title(card_name)
+    cost = game_card.get('cost')
+    try:
+        cost = int(cost) if cost is not None and cost != '' else None
+    except Exception:
+        cost = None
+    if not card_type:
+        card_type = str(game_card.get('type') or '').strip().lower()
+    if not img_bytes and game_card.get('image'):
+        image_url = game_card.get('image') or image_url
+        img_bytes = download_image_url(image_url)
 
     idx = CLUE_INDEX.get('index', 0) % len(CLUE_TYPES)
     clue_type = CLUE_TYPES[idx]
@@ -979,59 +1118,92 @@ def start_contest(vk_session):
     save_json(CLUE_INDEX_FILE, CLUE_INDEX)
     print(f"[CONTEST] Тип подсказки сегодня: {clue_type} (карта: «{card_name}»)", flush=True)
 
-    new_state = {}
-    for chat_id in CONTEST_CHATS:
-        new_state[str(chat_id)] = {
-            'card_name': card_name, 'card_slug': card_slug, 'element': element_key,
-            'started_at': moscow_now().isoformat(), 'guessed': False, 'revealed': False,
-            'clue_type': clue_type
-        }
+    started = moscow_now().isoformat()
+    center_rel = None
+    if clue_type in ("blur", "fragment") and img_bytes:
+        ratio0 = _contest_crop_ratio(clue_type, 0)
+        _, center_rel = make_contest_crop(img_bytes, clue_type, center_rel=None, size_ratio=ratio0)
+
+    base_state = {
+        'card_name': card_name,
+        'card_slug': card_slug,
+        'element': element_key,
+        'card_type': card_type or '',
+        'cost': cost,
+        'card_text': card_text,
+        'image_url': image_url or '',
+        'started_at': started,
+        'last_hint_at': started,
+        'guessed': False,
+        'revealed': False,
+        'clue_type': clue_type,
+        'reward': BASE_CONTEST_REWARD,
+        'hint_level': 0,
+        'crop_cx': (center_rel[0] if center_rel else None),
+        'crop_cy': (center_rel[1] if center_rel else None),
+    }
+
+    new_state = {str(chat_id): dict(base_state) for chat_id in CONTEST_CHATS}
     CONTEST_STATE = new_state
     save_contests()
 
     for chat_id in CONTEST_CHATS:
         try:
-            send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text)
+            send_contest_clue(vk_session, chat_id, CONTEST_STATE[str(chat_id)], img_bytes)
         except Exception as e:
             print(f"[CONTEST SEND ERROR] chat={chat_id}: {e}", flush=True)
 
-def send_contest_clue(vk_session, chat_id, clue_type, img_bytes, card_text):
-    if clue_type == "text":
-        clue = card_text if card_text else "Карта из вселенной Берсерк"
+def send_contest_clue(vk_session, chat_id, state, img_bytes=None, is_hourly=False):
+    clue_type = state.get('clue_type') or 'text'
+    reward = int(state.get('reward') or BASE_CONTEST_REWARD)
+    hint_level = int(state.get('hint_level') or 0)
+    reward_line = (
+        f"Награда удвоена: +{reward} баллов."
+        if is_hourly else
+        f"Первый правильный ответ — +{reward} баллов. Ответ будет раскрыт в 23:55."
+    )
+
+    if clue_type == "text" or not img_bytes:
+        msg = build_text_clue_message(state, hint_level=hint_level, is_hourly=is_hourly)
         vk_session.method('messages.send', {
-            'peer_id': chat_id,
-            'message': f"🎯 Угадай карту по описанию!\n\n«{clue}»\n\nПервый правильный ответ — +10 баллов. Ответ будет раскрыт в 23:55.",
-            'random_id': rnd_id()
+            'peer_id': chat_id, 'message': msg, 'random_id': rnd_id()
         })
         return
 
-    if clue_type == "blur" and img_bytes:
-        crop = make_blur_crop(img_bytes)
-        if crop:
-            attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
-            vk_session.method('messages.send', {
-                'peer_id': chat_id,
-                'message': "🎯 Угадай карту!\n\nНа картинке — сильно размытый фрагмент арта. Что это за карта? Первый правильный ответ — +10 баллов.",
-                'attachment': attachment, 'random_id': rnd_id()
-            })
-            return
+    center = None
+    if state.get('crop_cx') is not None and state.get('crop_cy') is not None:
+        center = (float(state['crop_cx']), float(state['crop_cy']))
+    ratio = _contest_crop_ratio(clue_type, hint_level)
+    crop, center = make_contest_crop(img_bytes, clue_type, center_rel=center, size_ratio=ratio)
+    if center:
+        state['crop_cx'], state['crop_cy'] = center[0], center[1]
+    if not crop:
+        msg = build_text_clue_message(state, hint_level=hint_level, is_hourly=is_hourly)
+        vk_session.method('messages.send', {
+            'peer_id': chat_id, 'message': msg, 'random_id': rnd_id()
+        })
+        return
 
-    if clue_type == "fragment" and img_bytes:
-        crop = make_fragment_crop(img_bytes)
-        if crop:
-            attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
-            vk_session.method('messages.send', {
-                'peer_id': chat_id,
-                'message': "🎯 Угадай карту!\n\nНа картинке — мелкий чёрно-белый фрагмент арта. Что это за карта? Первый правильный ответ — +10 баллов.",
-                'attachment': attachment, 'random_id': rnd_id()
-            })
-            return
-
-    clue = card_text if card_text else "Карта из вселенной Берсерк"
+    if clue_type == "blur":
+        lead = "💡 Подсказка: более крупный размытый фрагмент!" if is_hourly else "🎯 Угадай карту!"
+        body = (
+            "На картинке — размытый фрагмент арта (увеличен)."
+            if is_hourly else
+            "На картинке — сильно размытый фрагмент арта (~1/4 карты)."
+        )
+    else:
+        lead = "💡 Подсказка: более крупный ч/б фрагмент!" if is_hourly else "🎯 Угадай карту!"
+        body = (
+            "На картинке — увеличенный чёрно-белый фрагмент арта."
+            if is_hourly else
+            "На картинке — мелкий чёрно-белый фрагмент арта."
+        )
+    attachment = upload_and_get_attachment(vk_session, crop, 'clue.jpg', chat_id)
     vk_session.method('messages.send', {
         'peer_id': chat_id,
-        'message': f"🎯 Угадай карту по описанию!\n\n«{clue}»\n\nПервый правильный ответ — +10 баллов. Ответ будет раскрыт в 23:55.",
-        'random_id': rnd_id()
+        'message': f"{lead}\n\n{body} Что это за карта?\n{reward_line}",
+        'attachment': attachment,
+        'random_id': rnd_id(),
     })
 
 def normalize_text(text):
@@ -1043,11 +1215,12 @@ def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
         return False
     if normalize_text(text) == normalize_text(state['card_name']):
         state['guessed'] = True
+        reward = int(state.get('reward') or BASE_CONTEST_REWARD)
         save_contests()
-        add_score(peer_id, user_id, user_name, 10)
+        add_score(peer_id, user_id, user_name, reward)
         vk_session.method('messages.send', {
             'peer_id': peer_id,
-            'message': f"🎉 {user_name} угадал(а)! Это «{state['card_name']}».\n+10 баллов в рейтинг!",
+            'message': f"🎉 {user_name} угадал(а)! Это «{state['card_name']}».\n+{reward} баллов в рейтинг!",
             'random_id': rnd_id()
         })
         try:
@@ -1059,10 +1232,53 @@ def check_contest_answer(vk_session, peer_id, user_id, user_name, text):
                     'peer_id': peer_id, 'message': state['card_name'],
                     'attachment': attachment, 'random_id': rnd_id()
                 })
-        except:
+        except Exception:
             pass
         return True
     return False
+
+def _parse_iso(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(ts))
+    except Exception:
+        return None
+
+def process_hourly_contest_hints(vk_session):
+    """Раз в час без ответа: x2 награда + новая подсказка (больший кроп / больше текста)."""
+    now = moscow_now()
+    changed = False
+    for chat_id_str, state in list(CONTEST_STATE.items()):
+        if not state or state.get('guessed') or state.get('revealed'):
+            continue
+        anchor = _parse_iso(state.get('last_hint_at')) or _parse_iso(state.get('started_at'))
+        if not anchor:
+            continue
+        elapsed = (now - anchor).total_seconds()
+        if elapsed < HINT_INTERVAL_SEC:
+            continue
+
+        state['reward'] = int(state.get('reward') or BASE_CONTEST_REWARD) * 2
+        state['hint_level'] = int(state.get('hint_level') or 0) + 1
+        state['last_hint_at'] = now.isoformat()
+        changed = True
+        chat_id = int(chat_id_str)
+        try:
+            img_bytes = None
+            if state.get('clue_type') in ('blur', 'fragment'):
+                img_bytes = fetch_contest_image(state)
+            send_contest_clue(vk_session, chat_id, state, img_bytes=img_bytes, is_hourly=True)
+            print(
+                f"[CONTEST HINT] chat={chat_id} level={state['hint_level']} "
+                f"reward={state['reward']} type={state.get('clue_type')}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[CONTEST HINT ERROR] chat={chat_id}: {e}", flush=True)
+            traceback.print_exc()
+    if changed:
+        save_contests()
 
 def end_contest_timeout(vk_session):
     global CONTEST_STATE
@@ -1126,31 +1342,119 @@ def show_contest_chats(vk_session, peer_id):
 
 # ==================== РЕЙТИНГ ЧАТА (С АВТОСБРОСОМ 1-ГО ЧИСЛА) ====================
 
-def reset_chat_scores(chat_id_str):
+def reset_chat_scores(chat_id_str, persist=True):
     if chat_id_str in CHAT_SCORES:
         for uid in list(CHAT_SCORES[chat_id_str].keys()):
             if uid != '_reset_month':
                 if isinstance(CHAT_SCORES[chat_id_str][uid], dict):
                     CHAT_SCORES[chat_id_str][uid]['score'] = 0
         CHAT_SCORES[chat_id_str]['_reset_month'] = moscow_now().strftime('%Y-%m')
-        save_contests()
+        if persist:
+            save_contests()
         print(f"[SCORES] Рейтинг чата {chat_id_str} сброшен (1-е число)", flush=True)
 
-def reset_all_scores():
+def reset_all_scores(persist=True):
     if not CHAT_SCORES:
         return
     current_month = moscow_now().strftime('%Y-%m')
     for chat_id_str in list(CHAT_SCORES.keys()):
-        reset_chat_scores(chat_id_str)
+        reset_chat_scores(chat_id_str, persist=False)
+    if persist:
+        save_contests()
     print(f"[SCORES] Полный сброс всех рейтингов ({current_month})", flush=True)
 
 def check_monthly_reset(chat_id_str):
+    """Ленивый сброс при обращении к рейтингу; дубли месячного отчёта режет CONTEST_META."""
     current_month = moscow_now().strftime('%Y-%m')
     if chat_id_str not in CHAT_SCORES:
         CHAT_SCORES[chat_id_str] = {'_reset_month': current_month}
         return
     if CHAT_SCORES[chat_id_str].get('_reset_month') != current_month:
-        reset_chat_scores(chat_id_str)
+        # Если плановый отчёт за этот месяц ещё не ушёл — не молча обнуляем
+        if CONTEST_META.get('last_monthly_report') == current_month:
+            reset_chat_scores(chat_id_str)
+
+def format_month_leaders(chat_id_str, month_label=None):
+    scores = CHAT_SCORES.get(chat_id_str, {})
+    entries = [
+        (uid, data) for uid, data in scores.items()
+        if uid != '_reset_month' and isinstance(data, dict) and int(data.get('score') or 0) > 0
+    ]
+    entries.sort(key=lambda x: x[1].get('score', 0), reverse=True)
+    title = month_label or "прошедший месяц"
+    if not entries:
+        return f"📊 Итоги рейтинга за {title}:\n\nНикто не набрал очков."
+    lines = [f"📊 Итоги рейтинга за {title}:\n"]
+    for i, (uid, data) in enumerate(entries[:15], 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lines.append(f"{medal} {data.get('name', '???')} — {data.get('score', 0)} баллов")
+    lines.append(f"\nВсего игроков с очками: {len(entries)}")
+    lines.append("Рейтинг будет обнулён. Новый месяц — новый сезон!")
+    return "\n".join(lines)
+
+def process_monthly_score_reset(vk_session):
+    """
+    Смена месяца (Europe/Moscow): отчёт лидеров → затем сброс.
+    Флаг CONTEST_META['last_monthly_report'] = 'YYYY-MM' защищает от повторов.
+    """
+    global CONTEST_META
+    now = moscow_now()
+    current_month = now.strftime('%Y-%m')
+    last = CONTEST_META.get('last_monthly_report')
+    if last == current_month:
+        return
+    # Первый запуск в середине месяца — только зафиксировать флаг, без обнуления
+    if not last:
+        CONTEST_META['last_monthly_report'] = current_month
+        save_contests()
+        return
+
+    # Подпись прошедшего месяца
+    prev = (now.replace(day=1) - datetime.timedelta(days=1))
+    prev_label = prev.strftime('%m.%Y')
+
+    chat_ids = set(str(c) for c in CONTEST_CHATS)
+    chat_ids.update(str(k) for k in CHAT_SCORES.keys())
+    sent_ok = True
+    summaries = []
+
+    for chat_id_str in sorted(chat_ids):
+        try:
+            refresh_chat_names(vk_session, chat_id_str)
+        except Exception:
+            pass
+        msg = format_month_leaders(chat_id_str, month_label=prev_label)
+        summaries.append(f"Чат {chat_id_str}:\n{msg}")
+        try:
+            vk_session.method('messages.send', {
+                'peer_id': int(chat_id_str),
+                'message': msg,
+                'random_id': rnd_id(),
+            })
+        except Exception as e:
+            sent_ok = False
+            print(f"[MONTHLY REPORT ERROR] chat={chat_id_str}: {e}", flush=True)
+
+    if ADMIN_VK_ID:
+        admin_msg = "📢 Месячный отчёт рейтингов\n\n" + "\n\n———\n\n".join(summaries[:20])
+        try:
+            vk_session.method('messages.send', {
+                'peer_id': ADMIN_VK_ID,
+                'message': admin_msg[:4000],
+                'random_id': rnd_id(),
+            })
+        except Exception as e:
+            print(f"[MONTHLY REPORT ADMIN ERROR] {e}", flush=True)
+            # ЛС админу не блокирует сброс, если чаты уже получили отчёт
+
+    if not sent_ok and chat_ids:
+        print("[MONTHLY REPORT] Есть ошибки отправки в чаты — сброс отложен", flush=True)
+        return
+
+    reset_all_scores(persist=False)
+    CONTEST_META['last_monthly_report'] = current_month
+    save_contests()
+    print(f"[MONTHLY RESET] Отчёт отправлен, рейтинги сброшены ({current_month})", flush=True)
 
 def add_score(chat_id, user_id, user_name, points):
     chat_id_str = str(chat_id)
@@ -1222,32 +1526,40 @@ def show_top(vk_session, peer_id):
 # ==================== ПЛАНИРОВЩИКИ ====================
 
 def contest_scheduler(vk_session):
+    """Старт/финиш викторины, почасовые подсказки и месячный отчёт+сброс."""
     last_start = None
-    last_end   = None
+    last_end = None
+    last_hint_tick = None
     while True:
         try:
             now = moscow_now()
             today = now.strftime('%Y-%m-%d')
+            minute_key = now.strftime('%Y-%m-%d %H:%M')
+
             if now.hour == 20 and now.minute == 0 and last_start != today:
                 last_start = today
                 start_contest(vk_session)
             if now.hour == 23 and now.minute == 55 and last_end != today:
                 last_end = today
                 end_contest_timeout(vk_session)
+
+            # Раз в минуту: почасовые подсказки и проверка смены месяца
+            if last_hint_tick != minute_key:
+                last_hint_tick = minute_key
+                process_hourly_contest_hints(vk_session)
+                process_monthly_score_reset(vk_session)
         except Exception as e:
             print(f"[SCHEDULER ERROR] {e}", flush=True)
+            traceback.print_exc()
         time.sleep(20)
 
-def monthly_reset_scheduler():
-    last_reset_month = moscow_now().strftime('%Y-%m')
+def monthly_reset_scheduler(vk_session=None):
+    """Совместимость: месячный сброс теперь в contest_scheduler."""
+    if vk_session is None:
+        return
     while True:
         try:
-            now = moscow_now()
-            current_month = now.strftime('%Y-%m')
-            if now.day == 1 and current_month != last_reset_month:
-                print(f"[MONTHLY RESET] 1-е число месяца — сброс всех рейтингов...", flush=True)
-                reset_all_scores()
-                last_reset_month = current_month
+            process_monthly_score_reset(vk_session)
         except Exception as e:
             print(f"[MONTHLY RESET ERROR] {e}", flush=True)
         time.sleep(1800)
@@ -1471,11 +1783,10 @@ def run_vk_bot():
     threading.Thread(target=ensure_game_db, daemon=True).start()
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
-    threading.Thread(target=monthly_reset_scheduler, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     print(
-        f"Планировщики запущены: конкурс ({len(CONTEST_CHATS)} чатов) + "
-        f"ежемесячный сброс рейтинга + watchdog; contests.json загружен "
+        f"Планировщики запущены: конкурс/подсказки/месячный отчёт "
+        f"({len(CONTEST_CHATS)} чатов) + watchdog; contests.json загружен "
         f"(state={len(CONTEST_STATE)}, scores={len(CHAT_SCORES)})",
         flush=True,
     )
