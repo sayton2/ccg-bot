@@ -41,12 +41,20 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 ADMIN_VK_ID = int(os.environ.get("ADMIN_VK_ID", OWNER_ID or 0))
 
 ELEMENT_CACHE_FILE   = "element_cache.json"
-CONTESTS_FILE        = "contests.json"          # state + scores + meta
+BOT_DATA_FILE        = "bot_data.json"          # единый снимок: scores + state + meta
+CONTESTS_FILE        = "contests.json"          # legacy (миграция)
 SCORES_FILE          = "chat_scores.json"       # legacy (миграция)
 CONTEST_FILE         = "contest_state.json"     # legacy (миграция)
 CONTEST_CHATS_FILE   = "contest_chats.json"
 CLUE_INDEX_FILE      = "clue_index.json"
 MOSCOW_OFFSET = datetime.timedelta(hours=3)
+
+# GitHub Gist — облачный бэкап состояния (таблица лидеров, викторины, флаг сброса)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_FILENAME = "bot_data.json"
+GIST_DEBOUNCE_SEC = 2.5
+GIST_HTTP_TIMEOUT = 8
 
 CLUE_TYPES = ["blur", "text", "fragment"]
 BASE_CONTEST_REWARD = 10
@@ -153,37 +161,230 @@ def save_json(filename, data):
     except Exception as e:
         print(f"[SAVE ERROR] {filename}: {e}", flush=True)
 
-def load_contests():
-    """Загружает состояние конкурсов, баллы и meta из contests.json."""
-    data = load_json(CONTESTS_FILE, None)
-    if isinstance(data, dict) and ('state' in data or 'scores' in data or 'meta' in data):
-        return {
-            'state': data.get('state') or {},
-            'scores': data.get('scores') or {},
-            'meta': data.get('meta') or {},
-        }
+# ==================== ОБЛАЧНОЕ СОСТОЯНИЕ (GitHub Gist + local bot_data.json) ====================
+
+_state_lock = threading.Lock()
+_gist_sync_lock = threading.Lock()
+_gist_dirty = False
+_gist_last_push = 0.0
+_gist_worker_started = False
+_BOT_STATE_SOURCE = 'empty'
+
+def _normalize_bot_state(data):
+    """Единая схема: scores (топ), state (викторины), meta (флаг месячного сброса)."""
+    if not isinstance(data, dict):
+        data = {}
     return {
-        'state': load_json(CONTEST_FILE, {}),
-        'scores': load_json(SCORES_FILE, {}),
-        'meta': {},
+        'scores': data.get('scores') if isinstance(data.get('scores'), dict) else {},
+        'state': data.get('state') if isinstance(data.get('state'), dict) else {},
+        'meta': data.get('meta') if isinstance(data.get('meta'), dict) else {},
+        'updated_at': data.get('updated_at') or moscow_now().isoformat(),
     }
 
-def save_contests():
-    """Сохраняет конкурсы, баллы и meta в contests.json."""
-    save_json(CONTESTS_FILE, {
-        'state': CONTEST_STATE,
+def _snapshot_bot_state():
+    return _normalize_bot_state({
         'scores': CHAT_SCORES,
+        'state': CONTEST_STATE,
         'meta': CONTEST_META,
+        'updated_at': moscow_now().isoformat(),
     })
 
+def _gist_headers():
+    return {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'CardHeroConnect-VK-Bot',
+    }
+
+def _gist_api_url():
+    # Корректный REST endpoint GitHub Gist API (не github.com/{id})
+    return f'https://api.github.com/gists/{GIST_ID}'
+
+def _fetch_state_from_gist():
+    """GET gist → содержимое files[bot_data.json]."""
+    if not (GITHUB_TOKEN and GIST_ID):
+        return None
+    try:
+        res = requests.get(
+            _gist_api_url(),
+            headers=_gist_headers(),
+            timeout=GIST_HTTP_TIMEOUT,
+        )
+        if res.status_code != 200:
+            print(f"[GIST LOAD] HTTP {res.status_code}: {res.text[:200]}", flush=True)
+            return None
+        files = (res.json() or {}).get('files') or {}
+        node = files.get(GIST_FILENAME) or {}
+        content = node.get('content')
+        if not content:
+            # иногда большой файл отдаётся только по raw_url
+            raw_url = node.get('raw_url')
+            if raw_url:
+                raw = requests.get(raw_url, headers=_gist_headers(), timeout=GIST_HTTP_TIMEOUT)
+                if raw.status_code == 200 and raw.text:
+                    content = raw.text
+        if not content:
+            print("[GIST LOAD] bot_data.json пуст или отсутствует в Gist", flush=True)
+            return None
+        data = json.loads(content)
+        print("[GIST LOAD] Состояние загружено из GitHub Gist", flush=True)
+        return _normalize_bot_state(data)
+    except Exception as e:
+        print(f"[GIST LOAD ERROR] {e}", flush=True)
+        return None
+
+def _push_state_to_gist(snapshot):
+    """PATCH gist: обновляет files.bot_data.json."""
+    if not (GITHUB_TOKEN and GIST_ID):
+        return False
+    try:
+        payload = {
+            'files': {
+                GIST_FILENAME: {
+                    'content': json.dumps(snapshot, ensure_ascii=False, indent=2),
+                }
+            }
+        }
+        res = requests.patch(
+            _gist_api_url(),
+            headers=_gist_headers(),
+            json=payload,
+            timeout=GIST_HTTP_TIMEOUT,
+        )
+        if res.status_code in (200, 201):
+            print(f"[GIST SAVE] Синхронизировано ({snapshot.get('updated_at')})", flush=True)
+            return True
+        print(f"[GIST SAVE] HTTP {res.status_code}: {res.text[:240]}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[GIST SAVE ERROR] {e}", flush=True)
+        return False
+
+def _gist_flusher_loop():
+    """Фоновая отправка в Gist с дебаунсом — не блокирует LongPoll."""
+    global _gist_dirty, _gist_last_push
+    while True:
+        time.sleep(1.0)
+        with _gist_sync_lock:
+            if not _gist_dirty:
+                continue
+            if time.time() - _gist_last_push < GIST_DEBOUNCE_SEC:
+                continue
+            _gist_dirty = False
+        try:
+            with _state_lock:
+                snap = _snapshot_bot_state()
+            ok = _push_state_to_gist(snap)
+            with _gist_sync_lock:
+                _gist_last_push = time.time()
+                if not ok:
+                    # повторим позже
+                    _gist_dirty = True
+        except Exception as e:
+            print(f"[GIST FLUSHER ERROR] {e}", flush=True)
+            with _gist_sync_lock:
+                _gist_dirty = True
+
+def ensure_gist_worker():
+    global _gist_worker_started
+    if _gist_worker_started:
+        return
+    if not (GITHUB_TOKEN and GIST_ID):
+        return
+    t = threading.Thread(target=_gist_flusher_loop, name='gist-flusher', daemon=True)
+    t.start()
+    _gist_worker_started = True
+    print("[GIST] Фоновая синхронизация запущена", flush=True)
+
+def load_bot_state():
+    """
+    Приоритет:
+    1) GitHub Gist (если заданы GITHUB_TOKEN + GIST_ID)
+    2) локальный bot_data.json
+    3) legacy contests.json / отдельные файлы
+    """
+    global _BOT_STATE_SOURCE
+    data = None
+    source = 'empty'
+
+    if GITHUB_TOKEN and GIST_ID:
+        data = _fetch_state_from_gist()
+        if data:
+            source = 'gist'
+
+    if data is None:
+        local = load_json(BOT_DATA_FILE, None)
+        if isinstance(local, dict) and (local.get('scores') is not None or local.get('state') is not None):
+            data = _normalize_bot_state(local)
+            source = 'local_bot_data'
+
+    if data is None:
+        legacy = load_json(CONTESTS_FILE, None)
+        if isinstance(legacy, dict) and ('state' in legacy or 'scores' in legacy or 'meta' in legacy):
+            data = _normalize_bot_state(legacy)
+            source = 'legacy_contests'
+        else:
+            data = _normalize_bot_state({
+                'state': load_json(CONTEST_FILE, {}),
+                'scores': load_json(SCORES_FILE, {}),
+                'meta': {},
+            })
+            source = 'legacy_split'
+
+    _BOT_STATE_SOURCE = source
+    print(
+        f"[BOT STATE] source={source}; scores={len(data['scores'])}, "
+        f"quizzes={len(data['state'])}, meta_keys={list(data['meta'].keys())}",
+        flush=True,
+    )
+    return data
+
+def save_bot_state(sync_gist=True):
+    """
+    Пишет локальный bot_data.json сразу; Gist обновляет в фоне (debounce).
+    Не бросает исключения наружу — сбои сети не роняют LongPoll.
+    """
+    global _gist_dirty
+    try:
+        with _state_lock:
+            snap = _snapshot_bot_state()
+        save_json(BOT_DATA_FILE, snap)
+        # Дублируем в contests.json для обратной совместимости
+        save_json(CONTESTS_FILE, {
+            'state': snap['state'],
+            'scores': snap['scores'],
+            'meta': snap['meta'],
+        })
+        if sync_gist and GITHUB_TOKEN and GIST_ID:
+            ensure_gist_worker()
+            with _gist_sync_lock:
+                _gist_dirty = True
+    except Exception as e:
+        print(f"[BOT STATE SAVE ERROR] {e}", flush=True)
+
+def load_contests():
+    """Совместимость: загружает единое состояние бота."""
+    return load_bot_state()
+
+def save_contests():
+    """Совместимость: любое изменение прогресса → локально + Gist."""
+    save_bot_state(sync_gist=True)
+
 ELEMENT_CACHE  = load_json(ELEMENT_CACHE_FILE, {})
-_contests_data = load_contests()
+_contests_data = load_bot_state()
 CHAT_SCORES    = _contests_data['scores']
 CONTEST_STATE  = _contests_data['state']
 CONTEST_META   = _contests_data.get('meta') or {}
 CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
 CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
-save_contests()  # сразу зафиксировать актуальный снимок / миграцию
+# Локальный кэш всегда; в Gist на старте пушим только миграцию legacy → облако
+# (не затираем Gist пустым снимком, если GET временно упал)
+save_bot_state(sync_gist=False)
+if _BOT_STATE_SOURCE.startswith('legacy') or _BOT_STATE_SOURCE == 'local_bot_data':
+    if GITHUB_TOKEN and GIST_ID and (CHAT_SCORES or CONTEST_STATE or CONTEST_META):
+        save_bot_state(sync_gist=True)
+ensure_gist_worker()
 
 # FIX: Белый список из env-переменной — переживает рестарт Render (эфемерный диск).
 # Формат: CONTEST_CHATS=2000000001,2000000002 (через запятую).
@@ -1784,10 +1985,12 @@ def run_vk_bot():
     vk_session = vk_api.VkApi(token=VK_TOKEN, api_version='5.199')
     threading.Thread(target=contest_scheduler, args=(vk_session,), daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    gist_status = "ON" if (GITHUB_TOKEN and GIST_ID) else "OFF"
     print(
-        f"Планировщики запущены: конкурс/подсказки/месячный отчёт "
-        f"({len(CONTEST_CHATS)} чатов) + watchdog; contests.json загружен "
-        f"(state={len(CONTEST_STATE)}, scores={len(CHAT_SCORES)})",
+        f"Планировщики: конкурс/подсказки/месячный отчёт "
+        f"({len(CONTEST_CHATS)} чатов) + watchdog; "
+        f"Gist sync={gist_status}; "
+        f"state={len(CONTEST_STATE)}, scores={len(CHAT_SCORES)}",
         flush=True,
     )
     if not OWNER_ID:
