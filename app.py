@@ -1009,7 +1009,7 @@ def format_deck_caption(deck_obj, game_code=''):
     code = (game_code or deck_obj.get('game_code') or '').strip()
     if code:
         lines.append("")
-        lines.append("📋 Код колоды (Base64):")
+        lines.append("📋 Код колоды:")
         lines.append(code)
     return "\n".join(x for x in lines if x is not None)
 
@@ -1883,9 +1883,9 @@ def handle_message(vk_session, message_obj):
 
     if deck_code_candidate is not None:
         try:
-            img_bytes, hero_name, total, decoded = render_deck_image_from_base64(deck_code_candidate)
-            caption = f"🃏 Колода: {hero_name}\n📦 Карт: {total} / 60\n\n📋 Код:\n{decoded['code']}"
-            send_deck_image(vk_session, peer_id, img_bytes, caption)
+            img_bytes, _, _, _ = render_deck_image_from_base64(deck_code_candidate)
+            # Код пользователь уже прислал — в ответе только картинка дек-листа
+            send_deck_image(vk_session, peer_id, img_bytes, " ")
         except Exception as e:
             print(f"[DECK B64 ERROR] {e}", flush=True)
             traceback.print_exc()
