@@ -129,6 +129,7 @@ BH_SIGNATURE = b'BHD1'
 BH_ID_HIGH = 0x08005000
 PUBLIC_DECKS_URL = "https://ep-ccg.ru/wp-json/berserk/v1/decks/public"
 BERSERK_DATA_URL = "https://ep-ccg.ru/wp-json/berserk/v1/data"
+BERSERK_MAPPINGS_URL = "https://ep-ccg.ru/wp-json/berserk/v1/mappings"
 DECK_VIEW_URL = "https://ep-ccg.ru/koloda/?deck_id={}"
 PUBLIC_DECKS_TTL = 5 * 60  # кэш публичных колод, сек
 GAME_DB_TTL = 30 * 60      # кэш базы карт/героев, сек
@@ -140,7 +141,14 @@ SITE_FILES_INDEX = []
 INDEX_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 
-_GAME_DB = {'heroes': {}, 'cards': {}, 'by_title': {}, 'loaded_at': 0}
+_GAME_DB = {
+    'heroes': {},      # primary game_id -> hero
+    'cards': {},       # primary game_id -> card
+    'by_title': {},    # title.lower() -> entity
+    'by_wp_id': {},    # str(wp_id) -> entity
+    'lookup': {},      # любой ключ (hex/LE/crc32/slug/id) -> entity
+    'loaded_at': 0,
+}
 _PUBLIC_DECKS_CACHE = {'items': [], 'loaded_at': 0}
 _GAME_DB_LOCK = threading.Lock()
 _PUBLIC_DECKS_LOCK = threading.Lock()
@@ -726,52 +734,209 @@ def _element_from_list(elements):
             return low
     return 'nejtraly'
 
+def _to_le_hex(hex8):
+    """Как toLE() в dekbilder: перестановка байтовых пар 8-символьного hex."""
+    h = re.sub(r'[^0-9a-f]', '', str(hex8 or '').lower()).zfill(8)[-8:]
+    if len(h) != 8:
+        return h
+    return ''.join(reversed([h[i:i + 2] for i in range(0, 8, 2)]))
+
+def _crc32_hex(value):
+    """Нижний 8-символьный hex от zlib.crc32 (как возможный ключ сопоставления)."""
+    return format(zlib.crc32(str(value).encode('utf-8')) & 0xFFFFFFFF, '08x')
+
+def _entity_index_keys(entity):
+    """Все ключи, по которым сущность может встретиться в BHD1 / на сайте."""
+    keys = set()
+    gid = str(entity.get('game_id') or '').strip().lower()
+    if re.fullmatch(r'[0-9a-f]{8}', gid or ''):
+        keys.add(gid)
+        keys.add(_to_le_hex(gid))
+        keys.add(_crc32_hex(gid))
+        keys.add(_crc32_hex(gid.upper()))
+    wid = entity.get('id')
+    if wid is not None and str(wid).strip() != '':
+        keys.add(str(wid).strip())
+        keys.add(_crc32_hex(str(wid).strip()))
+        try:
+            keys.add(format(int(wid) & 0xFFFFFFFF, '08x'))
+        except Exception:
+            pass
+    title = str(entity.get('title') or '').strip()
+    if title:
+        low = title.lower()
+        keys.add(low)
+        keys.add(_crc32_hex(title))
+        keys.add(_crc32_hex(low))
+        slug = re.sub(r'[^\wа-яё]+', '-', low, flags=re.I).strip('-')
+        if slug:
+            keys.add(slug)
+            keys.add(_crc32_hex(slug))
+        try:
+            lat = to_lat(low)
+            if lat:
+                keys.add(lat)
+                keys.add(_crc32_hex(lat))
+                keys.add(lat.replace('-', ''))
+                keys.add(_crc32_hex(lat.replace('-', '')))
+        except Exception:
+            pass
+    return {k for k in keys if k}
+
+def _register_entity(lookup, by_title, by_wp_id, entity, *, primary_map=None, overwrite=False):
+    if not entity:
+        return
+    gid = str(entity.get('game_id') or '').strip().lower()
+    if primary_map is not None and re.fullmatch(r'[0-9a-f]{8}', gid or ''):
+        primary_map[gid] = entity
+    title = str(entity.get('title') or '').strip().lower()
+    if title and (overwrite or title not in by_title):
+        by_title[title] = entity
+    wid = entity.get('id')
+    if wid is not None and str(wid).strip() != '':
+        by_wp_id[str(wid).strip()] = entity
+    for key in _entity_index_keys(entity):
+        if overwrite or key not in lookup:
+            lookup[key] = entity
+
+def _load_approved_maps():
+    """approvedMaps из /berserk/v1/mappings: {old_game_id_hex: wp_id} (как в dekbilder)."""
+    try:
+        res = requests.get(BERSERK_MAPPINGS_URL, headers=BROWSER_HEADERS, timeout=15)
+        if res.status_code != 200:
+            return {}
+        data = res.json()
+        if isinstance(data, dict):
+            return {str(k).strip().lower(): v for k, v in data.items()}
+    except Exception as e:
+        print(f"[MAPPINGS ERROR] {e}", flush=True)
+    return {}
+
+def _enrich_aliases_from_public_decks(lookup, by_title, by_wp_id):
+    """
+    Старые BHD1-коды часто содержат прежние game_id героя.
+    Восстанавливаем связь hero_hex → имя через публичные колоды (deck_json.heroTitle).
+    """
+    added = 0
+    try:
+        decks = fetch_public_decks()
+    except Exception as e:
+        print(f"[ALIAS DECKS ERROR] {e}", flush=True)
+        return 0
+    for d in decks or []:
+        code = str(d.get('game_code') or '').strip()
+        hero_title = str(((d.get('deck_json') or {}).get('heroTitle')) or '').strip()
+        if not code or not hero_title:
+            continue
+        try:
+            decoded = decode_deck_bhd1(code)
+        except Exception:
+            continue
+        hero_gid = str(decoded.get('hero') or '').lower()
+        if not re.fullmatch(r'[0-9a-f]{8}', hero_gid or ''):
+            continue
+        entity = by_title.get(hero_title.lower())
+        if not entity:
+            entity = {
+                'id': d.get('hero_wp_id'),
+                'title': hero_title,
+                'game_id': hero_gid,
+                'image': '',
+                'elements': [],
+                'cost': 0,
+            }
+            wp = d.get('hero_wp_id')
+            if wp is not None and str(wp) in by_wp_id:
+                base = by_wp_id[str(wp)]
+                entity = dict(base)
+                entity['title'] = entity.get('title') or hero_title
+        # Индексируем старый hex (+ LE + crc), не затирая актуальный game_id сущности
+        alias_keys = {
+            hero_gid,
+            _to_le_hex(hero_gid),
+            _crc32_hex(hero_gid),
+            _crc32_hex(hero_title),
+            _crc32_hex(hero_title.lower()),
+        }
+        for key in alias_keys:
+            if key and key not in lookup:
+                lookup[key] = entity
+                added += 1
+        if hero_title.lower() not in by_title:
+            by_title[hero_title.lower()] = entity
+    return added
+
 def ensure_game_db(force=False):
-    """Локальная база героев/карт по game_id из /wp-json/berserk/v1/data."""
+    """Локальная база героев/карт + полный lookup (hex/LE/crc32/slug/wp_id/legacy)."""
     with _GAME_DB_LOCK:
         age = time.time() - _GAME_DB['loaded_at']
-        if not force and _GAME_DB['heroes'] and age < GAME_DB_TTL:
+        if not force and _GAME_DB['lookup'] and age < GAME_DB_TTL:
             return _GAME_DB
     try:
         res = requests.get(BERSERK_DATA_URL, headers=BROWSER_HEADERS, timeout=30)
         res.raise_for_status()
         data = res.json()
-        heroes, cards, by_title = {}, {}, {}
+        heroes, cards, by_title, by_wp_id, lookup = {}, {}, {}, {}, {}
+
         for h in data.get('heroes') or []:
-            gid = str(h.get('game_id') or '').strip().lower()
-            if gid:
-                heroes[gid] = h
-            title = str(h.get('title') or '').strip().lower()
-            if title:
-                by_title[title] = h
+            _register_entity(lookup, by_title, by_wp_id, h, primary_map=heroes, overwrite=True)
         for c in data.get('cards') or []:
-            gid = str(c.get('game_id') or '').strip().lower()
-            if gid:
-                cards[gid] = c
-            title = str(c.get('title') or '').strip().lower()
-            if title and title not in by_title:
-                by_title[title] = c
+            _register_entity(lookup, by_title, by_wp_id, c, primary_map=cards, overwrite=False)
+
+        # Официальные алиасы old_game_id → wp_id (если mappings не пустой)
+        maps = _load_approved_maps()
+        mapped = 0
+        for old_gid, wp_id in maps.items():
+            ent = by_wp_id.get(str(wp_id))
+            if not ent:
+                continue
+            for key in (str(old_gid).lower(), _to_le_hex(old_gid), _crc32_hex(old_gid)):
+                if key and key not in lookup:
+                    lookup[key] = ent
+                    mapped += 1
+
+        # Legacy hex из публичных колод (например Илариэль: 659111e1)
+        aliased = _enrich_aliases_from_public_decks(lookup, by_title, by_wp_id)
+
         with _GAME_DB_LOCK:
             _GAME_DB['heroes'] = heroes
             _GAME_DB['cards'] = cards
             _GAME_DB['by_title'] = by_title
+            _GAME_DB['by_wp_id'] = by_wp_id
+            _GAME_DB['lookup'] = lookup
             _GAME_DB['loaded_at'] = time.time()
-            print(f"[GAME DB] героев={len(heroes)}, карт={len(cards)}", flush=True)
-            return {
-                'heroes': heroes,
-                'cards': cards,
-                'by_title': by_title,
-                'loaded_at': _GAME_DB['loaded_at'],
-            }
+            print(
+                f"[GAME DB] героев={len(heroes)}, карт={len(cards)}, "
+                f"lookup={len(lookup)}, maps={mapped}, aliases={aliased}",
+                flush=True,
+            )
+            return dict(_GAME_DB)
     except Exception as e:
         print(f"[GAME DB ERROR] {e}", flush=True)
+        traceback.print_exc()
         with _GAME_DB_LOCK:
-            return {
-                'heroes': dict(_GAME_DB['heroes']),
-                'cards': dict(_GAME_DB['cards']),
-                'by_title': dict(_GAME_DB['by_title']),
-                'loaded_at': _GAME_DB['loaded_at'],
-            }
+            return dict(_GAME_DB)
+
+def resolve_game_entity(game_id):
+    """
+    Поиск героя/карты по ID из BHD1.
+    Пробует: raw hex, LE-перестановку байт, crc32-hex, wp_id, title/slug-алиасы.
+    """
+    db = ensure_game_db()
+    gid = str(game_id or '').strip().lower()
+    if not gid:
+        return None
+    lookup = db.get('lookup') or {}
+    candidates = [gid]
+    if re.fullmatch(r'[0-9a-f]{8}', gid):
+        candidates.extend([_to_le_hex(gid), _crc32_hex(gid), _crc32_hex(gid.upper())])
+    # иногда приходит числовой wp id
+    candidates.append(gid.lstrip('0') or '0')
+    for key in candidates:
+        ent = lookup.get(key)
+        if ent:
+            return ent
+    return (db.get('heroes') or {}).get(gid) or (db.get('cards') or {}).get(gid)
 
 def looks_like_deck_base64(text):
     """Грубая проверка: одна строка Base64 кода колоды BHD1."""
@@ -789,8 +954,13 @@ def looks_like_deck_base64(text):
 
 def decode_deck_bhd1(code):
     """
-    Распаковка официального кода колоды BHD1 (decodeDeck с dekbilder):
-    signature(4) + hero_id(8) + count(1) + N*(card_id(8)+qty(1)) + crc32(4).
+    Распаковка официального кода колоды BHD1 (decodeDeck из dekbilder):
+    signature 'BHD1'(4) + hero_id(uint32 LE + high 0x08005000) + count(u8)
+    + N * (card_id uint32 LE + high + qty u8) + crc32(u32 LE).
+
+    hero/card id в коде — 8 hex-символов (little-endian uint32 от game_id).
+    Имя героя резолвится отдельно через resolve_game_entity() (актуальный id,
+    LE-перестановка, crc32, approvedMaps и legacy-алиасы публичных колод).
     """
     trimmed = re.sub(r'\s+', '', str(code or '').strip())
     if not (24 <= len(trimmed) <= 1024):
@@ -839,7 +1009,12 @@ def decode_deck_bhd1(code):
             raise ValueError(f'Карта {cid} указана дважды')
         seen.add(cid)
         entries.append((cid, int(n)))
-    return {'hero': hero_id, 'entries': entries, 'code': trimmed}
+    return {
+        'hero': hero_id,
+        'hero_le': _to_le_hex(hero_id),
+        'entries': entries,
+        'code': trimmed,
+    }
 
 def download_image_url(url):
     if not url:
@@ -865,13 +1040,21 @@ def _meta_from_game_card(card):
 
 def deck_entries_to_card_rows(decoded):
     """game_id + count -> строки для build_deck_image: (cost, name, count, img_bytes, element)."""
-    db = ensure_game_db()
-    hero_meta = db['heroes'].get(decoded['hero']) or {}
-    hero_name = str(hero_meta.get('title') or f"Герой {decoded['hero']}").strip()
+    ensure_game_db()
+    hero_meta = resolve_game_entity(decoded.get('hero')) or {}
+    hero_name = str(hero_meta.get('title') or '').strip()
+    if not hero_name:
+        # Последний шанс: LE-форма / crc уже внутри resolve; оставим читаемый fallback
+        hero_name = f"Герой {decoded.get('hero')}"
+        print(
+            f"[DECK HERO MISS] id={decoded.get('hero')} le={decoded.get('hero_le')} "
+            f"— имя не найдено в lookup",
+            flush=True,
+        )
 
     def load_one(item):
         gid, count = item
-        card = db['cards'].get(gid) or db['heroes'].get(gid) or {}
+        card = resolve_game_entity(gid) or {}
         title, cost, element, image_url = _meta_from_game_card(card)
         img = download_image_url(image_url)
         if not img and title and title != '???':
