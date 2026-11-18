@@ -178,14 +178,33 @@ _gist_last_push = 0.0
 _gist_worker_started = False
 _BOT_STATE_SOURCE = 'empty'
 
+def _normalize_contest_chats(raw):
+    """Список peer_id чатов с включённым конкурсом → уникальные int."""
+    out, seen = [], set()
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for item in raw:
+        try:
+            cid = int(item)
+        except Exception:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    return out
+
 def _normalize_bot_state(data):
-    """Единая схема: scores (топ), state (викторины), meta (флаг месячного сброса)."""
+    """Единая схема: scores, state, meta, contest_chats (чаты с викториной)."""
     if not isinstance(data, dict):
         data = {}
     return {
         'scores': data.get('scores') if isinstance(data.get('scores'), dict) else {},
         'state': data.get('state') if isinstance(data.get('state'), dict) else {},
         'meta': data.get('meta') if isinstance(data.get('meta'), dict) else {},
+        'contest_chats': _normalize_contest_chats(
+            data.get('contest_chats', data.get('chats'))
+        ),
         'updated_at': data.get('updated_at') or moscow_now().isoformat(),
     }
 
@@ -194,6 +213,7 @@ def _snapshot_bot_state():
         'scores': CHAT_SCORES,
         'state': CONTEST_STATE,
         'meta': CONTEST_META,
+        'contest_chats': CONTEST_CHATS,
         'updated_at': moscow_now().isoformat(),
     })
 
@@ -343,31 +363,43 @@ def load_bot_state():
     _BOT_STATE_SOURCE = source
     print(
         f"[BOT STATE] source={source}; scores={len(data['scores'])}, "
-        f"quizzes={len(data['state'])}, meta_keys={list(data['meta'].keys())}",
+        f"quizzes={len(data['state'])}, chats={len(data.get('contest_chats') or [])}, "
+        f"meta_keys={list(data['meta'].keys())}",
         flush=True,
     )
     return data
 
-def save_bot_state(sync_gist=True):
+def save_bot_state(sync_gist=True, flush_now=False):
     """
-    Пишет локальный bot_data.json сразу; Gist обновляет в фоне (debounce).
+    Пишет локальный bot_data.json сразу; Gist обновляет в фоне (debounce)
+    или немедленно при flush_now=True (вкл/выкл конкурса).
     Не бросает исключения наружу — сбои сети не роняют LongPoll.
     """
-    global _gist_dirty
+    global _gist_dirty, _gist_last_push
     try:
         with _state_lock:
             snap = _snapshot_bot_state()
         save_json(BOT_DATA_FILE, snap)
-        # Дублируем в contests.json для обратной совместимости
+        # Дублируем legacy-файлы для совместимости
         save_json(CONTESTS_FILE, {
             'state': snap['state'],
             'scores': snap['scores'],
             'meta': snap['meta'],
+            'contest_chats': snap['contest_chats'],
         })
+        save_json(CONTEST_CHATS_FILE, snap['contest_chats'])
         if sync_gist and GITHUB_TOKEN and GIST_ID:
-            ensure_gist_worker()
-            with _gist_sync_lock:
-                _gist_dirty = True
+            if flush_now:
+                ok = _push_state_to_gist(snap)
+                with _gist_sync_lock:
+                    _gist_last_push = time.time()
+                    if not ok:
+                        _gist_dirty = True
+                        ensure_gist_worker()
+            else:
+                ensure_gist_worker()
+                with _gist_sync_lock:
+                    _gist_dirty = True
     except Exception as e:
         print(f"[BOT STATE SAVE ERROR] {e}", flush=True)
 
@@ -384,25 +416,37 @@ _contests_data = load_bot_state()
 CHAT_SCORES    = _contests_data['scores']
 CONTEST_STATE  = _contests_data['state']
 CONTEST_META   = _contests_data.get('meta') or {}
-CONTEST_CHATS  = load_json(CONTEST_CHATS_FILE, [])
+# Чаты конкурса: приоритет Gist/bot_data → legacy contest_chats.json → env (только дополняет)
+CONTEST_CHATS  = list(_contests_data.get('contest_chats') or [])
+if not CONTEST_CHATS:
+    CONTEST_CHATS = _normalize_contest_chats(load_json(CONTEST_CHATS_FILE, []))
 CLUE_INDEX     = load_json(CLUE_INDEX_FILE, {"index": 0})
-# Локальный кэш всегда; в Gist на старте пушим только миграцию legacy → облако
-# (не затираем Gist пустым снимком, если GET временно упал)
-save_bot_state(sync_gist=False)
-if _BOT_STATE_SOURCE.startswith('legacy') or _BOT_STATE_SOURCE == 'local_bot_data':
-    if GITHUB_TOKEN and GIST_ID and (CHAT_SCORES or CONTEST_STATE or CONTEST_META):
-        save_bot_state(sync_gist=True)
-ensure_gist_worker()
 
-# FIX: Белый список из env-переменной — переживает рестарт Render (эфемерный диск).
-# Формат: CONTEST_CHATS=2000000001,2000000002 (через запятую).
-# Команды !конкурс +/- продолжают работать (меняют файл), но при рестарте env переопределяет.
+# env CONTEST_CHATS=id1,id2 — только ДОБАВЛЯЕТ чаты, больше не затирает список из Gist
 _env_chats = os.environ.get("CONTEST_CHATS", "")
 if _env_chats:
-    CONTEST_CHATS = [int(c.strip()) for c in _env_chats.split(",") if c.strip().isdigit()]
-    save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
+    for c in _env_chats.split(","):
+        c = c.strip()
+        if c.isdigit():
+            cid = int(c)
+            if cid not in CONTEST_CHATS:
+                CONTEST_CHATS.append(cid)
 
-print(f"[CACHE] Стихий: {len(ELEMENT_CACHE)}, Чатов в конкурсе: {len(CONTEST_CHATS)}", flush=True)
+# Локальный кэш всегда; в Gist на старте пушим миграцию / актуальный список чатов
+save_bot_state(sync_gist=False)
+if _BOT_STATE_SOURCE.startswith('legacy') or _BOT_STATE_SOURCE == 'local_bot_data':
+    if GITHUB_TOKEN and GIST_ID and (CHAT_SCORES or CONTEST_STATE or CONTEST_META or CONTEST_CHATS):
+        save_bot_state(sync_gist=True)
+elif _BOT_STATE_SOURCE == 'gist' and CONTEST_CHATS:
+    # Список из облака уже загружен — планировщик подхватит его как есть
+    pass
+ensure_gist_worker()
+
+print(
+    f"[CACHE] Стихий: {len(ELEMENT_CACHE)}, Чатов в конкурсе: {len(CONTEST_CHATS)} "
+    f"(source={_BOT_STATE_SOURCE})",
+    flush=True,
+)
 
 # ==================== ИНДЕКС САЙТА ====================
 
@@ -1699,17 +1743,18 @@ def is_owner(user_id):
 
 def add_contest_chat(peer_id):
     if peer_id not in CONTEST_CHATS:
-        CONTEST_CHATS.append(peer_id)
-        save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
+        CONTEST_CHATS.append(int(peer_id))
+        save_bot_state(sync_gist=True, flush_now=True)
+        print(f"[CONTEST CHATS] +{peer_id}; всего={len(CONTEST_CHATS)}", flush=True)
         return True
     return False
 
 def remove_contest_chat(peer_id):
     if peer_id in CONTEST_CHATS:
         CONTEST_CHATS.remove(peer_id)
-        save_json(CONTEST_CHATS_FILE, CONTEST_CHATS)
         CONTEST_STATE.pop(str(peer_id), None)
-        save_contests()
+        save_bot_state(sync_gist=True, flush_now=True)
+        print(f"[CONTEST CHATS] -{peer_id}; всего={len(CONTEST_CHATS)}", flush=True)
         return True
     return False
 
@@ -1968,19 +2013,34 @@ def handle_message(vk_session, message_obj):
     text_clean = re.sub(r'\[club\d+\|@?[^\]]+\]\s*', '', raw_text).strip()
     text_lower = text_clean.lower()
 
-    if text_lower in ("!конкурс +", "!конкурс+", "!конкурс добавить"):
+    if text_lower in (
+        "!конкурс +", "!конкурс+", "!конкурс добавить",
+        "!конкурс вкл", "!конкурс включить",
+    ):
         if is_owner(user_id):
             added = add_contest_chat(peer_id)
-            msg = "✅ Чат добавлен в конкурс! Каждый день в 20:00 — «Угадай карту»." if added else "ℹ️ Этот чат уже в конкурсе."
+            msg = (
+                "✅ Чат добавлен в конкурс! Каждый день в 20:00 — «Угадай карту».\n"
+                "Список чатов сохранён в облако (GitHub Gist)."
+                if added else
+                "ℹ️ Этот чат уже в конкурсе."
+            )
         else:
             msg = "❌ Только владелец бота может управлять конкурсом."
         vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
         return
 
-    if text_lower in ("!конкурс -", "!конкурс-", "!конкурс удалить"):
+    if text_lower in (
+        "!конкурс -", "!конкурс-", "!конкурс удалить",
+        "!конкурс выкл", "!конкурс выключить",
+    ):
         if is_owner(user_id):
             removed = remove_contest_chat(peer_id)
-            msg = "✅ Чат удалён из конкурса." if removed else "ℹ️ Этого чата не было в конкурсе."
+            msg = (
+                "✅ Чат удалён из конкурса. Список обновлён в облаке."
+                if removed else
+                "ℹ️ Этого чата не было в конкурсе."
+            )
         else:
             msg = "❌ Только владелец бота может управлять конкурсом."
         vk_session.method('messages.send', {'peer_id': peer_id, 'message': msg, 'random_id': rnd_id()})
